@@ -1,8 +1,9 @@
 [workspace]
-members = []
+members = ["workspace-hack"]
 resolver = "3"
 
 [workspace.dependencies]
+workspace-hack = { path = "./workspace-hack" }
 
 [workspace.lints.clippy]
 all = "deny"

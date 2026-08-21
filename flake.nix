@@ -82,6 +82,7 @@
             inputsFrom = [ config.pre-commit.devShell ];
 
             packages = with pkgs; [
+              cargo-hakari
               rustToolchain
               sccache
             ];
