@@ -1,5 +1,6 @@
 [workspace]
-members = ["echonet-lite-codegen", "workspace-hack"]
+members = ["echonet-lite","echonet-lite-codegen", "workspace-hack"]
+resolver = "3"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

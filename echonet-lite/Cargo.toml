@@ -1,0 +1,13 @@
+[package]
+description = "no_std ECHONET Lite property parser, code-generated from the Machine Readable Appendix"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+name = "echonet-lite"
+rust-version = "1.98"
+version.workspace = true
+
+[dependencies]
+workspace-hack.workspace = true
+
+[features]
+default = []

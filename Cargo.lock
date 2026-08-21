@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "echonet-lite"
+version = "0.0.0"
+dependencies = [
+ "workspace-hack",
+]
+
+[[package]]
 name = "echonet-lite-codegen"
 version = "0.0.0"
 dependencies = [
