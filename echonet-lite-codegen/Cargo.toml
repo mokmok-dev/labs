@@ -1,0 +1,16 @@
+[package]
+description = "Code generator for the echonet-lite crate from the ECHONET Lite Machine Readable Appendix"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+name = "echonet-lite-codegen"
+rust-version = "1.98"
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+workspace-hack.workspace = true
+
+[[bin]]
+name = "echonet-lite-codegen"
+path = "src/main.rs"
