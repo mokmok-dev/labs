@@ -1,0 +1,18 @@
+[package]
+description = "ratatui dashboard for ECHONET Lite devices"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+name = "echonet-radar"
+rust-version = "1.98"
+version.workspace = true
+
+[dependencies]
+clap.workspace = true
+echonet-lite.workspace = true
+echonet-lite-udp = { path = "../echonet-lite-udp" }
+ratatui.workspace = true
+tokio.workspace = true
+workspace-hack.workspace = true
+
+[lints]
+workspace = true

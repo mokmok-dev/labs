@@ -92,7 +92,13 @@
             '';
           };
 
-          packages = { };
+          packages = import ./echonet-radar/package.nix {
+            inherit
+              cargoArtifacts
+              commonArgs
+              craneLib
+              ;
+          };
 
           pre-commit.settings = {
             hooks = {

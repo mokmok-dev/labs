@@ -15,6 +15,6 @@ version = "0.0.0"
 [build-dependencies]
 proc-macro2 = { version = "1" }
 quote = { version = "1" }
-syn = { version = "3", features = ["full"] }
+syn = { version = "3", features = ["extra-traits", "full"] }
 
 ### END HAKARI SECTION
