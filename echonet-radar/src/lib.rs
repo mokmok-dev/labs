@@ -172,6 +172,13 @@ pub enum RadarEvent {
     Status(String),
 }
 
+/// A command sent from the terminal to the radar service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    /// Send value GETs to all known device objects immediately.
+    PollNow,
+}
+
 /// Errors found in variable-length ECHONET Lite property data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -901,6 +908,7 @@ pub async fn run_service(
     socket: EchoNetSocket,
     config: RadarConfig,
     events: Sender<RadarEvent>,
+    mut commands: tokio::sync::mpsc::Receiver<Command>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     config
@@ -953,6 +961,25 @@ pub async fn run_service(
                 update_sleep
                     .as_mut()
                     .reset(tokio::time::Instant::from_std(service.next_update));
+            }
+            command = commands.recv() => {
+                match command {
+                    Some(Command::PollNow) => {
+                        // A manual poll does not shift the scheduled cadence;
+                        // the next automatic round still fires on its timer.
+                        let now = Instant::now();
+                        service.expire_pending(now);
+                        service.status = format!(
+                            "manual poll of {} device object(s)",
+                            service.poll_epcs.len()
+                        );
+                        if let Err(error) = service.refresh_values(&socket).await {
+                            service.status = format!("manual value update failed: {error}");
+                        }
+                        service.send_status(service.status.clone());
+                    }
+                    None => break,
+                }
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {

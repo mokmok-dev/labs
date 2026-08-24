@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use echonet_lite_udp::EchoNetSocket;
 use echonet_radar::{
-    ChangeEvent, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, RadarConfig, RadarEvent,
-    run_service,
+    ChangeEvent, Command, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, RadarConfig,
+    RadarEvent, run_service,
 };
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout};
@@ -54,12 +54,20 @@ impl Arguments {
 fn main() -> Result<(), Box<dyn Error>> {
     let config = Arguments::parse().config()?;
     let (event_sender, event_receiver) = mpsc::channel();
+    let (command_sender, command_receiver) = tokio::sync::mpsc::channel(8);
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
     let network_sender = event_sender.clone();
     let network_config = config;
     let network_thread = thread::Builder::new()
         .name(String::from("echonet-radar-network"))
-        .spawn(move || run_network(network_config, network_sender, shutdown_receiver))?;
+        .spawn(move || {
+            run_network(
+                network_config,
+                network_sender,
+                command_receiver,
+                shutdown_receiver,
+            )
+        })?;
     drop(event_sender);
 
     let terminal = match ratatui::try_init() {
@@ -70,7 +78,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(error.into());
         },
     };
-    let terminal_result = run_terminal(terminal, &event_receiver);
+    let terminal_result = run_terminal(terminal, &event_receiver, &command_sender);
     let restore_result = ratatui::try_restore();
     let _ = shutdown_sender.send(true);
     let network_result = network_thread
@@ -86,6 +94,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run_network(
     config: RadarConfig,
     events: std::sync::mpsc::Sender<RadarEvent>,
+    commands: tokio::sync::mpsc::Receiver<Command>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -94,7 +103,7 @@ fn run_network(
     let error_sender = events.clone();
     let result = runtime.block_on(async move {
         let socket = EchoNetSocket::bind_default_multicast(config.interface).await?;
-        run_service(socket, config, events, shutdown).await
+        run_service(socket, config, events, commands, shutdown).await
     });
     if let Err(error) = &result {
         let _ = error_sender.send(RadarEvent::Status(format!("network error: {error}")));
@@ -140,6 +149,7 @@ impl Feed {
 fn run_terminal(
     mut terminal: DefaultTerminal,
     events: &Receiver<RadarEvent>,
+    commands: &tokio::sync::mpsc::Sender<Command>,
 ) -> io::Result<()> {
     let mut feed = Feed::new();
     // Redraw only when new events or input arrive. INF telegrams surface as
@@ -168,6 +178,10 @@ fn run_terminal(
         {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('r' | 'R') => {
+                    // Send value GETs to all known devices right away.
+                    let _ = commands.try_send(Command::PollNow);
+                },
                 KeyCode::Up => {
                     feed.scroll_up();
                     dirty = true;
@@ -254,7 +268,7 @@ fn render(
     frame.render_widget(table, table_area);
 
     frame.render_widget(
-        Paragraph::new("↑/↓ scroll | Home/End jump | q / Esc: quit")
+        Paragraph::new("r: poll now | ↑/↓ scroll | Home/End jump | q / Esc: quit")
             .style(Style::default().fg(Color::DarkGray)),
         footer,
     );
