@@ -300,15 +300,18 @@ mod tests {
                 }],
             )
             .await;
-        // Hosts without a multicast-capable outgoing interface (e.g. a loopback
-        // only sandbox) cannot route multicast; that is an environment limit,
-        // not a transport bug. Assert success wherever multicast is routable.
+        // Hosts without a multicast-capable outgoing interface (loopback-only
+        // sandboxes and CI) cannot route multicast: the send fails with
+        // EINVAL/ENOADDR/ENETUNREACH. That is an environment limit, not a
+        // transport bug, so assert success wherever multicast is routable.
         match result {
             Ok(_) => {},
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::NetworkUnreachable
+                    io::ErrorKind::InvalidInput
+                        | io::ErrorKind::AddrNotAvailable
+                        | io::ErrorKind::NetworkUnreachable
                 ) => {},
             Err(error) => panic!("multicast send failed: {error}"),
         }
