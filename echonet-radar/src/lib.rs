@@ -18,7 +18,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime};
 
-use echonet_lite::ecodec::{Access, DataKind, EdtValue, decode, lookup};
+use echonet_lite::ecodec::{Access, EdtValue, decode, lookup};
 use echonet_lite::frame::{Eoj, Esv, FrameHeader, Property, parse};
 use echonet_lite_udp::EchoNetSocket;
 
@@ -779,9 +779,15 @@ impl ServiceState {
         else {
             return;
         };
-        let Ok(poll_epcs) = parse_property_map(edt) else {
+        let Ok(parsed) = parse_property_map(edt) else {
             return;
         };
+        // Poll only the properties that can actually be read with a Get.
+        let class_code = key.eoj.class_code();
+        let poll_epcs: Vec<u8> = parsed
+            .into_iter()
+            .filter(|epc| can_get(class_code, *epc))
+            .collect();
         if !poll_epcs.is_empty() {
             self.poll_epcs.insert(key.id(), poll_epcs);
         }
@@ -821,8 +827,10 @@ impl ServiceState {
             .entry(id)
             .or_insert_with(|| fallback_poll_epcs(header.seoj.class_code()));
         self.remember_source(source.ip(), header.seoj, source.port());
+        let class_code = header.seoj.class_code();
         for (epc, edt) in properties {
-            if !edt.is_empty() {
+            // Draw a state change only for values the class may announce via INF.
+            if can_inf(class_code, epc) && !edt.is_empty() {
                 self.record_value(key, epc, &edt);
             }
         }
@@ -856,21 +864,26 @@ fn fallback_poll_epcs(class_code: u16) -> Vec<u8> {
     let candidates = [0x80, 0xE0, 0xE1, 0xE7, 0xBB, 0xB0, 0xBE, 0xBA, 0xBF];
     candidates
         .into_iter()
-        .filter(|epc| is_pollable(class_code, *epc))
+        .filter(|epc| can_get(class_code, *epc))
         .collect()
 }
 
-fn is_pollable(
+/// Whether a property can be read with a Get request per the appendix.
+fn can_get(
     class_code: u16,
     epc: u8,
 ) -> bool {
-    lookup(class_code, epc).is_some_and(|info| {
-        matches!(info.get, Access::Required | Access::Optional)
-            && matches!(
-                info.kind,
-                DataKind::Number | DataKind::State | DataKind::Level
-            )
-    })
+    lookup(class_code, epc)
+        .is_some_and(|info| matches!(info.get, Access::Required | Access::Optional))
+}
+
+/// Whether a device may push an INF telegram for a property per the appendix.
+fn can_inf(
+    class_code: u16,
+    epc: u8,
+) -> bool {
+    lookup(class_code, epc)
+        .is_some_and(|info| matches!(info.inf, Access::Required | Access::Optional))
 }
 
 /// Run the asynchronous discovery, polling, and INF-watching service until
@@ -1314,6 +1327,40 @@ mod tests {
             .values()
             .any(|request| matches!(request, PendingRequest::Values { .. }));
         assert!(sent_value_gets);
+    }
+
+    #[test]
+    fn property_map_is_filtered_to_get_able_values() {
+        let (mut service, _receiver) = service();
+        let key = air_conditioner("127.0.0.1:3610".parse().unwrap());
+        // 0x80 is Get-able; 0xD0 (Buzzer) is Set-only and not readable.
+        service.process_property_map(key, &[(0x9F, vec![2, 0x80, 0xD0])]);
+        assert_eq!(
+            service.poll_epcs.get(&key.id()).map(Vec::as_slice),
+            Some(&[0x80][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn inf_for_non_infable_value_is_not_drawn() {
+        let socket = test_socket().await;
+        let (mut service, receiver) = service();
+        let source: SocketAddr = "192.0.2.11:3610".parse().unwrap();
+        // 0xD0 (Buzzer) is not announced via INF on an air conditioner.
+        service
+            .process_frame(
+                &socket,
+                FrameHeader {
+                    tid: 1,
+                    seoj: Eoj::new(0x01, 0x30, 0x01),
+                    deoj: CONTROLLER_EOJ,
+                    esv: Esv::from_code(INF_ESV_CODE),
+                },
+                vec![(0xD0, vec![0x41])],
+                source,
+            )
+            .await;
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
     }
 
     async fn test_socket() -> EchoNetSocket {
