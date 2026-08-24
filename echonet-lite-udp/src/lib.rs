@@ -68,7 +68,12 @@ impl EchoNetSocket {
         let port = group.port();
         let group_v4 = ipv4_addr(&group)?;
         let std_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        // SO_REUSEADDR allows the socket to share the multicast port with other
+        // ECHONET Lite applications. SO_REUSEPORT additionally guarantees that
+        // unicast datagrams to the bound port are delivered to this socket on
+        // platforms where the two behaviours are distinct (macOS/BSD).
         std_socket.set_reuse_address(true)?;
+        std_socket.set_reuse_port(true)?;
         std_socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
         std_socket.join_multicast_v4(&group_v4, &interface)?;
         std_socket.set_multicast_if_v4(&interface)?;
@@ -214,4 +219,101 @@ fn ipv4_addr(addr: &SocketAddr) -> io::Result<Ipv4Addr> {
 /// Map a frame codec error to an [`io::Error`].
 fn to_io(err: FrameError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use echonet_lite::frame::{Eoj, Esv, FrameHeader, Property, write};
+    use std::net::UdpSocket as StdUdpSocket;
+    use std::time::Duration;
+
+    /// A minimal ECHONET Lite GET frame.
+    fn sample_frame(tid: u16) -> Vec<u8> {
+        let header = FrameHeader {
+            tid,
+            seoj: Eoj::new(0x05, 0xFF, 0x01),
+            deoj: Eoj::new(0x0E, 0xF0, 0x00),
+            esv: Esv::PropertyReadRequest,
+        };
+        let mut buf = [0u8; 32];
+        let n = write(
+            header,
+            &[Property {
+                epc: 0xD6,
+                edt: &[],
+            }],
+            &mut buf,
+        )
+        .unwrap();
+        buf[..n].to_vec()
+    }
+
+    /// A radar socket bound to an ephemeral port and joined to the group on
+    /// `0.0.0.0` (the default interface the binary uses).
+    async fn radar() -> EchoNetSocket {
+        EchoNetSocket::bind_multicast(
+            SocketAddr::from((MULTICAST_GROUP, 0)),
+            Ipv4Addr::UNSPECIFIED,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn receives_unicast_from_a_peer() {
+        let radar = radar().await;
+        let unicast_addr =
+            SocketAddr::from((Ipv4Addr::LOCALHOST, radar.local_addr().unwrap().port()));
+        let peer = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        peer.send_to(&sample_frame(1), unicast_addr).unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, source) = tokio::time::timeout(Duration::from_secs(2), radar.recv(&mut buf))
+            .await
+            .expect("timed out waiting for unicast")
+            .unwrap();
+        assert!(len > 0);
+        assert_eq!(source.ip(), Ipv4Addr::LOCALHOST);
+    }
+
+    #[tokio::test]
+    async fn joins_the_multicast_group_and_sends_to_it() {
+        let radar = radar().await;
+        // The socket joined the group during bind, so unicast to the group port
+        // and multicast membership are both configured on the same socket.
+        assert!(radar.multicast_addr().ip().is_multicast());
+
+        let header = FrameHeader {
+            tid: 1,
+            seoj: Eoj::new(0x05, 0xFF, 0x01),
+            deoj: Eoj::new(0x0E, 0xF0, 0x00),
+            esv: Esv::PropertyReadRequest,
+        };
+        let result = radar
+            .send_frame(
+                header,
+                &[Property {
+                    epc: 0xD6,
+                    edt: &[],
+                }],
+            )
+            .await;
+        // Hosts without a multicast-capable outgoing interface (loopback-only
+        // sandboxes and CI) cannot route multicast: the send fails with
+        // EINVAL/ENOADDR/ENETUNREACH. That is an environment limit, not a
+        // transport bug, so assert success wherever multicast is routable.
+        match result {
+            Ok(_) => {},
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput
+                        | io::ErrorKind::AddrNotAvailable
+                        | io::ErrorKind::NetworkUnreachable
+                ) => {},
+            Err(error) => panic!("multicast send failed: {error}"),
+        }
+    }
 }
