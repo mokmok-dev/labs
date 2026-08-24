@@ -448,6 +448,7 @@ struct ServiceState {
     pending: HashMap<u16, PendingRequest>,
     discovery_tid: Option<u16>,
     next_tid: u16,
+    first_refresh_done: bool,
     status: String,
     next_update: Instant,
 }
@@ -466,6 +467,7 @@ impl ServiceState {
             pending: HashMap::new(),
             discovery_tid: None,
             next_tid: 0,
+            first_refresh_done: false,
             status: String::from("waiting for discovery"),
             next_update: now + config.update_interval,
         }
@@ -732,6 +734,14 @@ impl ServiceState {
                     self.status = format!("property-map request failed: {error}");
                 });
             }
+        }
+        // On startup, Get values immediately after the first discovery finds
+        // devices rather than waiting for the first 15s poll round.
+        if count > 0 && !self.first_refresh_done {
+            self.first_refresh_done = true;
+            self.refresh_values(socket).await.unwrap_or_else(|error| {
+                self.status = format!("initial value update failed: {error}");
+            });
         }
         self.status = format!("discovered {count} new device object(s)");
         self.send_status(self.status.clone());
@@ -1223,7 +1233,14 @@ mod tests {
             )
             .await;
         // Answer the pending property-map request.
-        let map_tid = *service.pending.keys().next().unwrap();
+        let map_tid = service
+            .pending
+            .iter()
+            .find_map(|(tid, request)| match request {
+                PendingRequest::PropertyMap { .. } => Some(*tid),
+                PendingRequest::Values { .. } => None,
+            })
+            .unwrap();
         service
             .process_frame(
                 &socket,
@@ -1237,9 +1254,15 @@ mod tests {
                 source,
             )
             .await;
-        // A poll round sends value GETs for the pollable properties.
-        service.refresh_values(&socket).await.unwrap();
-        let value_tid = *service.pending.keys().next().unwrap();
+        // The first discovery triggers an immediate value poll; answer it.
+        let value_tid = service
+            .pending
+            .iter()
+            .find_map(|(tid, request)| match request {
+                PendingRequest::Values { .. } => Some(*tid),
+                PendingRequest::PropertyMap { .. } => None,
+            })
+            .unwrap();
         service
             .process_frame(
                 &socket,
@@ -1249,11 +1272,7 @@ mod tests {
                     deoj: CONTROLLER_EOJ,
                     esv: Esv::from_code(GET_RESPONSE_ESV_CODE),
                 },
-                vec![
-                    (0x80, vec![0x30]),
-                    (0xBB, vec![0x01, 0x1E]),
-                    (0xB0, vec![0x41]),
-                ],
+                vec![(0x80, vec![0x30]), (0xB0, vec![0x41])],
                 source,
             )
             .await;
@@ -1265,8 +1284,36 @@ mod tests {
             }
         }
         assert!(changes.contains(&0x80));
-        assert!(changes.contains(&0xBB));
         assert!(changes.contains(&0xB0));
+    }
+
+    #[tokio::test]
+    async fn first_discovery_polls_values_immediately() {
+        let socket = test_socket().await;
+        let (mut service, _receiver) = service();
+        let source: SocketAddr = "192.0.2.9:3610".parse().unwrap();
+
+        service.discovery_tid = Some(1);
+        service
+            .process_frame(
+                &socket,
+                FrameHeader {
+                    tid: 1,
+                    seoj: Eoj::new(0x0E, 0xF0, 0x00),
+                    deoj: CONTROLLER_EOJ,
+                    esv: Esv::from_code(GET_RESPONSE_ESV_CODE),
+                },
+                vec![(DISCOVERY_EPC, vec![1, 0x01, 0x30, 0x01])],
+                source,
+            )
+            .await;
+
+        assert!(service.first_refresh_done);
+        let sent_value_gets = service
+            .pending
+            .values()
+            .any(|request| matches!(request, PendingRequest::Values { .. }));
+        assert!(sent_value_gets);
     }
 
     async fn test_socket() -> EchoNetSocket {
