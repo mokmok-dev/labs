@@ -1,16 +1,22 @@
-//! ECHONET Lite discovery and value polling for `echonet-radar`.
+//! ECHONET Lite state-change discovery and logging for `echonet-radar`.
 //!
-//! The service deliberately keeps the transport and terminal rendering separate:
-//! this module owns protocol state, while the binary renders [`RadarSnapshot`]
-//! values with ratatui.
+//! The service keeps the transport and terminal rendering separate: this module
+//! owns protocol state and emits [`RadarEvent`]s, while the binary renders the
+//! resulting time-series feed with ratatui.
+//!
+//! The radar performs periodic discovery (every minute) to learn which device
+//! objects exist, and periodic value polling (every 15 seconds) to detect state
+//! changes. Any property whose raw EDT differs from the last known value is
+//! reported as a [`RadarEvent::Change`]. When a device pushes an INF telegram,
+//! its properties are processed immediately so the change is rendered without
+//! waiting for the next poll round.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc::Sender;
-use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use echonet_lite::ecodec::{Access, DataKind, EdtValue, decode, lookup};
 use echonet_lite::frame::{Eoj, Esv, FrameHeader, Property, parse};
@@ -31,14 +37,14 @@ pub const GET_RESPONSE_ESV_CODE: u8 = 0x72;
 /// The ECHONET Lite GET response service code used when at least one requested
 /// property could not be read; readable properties still carry their EDT.
 pub const GET_RESPONSE_WITH_STATUS_ESV_CODE: u8 = 0x52;
+/// The ECHONET Lite INF service code: a device pushes a property notification.
+pub const INF_ESV_CODE: u8 = 0x63;
 /// The standard ECHONET Lite get-property-map EPC.
 pub const GET_PROPERTY_MAP_EPC: u8 = 0x9F;
 /// The default discovery interval.
 pub const DEFAULT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
-/// The default base interval for value polling.
+/// The default interval for value polling.
 pub const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(15);
-/// The default maximum positive jitter added to value polling.
-pub const DEFAULT_UPDATE_JITTER: Duration = Duration::from_secs(5);
 
 const EMPTY_EDT: &[u8] = &[];
 const VALUE_BATCH_SIZE: usize = 8;
@@ -61,10 +67,8 @@ pub struct RadarConfig {
     pub interface: Ipv4Addr,
     /// Interval between D6 discovery requests.
     pub discovery_interval: Duration,
-    /// Base interval between value polling rounds.
+    /// Interval between value polling rounds.
     pub update_interval: Duration,
-    /// Maximum positive jitter added to each value polling round.
-    pub update_jitter: Duration,
 }
 
 impl Default for RadarConfig {
@@ -73,7 +77,6 @@ impl Default for RadarConfig {
             interface: Ipv4Addr::UNSPECIFIED,
             discovery_interval: DEFAULT_DISCOVERY_INTERVAL,
             update_interval: DEFAULT_UPDATE_INTERVAL,
-            update_jitter: DEFAULT_UPDATE_JITTER,
         }
     }
 }
@@ -93,16 +96,6 @@ impl RadarConfig {
             return Err(ConfigError::ZeroInterval("update_interval"));
         }
         Ok(())
-    }
-
-    /// Produce the next value-poll delay using the supplied jitter source.
-    #[must_use]
-    pub fn next_update_delay(
-        self,
-        jitter: &mut JitterSource,
-    ) -> Duration {
-        self.update_interval
-            .saturating_add(jitter.sample(self.update_jitter))
     }
 }
 
@@ -126,54 +119,6 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Small non-cryptographic source used only to desynchronise polling rounds.
-#[derive(Debug, Clone, Copy)]
-pub struct JitterSource {
-    state: u64,
-}
-
-impl JitterSource {
-    /// Create a deterministic jitter source, useful for tests.
-    #[must_use]
-    pub const fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0 { 1 } else { seed },
-        }
-    }
-
-    /// Create a process-local source seeded from wall-clock time and process id.
-    #[must_use]
-    pub fn seeded() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| {
-                u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-            });
-        Self::new(nanos ^ u64::from(std::process::id()))
-    }
-
-    /// Sample a duration in the inclusive range `0..=maximum`.
-    #[must_use]
-    pub fn sample(
-        &mut self,
-        maximum: Duration,
-    ) -> Duration {
-        if maximum.is_zero() {
-            return Duration::ZERO;
-        }
-
-        // Xorshift is sufficient here: jitter is not an authentication or
-        // secrecy mechanism, it only prevents synchronized request bursts.
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 7;
-        self.state ^= self.state << 17;
-
-        let maximum_millis = u64::try_from(maximum.as_millis()).unwrap_or(u64::MAX);
-        let range = maximum_millis.saturating_add(1);
-        Duration::from_millis(self.state % range)
-    }
-}
-
 /// A discovered device object, identified by its source address and EOJ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeviceKey {
@@ -184,11 +129,10 @@ pub struct DeviceKey {
 }
 
 impl DeviceKey {
-    /// The identity used to deduplicate device rows: source IP and EOJ.
+    /// The identity used to track a device object: source IP and EOJ.
     ///
     /// The port is deliberately excluded so that a device answering from
-    /// several ports is shown as a single row and contacted on its latest
-    /// port.
+    /// several ports is treated as a single object.
     const fn id(&self) -> DeviceId {
         DeviceId {
             ip: self.address.ip(),
@@ -204,73 +148,28 @@ struct DeviceId {
     eoj: Eoj,
 }
 
-/// A decoded value displayed for one device object.
+/// A single observed state change on a device object.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValueSnapshot {
-    /// EPC of the value.
+pub struct ChangeEvent {
+    /// Wall-clock time at which the change was observed.
+    pub at: SystemTime,
+    /// Address from which the change was observed.
+    pub source: SocketAddr,
+    /// The device object that changed.
+    pub eoj: Eoj,
+    /// The EPC whose EDT changed.
     pub epc: u8,
-    /// MRA property name, or an EPC fallback for unknown properties.
-    pub name: String,
-    /// Human-readable decoded EDT.
-    pub value: String,
-    /// Raw EDT bytes as received, for detail views.
-    pub edt: Vec<u8>,
-    /// Time at which this value was last received.
-    pub updated_at: Instant,
+    /// Human-readable English description of the EDT.
+    pub edt: String,
 }
 
-/// A device row in the dashboard.
+/// An event emitted by the radar service for the terminal to render.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceSnapshot {
-    /// Device source and EOJ.
-    pub key: DeviceKey,
-    /// Values most recently received from the device.
-    pub values: Vec<ValueSnapshot>,
-    /// Time at which the device was last seen.
-    pub last_seen: Instant,
-    /// Time at which a value was last received.
-    pub last_update: Option<Instant>,
-}
-
-/// Complete state sent from the network service to the terminal.
-#[derive(Debug, Clone)]
-pub struct RadarSnapshot {
-    /// Discovered device rows.
-    pub devices: Vec<DeviceSnapshot>,
-    /// Current service status for the header.
-    pub status: String,
-    /// Most recent discovery request/response activity.
-    pub last_discovery: Option<Instant>,
-    /// Estimated time of the next discovery request.
-    pub next_discovery: Instant,
-    /// Most recent value polling round.
-    pub last_update: Option<Instant>,
-    /// Estimated time of the next value polling round.
-    pub next_update: Instant,
-}
-
-impl RadarSnapshot {
-    /// Create an empty snapshot with a startup status.
-    #[must_use]
-    pub fn empty() -> Self {
-        let now = Instant::now();
-        Self {
-            devices: Vec::new(),
-            status: String::from("starting"),
-            last_discovery: None,
-            next_discovery: now,
-            last_update: None,
-            next_update: now,
-        }
-    }
-
-    /// Create an empty snapshot carrying a service error or status message.
-    #[must_use]
-    pub fn with_status(status: String) -> Self {
-        let mut snapshot = Self::empty();
-        snapshot.status = status;
-        snapshot
-    }
+pub enum RadarEvent {
+    /// A property value changed on a device object.
+    Change(ChangeEvent),
+    /// A status message for the header (discovery, errors, poll rounds).
+    Status(String),
 }
 
 /// Errors found in variable-length ECHONET Lite property data.
@@ -416,6 +315,33 @@ pub fn format_value(
     }
 }
 
+/// Build a human-readable English description of a property's EDT, e.g.
+/// `"Operation status ON"` or `"Room temperature 26 Celsius"`.
+#[must_use]
+pub fn format_edt(
+    class_code: u16,
+    epc: u8,
+    edt: &[u8],
+) -> String {
+    let name = lookup(class_code, epc).map_or_else(
+        || format!("EPC 0x{epc:02X}"),
+        |info| String::from(info.name),
+    );
+    format!(
+        "{name} {}",
+        humanize_value(format_value(class_code, epc, edt))
+    )
+}
+
+/// Render a boolean state value as ON/OFF so it reads naturally in a log line.
+fn humanize_value(value: String) -> String {
+    match value.as_str() {
+        "true" => String::from("ON"),
+        "false" => String::from("OFF"),
+        _ => value,
+    }
+}
+
 fn format_number(
     raw: i64,
     scale_num: u32,
@@ -488,39 +414,6 @@ fn format_bytes(bytes: &[u8]) -> String {
 }
 
 #[derive(Debug, Clone)]
-struct DeviceState {
-    key: DeviceKey,
-    poll_epcs: Vec<u8>,
-    values: BTreeMap<u8, ValueSnapshot>,
-    last_seen: Instant,
-    last_update: Option<Instant>,
-}
-
-impl DeviceState {
-    fn new(
-        key: DeviceKey,
-        now: Instant,
-    ) -> Self {
-        Self {
-            poll_epcs: fallback_poll_epcs(key.eoj.class_code()),
-            key,
-            values: BTreeMap::new(),
-            last_seen: now,
-            last_update: None,
-        }
-    }
-
-    fn snapshot(&self) -> DeviceSnapshot {
-        DeviceSnapshot {
-            key: self.key,
-            values: self.values.values().cloned().collect(),
-            last_seen: self.last_seen,
-            last_update: self.last_update,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 enum PendingRequest {
     PropertyMap {
         key: DeviceKey,
@@ -548,60 +441,41 @@ impl PendingRequest {
 }
 
 struct ServiceState {
-    snapshots: Sender<RadarSnapshot>,
-    devices: HashMap<DeviceId, DeviceState>,
+    events: Sender<RadarEvent>,
+    poll_epcs: HashMap<DeviceId, Vec<u8>>,
+    values: HashMap<DeviceId, BTreeMap<u8, Vec<u8>>>,
+    source_ports: HashMap<DeviceId, u16>,
     pending: HashMap<u16, PendingRequest>,
     discovery_tid: Option<u16>,
     next_tid: u16,
     status: String,
-    last_discovery: Option<Instant>,
-    last_update: Option<Instant>,
-    next_discovery: Instant,
     next_update: Instant,
-    jitter: JitterSource,
 }
 
 impl ServiceState {
     fn new(
         config: RadarConfig,
-        snapshots: Sender<RadarSnapshot>,
+        events: Sender<RadarEvent>,
     ) -> Self {
         let now = Instant::now();
-        let mut jitter = JitterSource::seeded();
-        let next_update = now + config.next_update_delay(&mut jitter);
         Self {
-            snapshots,
-            devices: HashMap::new(),
+            events,
+            poll_epcs: HashMap::new(),
+            values: HashMap::new(),
+            source_ports: HashMap::new(),
             pending: HashMap::new(),
             discovery_tid: None,
             next_tid: 0,
             status: String::from("waiting for discovery"),
-            last_discovery: None,
-            last_update: None,
-            next_discovery: now,
-            next_update,
-            jitter,
+            next_update: now + config.update_interval,
         }
     }
 
-    fn publish(&self) {
-        let mut devices: Vec<_> = self.devices.values().map(DeviceState::snapshot).collect();
-        devices.sort_by(|left, right| {
-            left.key
-                .address
-                .cmp(&right.key.address)
-                .then_with(|| left.key.eoj.class_code().cmp(&right.key.eoj.class_code()))
-                .then_with(|| left.key.eoj.instance.cmp(&right.key.eoj.instance))
-        });
-        let snapshot = RadarSnapshot {
-            devices,
-            status: self.status.clone(),
-            last_discovery: self.last_discovery,
-            next_discovery: self.next_discovery,
-            last_update: self.last_update,
-            next_update: self.next_update,
-        };
-        let _ = self.snapshots.send(snapshot);
+    fn send_status(
+        &self,
+        message: String,
+    ) {
+        let _ = self.events.send(RadarEvent::Status(message));
     }
 
     fn allocate_tid(
@@ -644,7 +518,6 @@ impl ServiceState {
         }];
         socket.send_frame(header, &properties).await.map(|_| ())?;
         self.discovery_tid = Some(tid);
-        self.status = format!("discovery sent (TID 0x{tid:04X})");
         Ok(())
     }
 
@@ -722,12 +595,21 @@ impl ServiceState {
         &mut self,
         socket: &EchoNetSocket,
     ) -> io::Result<()> {
-        let keys: Vec<_> = self.devices.values().map(|device| device.key).collect();
+        // Refresh each known device object using its freshest source port.
+        let keys: Vec<DeviceKey> = self
+            .poll_epcs
+            .keys()
+            .filter_map(|id| {
+                self.source_address(*id).map(|address| DeviceKey {
+                    address,
+                    eoj: id.eoj,
+                })
+            })
+            .collect();
         for key in keys {
-            let Some(device) = self.devices.get(&key.id()) else {
+            let Some(epcs) = self.poll_epcs.get(&key.id()).cloned() else {
                 continue;
             };
-            let epcs = device.poll_epcs.clone();
             for batch in epcs.chunks(VALUE_BATCH_SIZE) {
                 self.send_value_batch(socket, key, batch.to_vec()).await?;
             }
@@ -735,13 +617,27 @@ impl ServiceState {
         Ok(())
     }
 
-    async fn process_properties(
+    /// The freshest known source address for a device object.
+    fn source_address(
+        &self,
+        id: DeviceId,
+    ) -> Option<SocketAddr> {
+        self.source_ports
+            .get(&id)
+            .map(|port| SocketAddr::from((id.ip, *port)))
+    }
+
+    async fn process_frame(
         &mut self,
         socket: &EchoNetSocket,
         header: FrameHeader,
         properties: Vec<(u8, Vec<u8>)>,
         source: SocketAddr,
     ) {
+        if header.esv.code() == INF_ESV_CODE {
+            self.process_inf(header, properties, source);
+            return;
+        }
         if self.is_discovery_response(header, &properties) {
             self.process_discovery(socket, properties, source).await;
             return;
@@ -759,19 +655,14 @@ impl ServiceState {
         };
         if !is_get_response_code(header.esv.code()) {
             self.status = format!("device rejected request from {}", source.ip());
-            self.publish();
+            self.send_status(self.status.clone());
             return;
         }
 
         let key = pending.key();
-        if let Some(device) = self.devices.get_mut(&key.id()) {
-            // The answer proves the device is reachable at this source; keep
-            // the freshest contact port for subsequent unicast requests.
-            device.key = DeviceKey {
-                address: source,
-                eoj: key.eoj,
-            };
-        }
+        // The answer proves the device is reachable at this source; remember
+        // the freshest contact port for subsequent unicast requests.
+        self.remember_source(key.address.ip(), key.eoj, source.port());
 
         match pending {
             PendingRequest::PropertyMap { key, .. } => {
@@ -781,7 +672,6 @@ impl ServiceState {
                 self.process_values(key, &epcs, &properties);
             },
         }
-        self.publish();
     }
 
     fn is_discovery_response(
@@ -808,12 +698,11 @@ impl ServiceState {
             Ok(instances) => instances,
             Err(error) => {
                 self.status = format!("invalid discovery response: {error}");
-                self.publish();
+                self.send_status(self.status.clone());
                 return;
             },
         };
-        let now = Instant::now();
-        let mut keys = Vec::with_capacity(instances.len());
+        let mut count = 0;
         for eoj in instances {
             if eoj.class_code() == NODE_PROFILE_CLASS_CODE {
                 continue;
@@ -822,43 +711,41 @@ impl ServiceState {
                 ip: source.ip(),
                 eoj,
             };
-            self.devices
-                .entry(id)
-                .and_modify(|device| {
-                    device.last_seen = now;
-                    device.key = DeviceKey {
+            self.poll_epcs.entry(id).or_insert_with(|| {
+                count += 1;
+                fallback_poll_epcs(eoj.class_code())
+            });
+            self.remember_source(source.ip(), eoj, source.port());
+            if !self.has_pending_map(DeviceKey {
+                address: source,
+                eoj,
+            }) {
+                self.send_property_map(
+                    socket,
+                    DeviceKey {
                         address: source,
                         eoj,
-                    };
-                })
-                .or_insert_with(|| {
-                    DeviceState::new(
-                        DeviceKey {
-                            address: source,
-                            eoj,
-                        },
-                        now,
-                    )
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    self.status = format!("property-map request failed: {error}");
                 });
-            keys.push(eoj);
-        }
-        self.last_discovery = Some(now);
-        self.status = format!("discovered {} device object(s)", keys.len());
-        for eoj in keys {
-            let id = DeviceId {
-                ip: source.ip(),
-                eoj,
-            };
-            let Some(key) = self.devices.get(&id).map(|device| device.key) else {
-                continue;
-            };
-            if !self.has_pending_map(key)
-                && let Err(error) = self.send_property_map(socket, key).await
-            {
-                self.status = format!("property-map request failed: {error}");
             }
         }
-        self.publish();
+        self.status = format!("discovered {count} new device object(s)");
+        self.send_status(self.status.clone());
+    }
+
+    fn remember_source(
+        &mut self,
+        ip: IpAddr,
+        eoj: Eoj,
+        port: u16,
+    ) {
+        let id = DeviceId { ip, eoj };
+        let entry = self.source_ports.entry(id).or_insert(port);
+        *entry = port;
     }
 
     fn has_pending_map(
@@ -876,10 +763,6 @@ impl ServiceState {
         key: DeviceKey,
         properties: &[(u8, Vec<u8>)],
     ) {
-        let Some(device) = self.devices.get_mut(&key.id()) else {
-            return;
-        };
-        device.last_seen = Instant::now();
         let Some((_, edt)) = properties
             .iter()
             .find(|(epc, _)| *epc == GET_PROPERTY_MAP_EPC)
@@ -890,7 +773,7 @@ impl ServiceState {
             return;
         };
         if !poll_epcs.is_empty() {
-            device.poll_epcs = poll_epcs;
+            self.poll_epcs.insert(key.id(), poll_epcs);
         }
     }
 
@@ -900,12 +783,6 @@ impl ServiceState {
         requested_epcs: &[u8],
         properties: &[(u8, Vec<u8>)],
     ) {
-        let Some(device) = self.devices.get_mut(&key.id()) else {
-            return;
-        };
-        let now = Instant::now();
-        let class_code = key.eoj.class_code();
-        let mut received = false;
         for (epc, edt) in properties {
             if !requested_epcs.contains(epc) || edt.is_empty() {
                 // A requested property can come back without data (PDC 0) when
@@ -914,26 +791,54 @@ impl ServiceState {
                 // discarding the whole response.
                 continue;
             }
-            let name = lookup(class_code, *epc).map_or_else(
-                || format!("EPC 0x{epc:02X}"),
-                |info| String::from(info.name),
-            );
-            device.values.insert(
-                *epc,
-                ValueSnapshot {
-                    epc: *epc,
-                    name,
-                    value: format_value(class_code, *epc, edt),
-                    edt: edt.clone(),
-                    updated_at: now,
-                },
-            );
-            received = true;
+            self.record_value(key, *epc, edt);
         }
-        device.last_seen = now;
-        if received {
-            device.last_update = Some(now);
+    }
+
+    fn process_inf(
+        &mut self,
+        header: FrameHeader,
+        properties: Vec<(u8, Vec<u8>)>,
+        source: SocketAddr,
+    ) {
+        let key = DeviceKey {
+            address: source,
+            eoj: header.seoj,
+        };
+        let id = key.id();
+        // Track INF-sourced devices so later polling keeps watching them.
+        self.poll_epcs
+            .entry(id)
+            .or_insert_with(|| fallback_poll_epcs(header.seoj.class_code()));
+        self.remember_source(source.ip(), header.seoj, source.port());
+        for (epc, edt) in properties {
+            if !edt.is_empty() {
+                self.record_value(key, epc, &edt);
+            }
         }
+    }
+
+    /// Record a property EDT, emitting a [`RadarEvent::Change`] when it differs
+    /// from the last known value for the device object.
+    fn record_value(
+        &mut self,
+        key: DeviceKey,
+        epc: u8,
+        edt: &[u8],
+    ) {
+        let id = key.id();
+        let last = self.values.entry(id).or_default().insert(epc, edt.to_vec());
+        if last.as_deref() == Some(edt) {
+            return;
+        }
+        let change = ChangeEvent {
+            at: SystemTime::now(),
+            source: key.address,
+            eoj: key.eoj,
+            epc,
+            edt: format_edt(key.eoj.class_code(), epc, edt),
+        };
+        let _ = self.events.send(RadarEvent::Change(change));
     }
 }
 
@@ -958,7 +863,8 @@ fn is_pollable(
     })
 }
 
-/// Run the asynchronous discovery and polling service until shutdown.
+/// Run the asynchronous discovery, polling, and INF-watching service until
+/// shutdown.
 ///
 /// The receiver is a Tokio watch channel so a terminal thread can request a
 /// clean stop without interrupting a pending UDP receive.
@@ -966,20 +872,20 @@ fn is_pollable(
 /// # Errors
 ///
 /// Returns an I/O error for invalid configuration or receive failures.
-/// Individual request-send failures are reported in the snapshot status and
-/// the service continues polling.
+/// Individual request-send failures are reported as status events and the
+/// service continues polling.
 pub async fn run_service(
     socket: EchoNetSocket,
     config: RadarConfig,
-    snapshots: Sender<RadarSnapshot>,
+    events: Sender<RadarEvent>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     config
         .validate()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
 
-    let mut service = ServiceState::new(config, snapshots);
-    service.publish();
+    let mut service = ServiceState::new(config, events);
+    service.send_status(service.status.clone());
 
     let mut discovery_timer = tokio::time::interval(config.discovery_interval);
     discovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -998,29 +904,29 @@ pub async fn run_service(
                         .properties()
                         .map(|property| (property.epc, property.edt.to_vec()))
                         .collect();
-                    service.process_properties(&socket, header, properties, source).await;
+                    service.process_frame(&socket, header, properties, source).await;
                 }
             }
             _ = discovery_timer.tick() => {
                 let now = Instant::now();
                 service.expire_pending(now);
-                service.next_discovery = now + config.discovery_interval;
                 if let Err(error) = service.send_discovery(&socket).await {
                     service.status = format!("discovery send failed: {error}");
                 }
-                service.publish();
+                service.send_status(service.status.clone());
             }
             () = &mut update_sleep => {
                 let now = Instant::now();
                 service.expire_pending(now);
-                service.last_update = Some(now);
-                let delay = config.next_update_delay(&mut service.jitter);
-                service.next_update = now + delay;
-                service.status = format!("polling {} device object(s)", service.devices.len());
+                service.status = format!(
+                    "polling {} device object(s)",
+                    service.poll_epcs.len()
+                );
                 if let Err(error) = service.refresh_values(&socket).await {
                     service.status = format!("value update failed: {error}");
                 }
-                service.publish();
+                service.next_update = now + config.update_interval;
+                service.send_status(service.status.clone());
                 update_sleep
                     .as_mut()
                     .reset(tokio::time::Instant::from_std(service.next_update));
@@ -1039,13 +945,42 @@ pub async fn run_service(
 mod tests {
     use super::*;
     use echonet_lite::frame::write;
+    use std::sync::mpsc::{self, TryRecvError};
+
+    fn key(
+        ip: &str,
+        class_group: u8,
+        class: u8,
+        instance: u8,
+    ) -> DeviceKey {
+        DeviceKey {
+            address: format!("{ip}:3610").parse().unwrap(),
+            eoj: Eoj::new(class_group, class, instance),
+        }
+    }
+
+    fn air_conditioner(source: SocketAddr) -> DeviceKey {
+        DeviceKey {
+            address: source,
+            eoj: Eoj::new(0x01, 0x30, 0x01),
+        }
+    }
+
+    fn service() -> (ServiceState, mpsc::Receiver<RadarEvent>) {
+        let (sender, receiver) = mpsc::channel();
+        let service = ServiceState::new(RadarConfig::default(), sender);
+        (service, receiver)
+    }
+
+    const fn is_change(event: &RadarEvent) -> bool {
+        matches!(event, RadarEvent::Change(_))
+    }
 
     #[test]
     fn default_schedule_matches_radar_defaults() {
         let config = RadarConfig::default();
         assert_eq!(config.discovery_interval, Duration::from_secs(60));
         assert_eq!(config.update_interval, Duration::from_secs(15));
-        assert_eq!(config.update_jitter, Duration::from_secs(5));
     }
 
     #[test]
@@ -1062,12 +997,8 @@ mod tests {
 
     #[test]
     fn expired_requests_do_not_block_future_polls() {
-        let (sender, _receiver) = std::sync::mpsc::channel();
-        let mut service = ServiceState::new(RadarConfig::default(), sender);
-        let key = DeviceKey {
-            address: "127.0.0.1:3610".parse().unwrap(),
-            eoj: Eoj::new(0x00, 0x11, 0x01),
-        };
+        let (mut service, _receiver) = service();
+        let key = key("127.0.0.1", 0x00, 0x11, 0x01);
         service.pending.insert(
             1,
             PendingRequest::PropertyMap {
@@ -1079,15 +1010,6 @@ mod tests {
         );
         service.expire_pending(Instant::now());
         assert!(service.pending.is_empty());
-    }
-
-    #[test]
-    fn jitter_is_bounded_and_added_to_base_interval() {
-        let config = RadarConfig::default();
-        let mut jitter = JitterSource::new(42);
-        let delay = config.next_update_delay(&mut jitter);
-        assert!(delay >= Duration::from_secs(15));
-        assert!(delay <= Duration::from_secs(20));
     }
 
     #[test]
@@ -1177,38 +1099,58 @@ mod tests {
         assert_eq!(format_value(0xFFFF, 0x80, &[0x01, 0xAF]), "01 AF");
     }
 
-    #[tokio::test]
-    async fn unknown_class_map_epcs_become_poll_targets() {
-        let socket = test_socket().await;
-        let (sender, _receiver) = std::sync::mpsc::channel();
-        let mut service = ServiceState::new(RadarConfig::default(), sender);
-        let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
-        // 0x013D (dehumidifier) is not in the generated appendix tables.
-        let key = DeviceKey {
-            address: source,
-            eoj: Eoj::new(0x01, 0x3D, 0x01),
-        };
-
-        service.discovery_tid = Some(1);
-        service
-            .process_discovery(
-                &socket,
-                vec![(DISCOVERY_EPC, vec![1, 0x01, 0x3D, 0x01])],
-                source,
-            )
-            .await;
-        let (header, properties) = map_response(
-            *service.pending.keys().next().unwrap(),
-            key,
-            GET_RESPONSE_ESV_CODE,
-            vec![3, 0x80, 0xC0, 0xE1],
+    #[test]
+    fn format_edt_prepends_the_property_name() {
+        // 0x80 on an air conditioner is "Operation status" with state ON/OFF.
+        assert_eq!(format_edt(0x0130, 0x80, &[0x30]), "Operation status ON");
+        assert_eq!(
+            format_edt(0x0130, 0xBB, &[0x01, 0x1E]),
+            "Measured value of room temperature 01 1E"
         );
-        service
-            .process_properties(&socket, header, properties, source)
-            .await;
+        assert_eq!(format_edt(0xFFFF, 0x80, &[0x01]), "EPC 0x80 01");
+    }
 
-        let device = service.devices.get(&key.id()).unwrap();
-        assert_eq!(device.poll_epcs, [0x80, 0xC0, 0xE1]);
+    #[test]
+    fn record_value_emits_change_only_when_edt_differs() {
+        let (mut service, receiver) = service();
+        let key = air_conditioner("127.0.0.1:3610".parse().unwrap());
+
+        // First observation is a change.
+        service.record_value(key, 0x80, &[0x30]);
+        let RadarEvent::Change(first) = receiver.recv().unwrap() else {
+            panic!("expected a change event");
+        };
+        assert_eq!(first.epc, 0x80);
+        assert_eq!(first.edt, "Operation status ON");
+
+        // An identical value is not reported again.
+        service.record_value(key, 0x80, &[0x30]);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+        // A different value is reported.
+        service.record_value(key, 0x80, &[0x31]);
+        let RadarEvent::Change(second) = receiver.recv().unwrap() else {
+            panic!("expected a change event");
+        };
+        assert_eq!(second.edt, "Operation status OFF");
+    }
+
+    #[test]
+    fn record_value_is_per_epc() {
+        let (mut service, receiver) = service();
+        let key = air_conditioner("127.0.0.1:3610".parse().unwrap());
+
+        service.record_value(key, 0x80, &[0x30]);
+        service.record_value(key, 0xBB, &[0x01, 0x1E]);
+        assert!(is_change(&receiver.recv().unwrap()));
+        assert!(is_change(&receiver.recv().unwrap()));
+
+        // Changing one EPC does not re-report the other.
+        service.record_value(key, 0x80, &[0x31]);
+        let RadarEvent::Change(changed) = receiver.recv().unwrap() else {
+            panic!("expected a change event");
+        };
+        assert_eq!(changed.epc, 0x80);
     }
 
     #[test]
@@ -1223,200 +1165,86 @@ mod tests {
         }
     }
 
-    async fn test_socket() -> EchoNetSocket {
-        EchoNetSocket::bind_multicast(
-            SocketAddr::from((echonet_lite_udp::MULTICAST_GROUP, 0)),
-            Ipv4Addr::LOCALHOST,
-        )
-        .await
-        .unwrap()
-    }
-
-    fn air_conditioner_key(source: SocketAddr) -> DeviceKey {
-        DeviceKey {
-            address: source,
-            eoj: Eoj::new(0x01, 0x30, 0x01),
-        }
-    }
-
-    fn map_response(
-        tid: u16,
-        key: DeviceKey,
-        esv: u8,
-        property_map: Vec<u8>,
-    ) -> (FrameHeader, Vec<(u8, Vec<u8>)>) {
-        (
-            FrameHeader {
-                tid,
-                seoj: key.eoj,
-                deoj: CONTROLLER_EOJ,
-                esv: Esv::from_code(esv),
-            },
-            vec![
-                (0x9D, property_map.clone()),
-                (0x9E, property_map.clone()),
-                (0x9F, property_map),
-            ],
-        )
-    }
-
     #[tokio::test]
-    async fn devices_deduplicate_across_source_ports() {
+    async fn inf_telegram_emits_change_immediately() {
         let socket = test_socket().await;
-        let (sender, _receiver) = std::sync::mpsc::channel();
-        let mut service = ServiceState::new(RadarConfig::default(), sender);
-        let instance_list = vec![(DISCOVERY_EPC, vec![1, 0x01, 0x30, 0x01])];
-
-        // The same device object answering the same discovery from two ports
-        // must collapse into one row.
-        let first: SocketAddr = "192.0.2.7:3610".parse().unwrap();
-        let second: SocketAddr = "192.0.2.7:40000".parse().unwrap();
-        service.discovery_tid = Some(1);
-        service
-            .process_discovery(&socket, instance_list.clone(), first)
-            .await;
-        service.discovery_tid = Some(2);
-        service
-            .process_discovery(&socket, instance_list, second)
-            .await;
-
-        assert_eq!(service.devices.len(), 1);
-        let device = service.devices.values().next().unwrap();
-        assert_eq!(device.key.address.ip(), first.ip());
-        // The freshest source port is kept for unicast requests.
-        assert_eq!(device.key.address.port(), 40000);
-    }
-
-    #[tokio::test]
-    async fn devices_with_distinct_ip_or_eoj_stay_separate() {
-        let socket = test_socket().await;
-        let (sender, _receiver) = std::sync::mpsc::channel();
-        let mut service = ServiceState::new(RadarConfig::default(), sender);
-        service.discovery_tid = Some(1);
+        let (mut service, receiver) = service();
+        let source: SocketAddr = "192.0.2.7:3610".parse().unwrap();
 
         service
-            .process_discovery(
-                &socket,
-                vec![(DISCOVERY_EPC, vec![1, 0x01, 0x30, 0x01])],
-                "192.0.2.7:3610".parse().unwrap(),
-            )
-            .await;
-        service
-            .process_discovery(
-                &socket,
-                vec![(DISCOVERY_EPC, vec![1, 0x01, 0x30, 0x01])],
-                "192.0.2.8:3610".parse().unwrap(),
-            )
-            .await;
-        service
-            .process_discovery(
-                &socket,
-                vec![(DISCOVERY_EPC, vec![1, 0x01, 0x33, 0x01])],
-                "192.0.2.7:3610".parse().unwrap(),
-            )
-            .await;
-
-        assert_eq!(service.devices.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn response_from_new_port_updates_contact_address() {
-        let socket = test_socket().await;
-        let (sender, _receiver) = std::sync::mpsc::channel();
-        let mut service = ServiceState::new(RadarConfig::default(), sender);
-        let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
-        let key = air_conditioner_key(source);
-
-        service.discovery_tid = Some(1);
-        service
-            .process_discovery(
-                &socket,
-                vec![(DISCOVERY_EPC, vec![1, 0x01, 0x30, 0x01])],
-                source,
-            )
-            .await;
-        let tid = *service.pending.keys().next().unwrap();
-        let (header, properties) =
-            map_response(tid, key, GET_RESPONSE_ESV_CODE, vec![2, 0x80, 0xB0]);
-
-        // The map answer comes back from a different source port.
-        let answer_from: SocketAddr = "127.0.0.1:40000".parse().unwrap();
-        service
-            .process_properties(&socket, header, properties, answer_from)
-            .await;
-
-        let device = service.devices.get(&key.id()).unwrap();
-        assert_eq!(device.key.address.port(), 40000);
-    }
-
-    #[tokio::test]
-    async fn property_map_with_status_is_parsed() {
-        let socket = test_socket().await;
-        let (sender, _receiver) = std::sync::mpsc::channel();
-        let mut service = ServiceState::new(RadarConfig::default(), sender);
-        let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
-        let key = air_conditioner_key(source);
-
-        service.discovery_tid = Some(1);
-        service
-            .process_discovery(
-                &socket,
-                vec![(DISCOVERY_EPC, vec![1, 0x01, 0x30, 0x01])],
-                source,
-            )
-            .await;
-        let tid = *service.pending.keys().next().unwrap();
-
-        // The device answers with GET response with status (0x52): the 0x9D and
-        // 0x9E map EPCs come back empty, but 0x9F still carries the map.
-        let (header, properties) = map_response(
-            tid,
-            key,
-            GET_RESPONSE_WITH_STATUS_ESV_CODE,
-            vec![6, 0x80, 0xBB, 0xB0, 0xBE, 0xBA, 0xBF],
-        );
-        service
-            .process_properties(&socket, header, properties, source)
-            .await;
-
-        let device = service.devices.get(&key.id()).unwrap();
-        assert_eq!(device.poll_epcs, [0x80, 0xBB, 0xB0, 0xBE, 0xBA, 0xBF]);
-        assert!(service.pending.is_empty());
-    }
-
-    #[tokio::test]
-    async fn normal_response_stores_all_requested_values() {
-        let socket = test_socket().await;
-        let (sender, _receiver) = std::sync::mpsc::channel();
-        let mut service = ServiceState::new(RadarConfig::default(), sender);
-        let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
-        let key = air_conditioner_key(source);
-
-        service.discovery_tid = Some(1);
-        service
-            .process_discovery(
-                &socket,
-                vec![(DISCOVERY_EPC, vec![1, 0x01, 0x30, 0x01])],
-                source,
-            )
-            .await;
-        let (header, properties) = map_response(
-            *service.pending.keys().next().unwrap(),
-            key,
-            GET_RESPONSE_ESV_CODE,
-            vec![3, 0x80, 0xBB, 0xB0],
-        );
-        service
-            .process_properties(&socket, header, properties, source)
-            .await;
-
-        service.refresh_values(&socket).await.unwrap();
-        let tid = *service.pending.keys().next().unwrap();
-        service
-            .process_properties(
+            .process_frame(
                 &socket,
                 FrameHeader {
-                    tid,
+                    tid: 7,
+                    seoj: Eoj::new(0x01, 0x30, 0x01),
+                    deoj: CONTROLLER_EOJ,
+                    esv: Esv::from_code(INF_ESV_CODE),
+                },
+                vec![(0x80, vec![0x30])],
+                source,
+            )
+            .await;
+
+        let RadarEvent::Change(change) = receiver.recv().unwrap() else {
+            panic!("expected a change event");
+        };
+        assert_eq!(change.source.ip(), source.ip());
+        assert_eq!(change.eoj, Eoj::new(0x01, 0x30, 0x01));
+        assert_eq!(change.epc, 0x80);
+        assert_eq!(change.edt, "Operation status ON");
+        // INF-sourced devices become polling targets.
+        let id = DeviceId {
+            ip: source.ip(),
+            eoj: Eoj::new(0x01, 0x30, 0x01),
+        };
+        assert!(service.poll_epcs.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn poll_response_records_changes_per_device() {
+        let socket = test_socket().await;
+        let (mut service, receiver) = service();
+        let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
+        let key = air_conditioner(source);
+
+        // Discover the device object.
+        service.discovery_tid = Some(1);
+        service
+            .process_frame(
+                &socket,
+                FrameHeader {
+                    tid: 1,
+                    seoj: Eoj::new(0x0E, 0xF0, 0x00),
+                    deoj: CONTROLLER_EOJ,
+                    esv: Esv::from_code(GET_RESPONSE_ESV_CODE),
+                },
+                vec![(DISCOVERY_EPC, vec![1, 0x01, 0x30, 0x01])],
+                source,
+            )
+            .await;
+        // Answer the pending property-map request.
+        let map_tid = *service.pending.keys().next().unwrap();
+        service
+            .process_frame(
+                &socket,
+                FrameHeader {
+                    tid: map_tid,
+                    seoj: key.eoj,
+                    deoj: CONTROLLER_EOJ,
+                    esv: Esv::from_code(GET_RESPONSE_ESV_CODE),
+                },
+                vec![(0x9F, vec![3, 0x80, 0xBB, 0xB0])],
+                source,
+            )
+            .await;
+        // A poll round sends value GETs for the pollable properties.
+        service.refresh_values(&socket).await.unwrap();
+        let value_tid = *service.pending.keys().next().unwrap();
+        service
+            .process_frame(
+                &socket,
+                FrameHeader {
+                    tid: value_tid,
                     seoj: key.eoj,
                     deoj: CONTROLLER_EOJ,
                     esv: Esv::from_code(GET_RESPONSE_ESV_CODE),
@@ -1430,70 +1258,23 @@ mod tests {
             )
             .await;
 
-        let device = service.devices.get(&key.id()).unwrap();
-        assert_eq!(device.values.len(), 3);
-        assert_eq!(device.values.get(&0x80).unwrap().value, "true");
-        assert_eq!(device.values.get(&0xB0).unwrap().value, "auto");
-        // 0xBB is declared Raw in the property tables, so it is kept as hex.
-        assert_eq!(device.values.get(&0xBB).unwrap().value, "01 1E");
-        assert!(device.last_update.is_some());
+        let mut changes = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let RadarEvent::Change(change) = event {
+                changes.push(change.epc);
+            }
+        }
+        assert!(changes.contains(&0x80));
+        assert!(changes.contains(&0xBB));
+        assert!(changes.contains(&0xB0));
     }
 
-    #[tokio::test]
-    async fn response_with_status_keeps_readable_values() {
-        let socket = test_socket().await;
-        let (sender, _receiver) = std::sync::mpsc::channel();
-        let mut service = ServiceState::new(RadarConfig::default(), sender);
-        let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
-        let key = air_conditioner_key(source);
-
-        service.discovery_tid = Some(1);
-        service
-            .process_discovery(
-                &socket,
-                vec![(DISCOVERY_EPC, vec![1, 0x01, 0x30, 0x01])],
-                source,
-            )
-            .await;
-        let (header, properties) = map_response(
-            *service.pending.keys().next().unwrap(),
-            key,
-            GET_RESPONSE_ESV_CODE,
-            vec![6, 0x80, 0xBB, 0xB0, 0xBE, 0xBA, 0xBF],
-        );
-        service
-            .process_properties(&socket, header, properties, source)
-            .await;
-
-        service.refresh_values(&socket).await.unwrap();
-        let tid = *service.pending.keys().next().unwrap();
-
-        // One property is readable, the rest fail; the readable value must not
-        // be discarded with the failures.
-        service
-            .process_properties(
-                &socket,
-                FrameHeader {
-                    tid,
-                    seoj: key.eoj,
-                    deoj: CONTROLLER_EOJ,
-                    esv: Esv::from_code(GET_RESPONSE_WITH_STATUS_ESV_CODE),
-                },
-                vec![
-                    (0x80, vec![0x30]),
-                    (0xBB, Vec::new()),
-                    (0xB0, Vec::new()),
-                    (0xBE, Vec::new()),
-                    (0xBA, Vec::new()),
-                    (0xBF, Vec::new()),
-                ],
-                source,
-            )
-            .await;
-
-        let device = service.devices.get(&key.id()).unwrap();
-        assert_eq!(device.values.len(), 1);
-        assert_eq!(device.values.get(&0x80).unwrap().value, "true");
-        assert!(service.pending.is_empty());
+    async fn test_socket() -> EchoNetSocket {
+        EchoNetSocket::bind_multicast(
+            SocketAddr::from((echonet_lite_udp::MULTICAST_GROUP, 0)),
+            Ipv4Addr::LOCALHOST,
+        )
+        .await
+        .unwrap()
     }
 }
