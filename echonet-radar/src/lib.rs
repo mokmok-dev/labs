@@ -615,13 +615,24 @@ impl ServiceState {
                 })
             })
             .collect();
+        // A transient send failure for one device must not skip the rest of
+        // the round; report the first error and keep polling the others.
+        let mut first_error = None;
         for key in keys {
             let Some(epcs) = self.poll_epcs.get(&key.id()).cloned() else {
                 continue;
             };
             for batch in epcs.chunks(VALUE_BATCH_SIZE) {
-                self.send_value_batch(socket, key, batch.to_vec()).await?;
+                if let Err(error) = self.send_value_batch(socket, key, batch.to_vec()).await {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    break;
+                }
             }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -644,7 +655,7 @@ impl ServiceState {
         source: SocketAddr,
     ) {
         if header.esv.code() == INF_ESV_CODE {
-            self.process_inf(header, properties, source);
+            self.process_inf(socket, header, properties, source).await;
             return;
         }
         if self.is_discovery_response(header, &properties) {
@@ -818,8 +829,9 @@ impl ServiceState {
         }
     }
 
-    fn process_inf(
+    async fn process_inf(
         &mut self,
+        socket: &EchoNetSocket,
         header: FrameHeader,
         properties: Vec<(u8, Vec<u8>)>,
         source: SocketAddr,
@@ -829,11 +841,23 @@ impl ServiceState {
             eoj: header.seoj,
         };
         let id = key.id();
-        // Track INF-sourced devices so later polling keeps watching them.
-        self.poll_epcs
-            .entry(id)
-            .or_insert_with(|| fallback_poll_epcs(header.seoj.class_code()));
+        // Track INF-sourced devices so later polling keeps watching them, and
+        // request their property map so polling uses the real Get-able set
+        // rather than the fallback list.
+        let is_new = match self.poll_epcs.entry(id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(fallback_poll_epcs(header.seoj.class_code()));
+                true
+            },
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        };
         self.remember_source(source.ip(), header.seoj, source.port());
+        if is_new
+            && !self.has_pending_map(key)
+            && let Err(error) = self.send_property_map(socket, key).await
+        {
+            self.status = format!("property-map request failed: {error}");
+        }
         let class_code = header.seoj.class_code();
         for (epc, edt) in properties {
             // Draw a state change only for values the class may announce via INF.
@@ -1354,6 +1378,36 @@ mod tests {
             .values()
             .any(|request| matches!(request, PendingRequest::Values { .. }));
         assert!(sent_value_gets);
+    }
+
+    #[tokio::test]
+    async fn inf_from_new_device_requests_property_map() {
+        let socket = test_socket().await;
+        let (mut service, _receiver) = service();
+        let source: SocketAddr = "192.0.2.13:3610".parse().unwrap();
+
+        service
+            .process_frame(
+                &socket,
+                FrameHeader {
+                    tid: 1,
+                    seoj: Eoj::new(0x01, 0x30, 0x01),
+                    deoj: CONTROLLER_EOJ,
+                    esv: Esv::from_code(INF_ESV_CODE),
+                },
+                vec![(0x80, vec![0x30])],
+                source,
+            )
+            .await;
+
+        // A device first seen via INF must also get its property map requested
+        // so polling uses the real Get-able set, not the fallback list.
+        assert!(
+            service
+                .pending
+                .values()
+                .any(|request| matches!(request, PendingRequest::PropertyMap { .. }))
+        );
     }
 
     #[test]

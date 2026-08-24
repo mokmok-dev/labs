@@ -156,20 +156,25 @@ fn run_terminal(
     // `Change` events, so they are rendered within one poll cycle.
     let mut dirty = true;
     loop {
-        match events.try_recv() {
-            Ok(RadarEvent::Change(change)) => {
-                feed.push_change(change);
-                dirty = true;
-            },
-            Ok(RadarEvent::Status(status)) => {
-                feed.status = status;
-                dirty = true;
-            },
-            Err(TryRecvError::Empty) => {},
-            Err(TryRecvError::Disconnected) => {
-                feed.status = String::from("network service stopped");
-                dirty = true;
-            },
+        // Drain everything the network thread has queued so bursts of INF
+        // telegrams render within one frame instead of one per poll cycle.
+        loop {
+            match events.try_recv() {
+                Ok(RadarEvent::Change(change)) => {
+                    feed.push_change(change);
+                    dirty = true;
+                },
+                Ok(RadarEvent::Status(status)) => {
+                    feed.status = status;
+                    dirty = true;
+                },
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    feed.status = String::from("network service stopped");
+                    dirty = true;
+                    break;
+                },
+            }
         }
 
         if event::poll(Duration::from_millis(50))?
