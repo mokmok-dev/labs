@@ -1355,7 +1355,7 @@ mod tests {
     async fn first_discovery_polls_values_immediately() {
         let socket = test_socket().await;
         let (mut service, _receiver) = service();
-        let source: SocketAddr = "192.0.2.9:3610".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
 
         service.discovery_tid = Some(1);
         service
@@ -1384,7 +1384,7 @@ mod tests {
     async fn inf_from_new_device_requests_property_map() {
         let socket = test_socket().await;
         let (mut service, _receiver) = service();
-        let source: SocketAddr = "192.0.2.13:3610".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
 
         service
             .process_frame(
