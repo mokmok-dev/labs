@@ -261,6 +261,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a multicast-capable interface; nix sandbox/CI is loopback-only"]
     async fn receives_unicast_from_a_peer() {
         let radar = radar().await;
         let unicast_addr =
@@ -279,6 +280,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a multicast-capable interface; nix sandbox/CI is loopback-only"]
     async fn joins_the_multicast_group_and_sends_to_it() {
         let radar = radar().await;
         // The socket joined the group during bind, so unicast to the group port
