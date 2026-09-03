@@ -12,6 +12,10 @@ version = "0.0.0"
 # are managed by hakari.
 
 ### BEGIN HAKARI SECTION
+[dependencies]
+usage-argv = { version = "6", default-features = false, features = ["complete", "diagnostics"] }
+usage-rs = { version = "6", features = ["completions"] }
+
 [build-dependencies]
 proc-macro2 = { version = "1" }
 quote = { version = "1" }
