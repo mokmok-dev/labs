@@ -6,7 +6,6 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::Parser;
 use echonet_lite_udp::EchoNetSocket;
 use echonet_radar::{
     ChangeEvent, Command, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, RadarConfig,
@@ -18,24 +17,36 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 use ratatui::{DefaultTerminal, Frame};
+use usage::Cli;
 
 /// Maximum number of change events kept in the feed.
 const MAX_EVENTS: usize = 1000;
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "echonet-radar",
-    about = "Log ECHONET Lite device state changes as a time-series feed"
-)]
+/// Log ECHONET Lite device state changes as a time-series feed
+//
+// `default = "..."` is required beside `default_value_t`: the literal feeds the
+// emitted portable spec, the Rust expression supplies the runtime value.
+#[derive(Debug, Cli)]
+#[usage(bin = "echonet-radar", version, completion)]
 struct Arguments {
     /// IPv4 interface used for multicast membership.
-    #[arg(long, default_value = "0.0.0.0", value_name = "IP")]
+    #[usage(long, default = "0.0.0.0", value_name = "IP")]
     interface: Ipv4Addr,
     /// Discovery interval in seconds.
-    #[arg(long, default_value_t = DEFAULT_DISCOVERY_INTERVAL.as_secs(), value_name = "SECONDS")]
+    #[usage(
+        long,
+        default = "60",
+        default_value_t = DEFAULT_DISCOVERY_INTERVAL.as_secs(),
+        value_name = "SECONDS"
+    )]
     discovery_interval_seconds: u64,
     /// Value-polling interval in seconds.
-    #[arg(long, default_value_t = DEFAULT_UPDATE_INTERVAL.as_secs(), value_name = "SECONDS")]
+    #[usage(
+        long,
+        default = "15",
+        default_value_t = DEFAULT_UPDATE_INTERVAL.as_secs(),
+        value_name = "SECONDS"
+    )]
     update_interval_seconds: u64,
 }
 

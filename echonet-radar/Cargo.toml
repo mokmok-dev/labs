@@ -7,11 +7,11 @@ rust-version = "1.98"
 version.workspace = true
 
 [dependencies]
-clap.workspace = true
 echonet-lite.workspace = true
 echonet-lite-udp.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
+usage = { workspace = true, features = ["completions"] }
 workspace-hack.workspace = true
 
 [lints]
