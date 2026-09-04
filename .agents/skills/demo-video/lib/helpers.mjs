@@ -27,7 +27,9 @@ export async function createContext(browser, videoDir) {
 
 /**
  * ブラウザを起動する
- * `playwright install chromium` で取得したブラウザを使用する。
+ * PLAYWRIGHT_BROWSERS_PATH が設定されていればそのパスのブラウザ
+ * （nix devShell では nixpkgs 製）、未設定なら `playwright install chromium`
+ * で取得したブラウザを使用する。
  * @param {boolean} headless - ヘッドレスモード（デフォルトtrue）
  * @returns {Promise<import('playwright').Browser>}
  */

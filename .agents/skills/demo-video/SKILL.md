@@ -187,14 +187,19 @@ node <指定されたスクリプトパス>
 ## 前提条件
 
 - Node.js 24（Nix devShell `nix develop` / direnv で提供）
-- `playwright` npmパッケージ: スキルディレクトリ内
-  （`.agents/skills/demo-video/package.json`）で管理。初回のみインストールする:
+- `playwright-test`（nixpkgs）: devShell が CLI とブラウザ一式を提供し、
+  `PLAYWRIGHT_BROWSERS_PATH` を nixpkgs 製ブラウザに設定する。
+  `playwright` npmパッケージ（スキルディレクトリの devDependencies）は
+  ブラウザリビジョンの一致のため nixpkgs のバージョン（`nix eval
+  nixpkgs#playwright-test.version`）と一致させること。初回のみ依存を入れる:
 
   ```bash
   pnpm --dir .agents/skills/demo-video install
-  pnpm --dir .agents/skills/demo-video exec playwright install chromium
   ```
 
+- nix を使わない環境では `pnpm --dir .agents/skills/demo-video exec
+  playwright install chromium` でブラウザを取得する
+  （`PLAYWRIGHT_BROWSERS_PATH` を unset すること）
 - ffmpeg: MP4変換に使用。PATHに無い場合は変換をスキップし、WebM のまま出力する
 - 対象サーバーが起動済み（vite dev または `cargo run -p echonet-radar`）
 
