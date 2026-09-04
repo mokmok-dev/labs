@@ -1,0 +1,2 @@
+minimumReleaseAgeExclude:
+  - '@cloudflare/kumo@2.13.1'

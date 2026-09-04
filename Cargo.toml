@@ -9,14 +9,20 @@ members = [
 resolver = "3"
 
 [workspace.dependencies]
+axum = { version = "0.8", features = ["ws"] }
 echonet-lite = { version = "0.0.0", path = "./echonet-lite" }
 echonet-lite-codegen = { version = "0.0.0", path = "./echonet-lite-codegen" }
 echonet-lite-udp = { version = "0.0.0", path = "./echonet-lite-udp" }
 echonet-radar = { version = "0.0.0", path = "./echonet-radar" }
-ratatui = "0.30"
+gpui-kit = "0.6"
+gpui-wry = "0.6"
+rust-embed = "8"
+# gpui-wry builds its webviews with the lb-wry fork; use the same package so
+# builder types match when echonet-radar constructs its own webview.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = { version = "0.6", features = ["all"] }
+wry = { package = "lb-wry", version = "0.53.3" }
 # Keep dependency tables single-line: usage-derive's workspace-inheritance lookup
 # cannot resolve `usage` when a preceding entry is a multi-line inline table.
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
