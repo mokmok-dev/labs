@@ -45,11 +45,6 @@ body {
   width: 280px;
 }
 
-.radar-buffer {
-  flex: 1;
-  min-width: 0;
-}
-
 .radar-header {
   display: flex;
   align-items: center;
@@ -108,10 +103,6 @@ body {
 
 [data-sidebar-wrapper][data-state="collapsed"] .radar-sidebar-brand {
   display: none;
-}
-
-[data-sidebar-wrapper][data-state="collapsed"] .radar-buffer {
-  visibility: hidden;
 }
 
 .radar-mono {
