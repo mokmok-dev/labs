@@ -22,6 +22,7 @@ export function useRadarSocket(): RadarSocket {
   const [changes, setChanges] = useState<ChangePayload[]>([]);
   const [status, setStatus] = useState("connecting");
   const [connection, setConnection] = useState<Connection>("connecting");
+  const [attempt, setAttempt] = useState(0);
   const socketRef = useRef<WebSocket | null>(null);
 
   const connect = useCallback(() => {
@@ -32,6 +33,7 @@ export function useRadarSocket(): RadarSocket {
       if (socketRef.current === socket) {
         socketRef.current = null;
         setConnection("closed");
+        setAttempt((previous) => previous + 1);
       }
     };
     socket.onmessage = (event) => {
@@ -60,10 +62,10 @@ export function useRadarSocket(): RadarSocket {
   }, [connect]);
 
   useEffect(() => {
-    if (connection !== "closed") return;
+    if (attempt === 0) return;
     const timer = window.setTimeout(connect, RECONNECT_DELAY_MS);
     return () => window.clearTimeout(timer);
-  }, [connection, connect]);
+  }, [attempt, connect]);
 
   const pollNow = useCallback(() => {
     if (socketRef.current?.readyState === WebSocket.OPEN) {
