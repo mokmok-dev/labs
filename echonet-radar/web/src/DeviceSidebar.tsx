@@ -29,6 +29,7 @@ export function DeviceSidebar({
             echonet-radar
           </Text>
         </div>
+        <Sidebar.Trigger />
       </Sidebar.Header>
       {connection === "connecting" ? (
         <Sidebar.Loading />
@@ -90,7 +91,6 @@ export function DeviceSidebar({
             customValue={`${changes.length} / ${MAX_EVENTS}`}
           />
         </div>
-        <Sidebar.Trigger />
       </Sidebar.Footer>
     </Sidebar>
   );
