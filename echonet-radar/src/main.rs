@@ -486,7 +486,7 @@ fn create_webview(
 }
 
 #[cfg(not(target_os = "macos"))]
-fn create_webview(
+const fn create_webview(
     _url: &str,
     _window: &mut Window,
     _cx: &mut App,
