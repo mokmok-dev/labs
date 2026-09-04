@@ -27,8 +27,7 @@ export async function createContext(browser, videoDir) {
 
 /**
  * ブラウザを起動する
- * PLAYWRIGHT_BROWSERS_PATH が設定されていれば nixpkgs の Chromium を、
- * 未設定なら playwright install で取得したブラウザを使う。
+ * `playwright install chromium` で取得したブラウザを使用する。
  * @param {boolean} headless - ヘッドレスモード（デフォルトtrue）
  * @returns {Promise<import('playwright').Browser>}
  */
@@ -206,16 +205,24 @@ export async function finishRecording(page, context, outputDir, outputName) {
 
 /**
  * WebMファイルをMP4に変換する（ffmpeg使用）
+ * ffmpeg がPATHに無い場合は変換をスキップし、WebM のまま出力する。
  * @param {string} inputPath - 入力WebMファイルパス
  * @param {string} outputPath - 出力MP4ファイルパス
  */
 export async function convertToMp4(inputPath, outputPath) {
   console.log(`  MP4変換中: ${inputPath} → ${outputPath}`);
-  execFileSync('ffmpeg', [
-    '-y', '-i', inputPath,
-    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-    outputPath,
-  ], { stdio: 'pipe' });
+  try {
+    execFileSync('ffmpeg', [
+      '-y', '-i', inputPath,
+      '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+      '-pix_fmt', 'yuv420p',
+      outputPath,
+    ], { stdio: 'pipe' });
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    console.warn(`  警告: ffmpeg が見つからないため WebM のまま出力します: ${inputPath}`);
+    return;
+  }
   console.log(`  MP4変換完了: ${outputPath}`);
 }
 

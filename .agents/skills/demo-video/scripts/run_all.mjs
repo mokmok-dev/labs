@@ -1,7 +1,6 @@
 // デフォルトのデモ録画シナリオ。
-// CI（.github/workflows/demo-video.yaml）はこのスクリプトを実行して
-// 各画面の MP4 を生成する。PR固有のシナリオはこのディレクトリに
-// 追加スクリプトを置いて拡張する。
+// echonet-radar の webview UI（単一ページ）を録画する。
+// PR固有のシナリオは `.tmp/demo/` に追加スクリプトを置いて拡張する。
 import {
   launchBrowser,
   createContext,
@@ -15,9 +14,7 @@ const BASE_URL = process.env.DEMO_BASE_URL || 'http://localhost:5173';
 const VIDEO_DIR = '.tmp/demo/videos';
 
 const scenarios = [
-  { name: 'home', label: 'ホーム画面', path: '/' },
-  { name: 'table', label: 'データテーブル', path: '/table' },
-  { name: 'about', label: 'アバウト', path: '/about' },
+  { name: 'home', label: 'echonet-radar トップ画面（ヘッダーとイベントテーブル）', path: '/' },
 ];
 
 const browser = await launchBrowser();
@@ -29,6 +26,8 @@ for (const scenario of scenarios) {
   await page.goto(`${BASE_URL}${scenario.path}`);
   await page.waitForLoadState('networkidle');
   await step(page, scenario.label, 2500);
+  await clickWithHighlight(page, 'button:has-text("Poll now")');
+  await step(page, 'Poll now でデバイスの再取得を実行', 2000);
 
   const webmPath = await finishRecording(page, context, VIDEO_DIR, scenario.name);
   await convertToMp4(webmPath, webmPath.replace('.webm', '.mp4'));
