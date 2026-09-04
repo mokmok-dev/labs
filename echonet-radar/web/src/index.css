@@ -92,6 +92,15 @@ body {
   gap: 12px;
 }
 
+.radar-center > * {
+  max-width: 480px;
+}
+
+[data-sidebar-wrapper][data-state="collapsed"] .radar-sidebar-brand h1,
+[data-sidebar-wrapper][data-state="collapsed"] .radar-buffer {
+  visibility: hidden;
+}
+
 .radar-mono {
   font-size: 0.875rem;
   line-height: 1.25rem;
