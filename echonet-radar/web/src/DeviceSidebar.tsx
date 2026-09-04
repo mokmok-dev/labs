@@ -1,6 +1,7 @@
 import { Broadcast, Cpu, Stack } from "@phosphor-icons/react";
-import { Empty, Sidebar, Text } from "@cloudflare/kumo";
+import { Empty, Meter, Sidebar, Text } from "@cloudflare/kumo";
 import { sameDevice, summarizeDevices, type DeviceKey } from "./device";
+import { MAX_EVENTS } from "./useRadarSocket";
 import type { ChangePayload, Connection } from "./types";
 
 interface DeviceSidebarProps {
@@ -80,6 +81,14 @@ export function DeviceSidebar({
         </Sidebar.Content>
       )}
       <Sidebar.Footer>
+        <div className="radar-buffer">
+          <Meter
+            label="Event buffer"
+            value={changes.length}
+            max={MAX_EVENTS}
+            customValue={`${changes.length} / ${MAX_EVENTS}`}
+          />
+        </div>
         <Sidebar.Trigger />
       </Sidebar.Footer>
     </Sidebar>

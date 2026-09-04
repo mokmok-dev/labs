@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChangePayload, Connection, ServerMessage } from "./types";
 
-const MAX_EVENTS = 1000;
+export const MAX_EVENTS = 1000;
 const RECONNECT_DELAY_MS = 1000;
 
 const wsUrl = (): string => {
@@ -15,7 +15,7 @@ interface RadarSocket {
   changes: ChangePayload[];
   status: string;
   connection: Connection;
-  pollNow: () => void;
+  pollNow: () => boolean;
 }
 
 export function useRadarSocket(): RadarSocket {
@@ -67,10 +67,13 @@ export function useRadarSocket(): RadarSocket {
     return () => window.clearTimeout(timer);
   }, [attempt, connect]);
 
-  const pollNow = useCallback(() => {
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ type: "pollNow" }));
+  const pollNow = useCallback((): boolean => {
+    const socket = socketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "pollNow" }));
+      return true;
     }
+    return false;
   }, []);
 
   return { changes, status, connection, pollNow };
