@@ -1,21 +1,10 @@
-import { Badge, Button, Table, Text } from "@cloudflare/kumo";
-import { Broadcast, Repeat } from "@phosphor-icons/react";
+import { useMemo, useState } from "react";
+import { Badge, Button, Sidebar, Text } from "@cloudflare/kumo";
+import { Repeat } from "@phosphor-icons/react";
+import { sameDevice, type DeviceKey } from "./device";
+import { DeviceSidebar } from "./DeviceSidebar";
+import { EventViews } from "./EventViews";
 import { useRadarSocket } from "./useRadarSocket";
-
-function formatTime(atMs: number): string {
-  const time = new Date(atMs);
-  const now = new Date();
-  const sameDay =
-    time.getFullYear() === now.getFullYear() &&
-    time.getMonth() === now.getMonth() &&
-    time.getDate() === now.getDate();
-  const clock = time.toLocaleTimeString();
-  return sameDay ? clock : `${time.toLocaleDateString()} ${clock}`;
-}
-
-function formatEpc(epc: number): string {
-  return `0x${epc.toString(16).padStart(2, "0").toUpperCase()}`;
-}
 
 function connectionBadge(connection: "connecting" | "open" | "closed") {
   switch (connection) {
@@ -34,24 +23,35 @@ function connectionBadge(connection: "connecting" | "open" | "closed") {
 
 export function App() {
   const { changes, status, connection, pollNow } = useRadarSocket();
+  const [selected, setSelected] = useState<DeviceKey | null>(null);
+
+  const visible = useMemo(
+    () =>
+      selected === null
+        ? changes
+        : changes.filter((change) => sameDevice(selected, change)),
+    [changes, selected],
+  );
 
   return (
-    <div className="radar">
-      <header className="radar-header">
-        <div className="radar-title">
-          <Broadcast size={18} weight="duotone" />
-          <Text variant="heading" as="h1">
-            echonet-radar
-          </Text>
-        </div>
-        <div className="radar-status">
-          {connectionBadge(connection)}
-          <Text variant="secondary" size="sm">
-            {status}
-          </Text>
-          <span className="radar-mono">
-            <Text variant="mono-secondary">{changes.length} events</Text>
-          </span>
+    <Sidebar.Provider defaultOpen collapsible="icon">
+      <DeviceSidebar
+        changes={changes}
+        connection={connection}
+        selected={selected}
+        onSelect={setSelected}
+      />
+      <div className="radar-main">
+        <header className="radar-header">
+          <div className="radar-status">
+            {connectionBadge(connection)}
+            <Text variant="secondary" size="sm">
+              {status}
+            </Text>
+            <span className="radar-mono">
+              <Text variant="mono-secondary">{visible.length} events</Text>
+            </span>
+          </div>
           <Button
             variant="secondary"
             size="sm"
@@ -60,50 +60,13 @@ export function App() {
           >
             Poll now
           </Button>
-        </div>
-      </header>
-
-      <main className="radar-table">
-        <Table>
-          <Table.Header sticky>
-            <Table.Row>
-              <Table.Head className="radar-col-time">Time</Table.Head>
-              <Table.Head className="radar-col-source">Source</Table.Head>
-              <Table.Head className="radar-col-eoj">EOJ</Table.Head>
-              <Table.Head className="radar-col-epc">EPC</Table.Head>
-              <Table.Head>EDT</Table.Head>
-            </Table.Row>
-          </Table.Header>
-          <Table.Body>
-            {changes.map((change, index) => (
-              <Table.Row key={`${change.atMs}-${index}`}>
-                <Table.Cell className="radar-col-time radar-mono">
-                  <Text variant="mono-secondary">{formatTime(change.atMs)}</Text>
-                </Table.Cell>
-                <Table.Cell className="radar-col-source radar-mono">
-                  <Text variant="mono-secondary">{change.source}</Text>
-                </Table.Cell>
-                <Table.Cell className="radar-col-eoj radar-mono">
-                  <Text variant="mono">{change.eoj}</Text>
-                </Table.Cell>
-                <Table.Cell className="radar-col-epc radar-mono">
-                  <Text variant="mono">{formatEpc(change.epc)}</Text>
-                </Table.Cell>
-                <Table.Cell>
-                  <Text size="sm">{change.edt}</Text>
-                </Table.Cell>
-              </Table.Row>
-            ))}
-          </Table.Body>
-        </Table>
-        {changes.length === 0 && (
-          <div className="radar-empty">
-            <Text variant="secondary">
-              Waiting for ECHONET Lite device activity…
-            </Text>
-          </div>
-        )}
-      </main>
-    </div>
+        </header>
+        <EventViews
+          changes={visible}
+          loading={connection === "connecting"}
+          onPollNow={pollNow}
+        />
+      </div>
+    </Sidebar.Provider>
   );
 }
