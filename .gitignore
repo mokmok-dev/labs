@@ -5,3 +5,4 @@ result
 result-*
 target
 echonet-radar/web/dist
+.tmp

@@ -1,0 +1,11 @@
+{
+  "name": "demo-video-skill",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "playwright": "^1.62.0"
+  }
+}
