@@ -9967,7 +9967,7 @@ name = "workspace-hack"
 version = "0.0.0"
 dependencies = [
  "crossbeam-utils",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "indexmap",
  "log",
  "memchr",

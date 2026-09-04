@@ -14,7 +14,7 @@ version = "0.0.0"
 ### BEGIN HAKARI SECTION
 [dependencies]
 crossbeam-utils = { version = "0.8" }
-getrandom = { version = "0.3", default-features = false, features = ["std"] }
+getrandom = { version = "0.4", default-features = false, features = ["std"] }
 indexmap = { version = "2", features = ["serde"] }
 log = { version = "0.4", default-features = false, features = ["kv_unstable_serde"] }
 memchr = { version = "2" }
@@ -32,7 +32,7 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 
 [build-dependencies]
 crossbeam-utils = { version = "0.8" }
-getrandom = { version = "0.3", default-features = false, features = ["std"] }
+getrandom = { version = "0.4", default-features = false, features = ["std"] }
 indexmap = { version = "2", features = ["serde"] }
 log = { version = "0.4", default-features = false, features = ["kv_unstable_serde"] }
 memchr = { version = "2" }
