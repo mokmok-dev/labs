@@ -37,6 +37,7 @@ export function DeviceSidebar({
         <Sidebar.Content>
           <Sidebar.Group>
             <Empty
+              className="radar-sidebar-empty"
               size="sm"
               icon={<Broadcast size={32} className="text-kumo-inactive" />}
               title="No devices yet"
