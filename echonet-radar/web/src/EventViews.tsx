@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Broadcast, MagnifyingGlass, Repeat } from "@phosphor-icons/react";
+import { useMemo, useState } from "react";
+import { Broadcast, MagnifyingGlass, Repeat, WifiSlash } from "@phosphor-icons/react";
 import {
   Button,
   Empty,
@@ -11,7 +11,7 @@ import {
   Toolbar,
 } from "@cloudflare/kumo";
 import { latestState } from "./device";
-import type { ChangePayload } from "./types";
+import type { ChangePayload, Connection } from "./types";
 
 function formatTime(atMs: number): string {
   const time = new Date(atMs);
@@ -38,19 +38,25 @@ function matchesQuery(change: ChangePayload, query: string): boolean {
   );
 }
 
+function eventKey(change: ChangePayload, index: number): string {
+  return `${change.atMs}-${change.source}-${change.eoj}-${change.epc}-${index}`;
+}
+
 interface EventViewsProps {
   changes: ChangePayload[];
-  loading: boolean;
+  connection: Connection;
   onPollNow: () => void;
 }
 
-export function EventViews({ changes, loading, onPollNow }: EventViewsProps) {
+export function EventViews({ changes, connection, onPollNow }: EventViewsProps) {
   const [view, setView] = useState("activity");
   const [query, setQuery] = useState("");
 
   const trimmed = query.trim().toLowerCase();
-  const filtered = changes.filter((change) => matchesQuery(change, trimmed));
-  const rows = view === "state" ? latestState(filtered) : filtered;
+  const rows = useMemo(() => {
+    const filtered = changes.filter((change) => matchesQuery(change, trimmed));
+    return view === "state" ? latestState(filtered) : filtered;
+  }, [changes, trimmed, view]);
 
   return (
     <main className="radar-content">
@@ -74,6 +80,7 @@ export function EventViews({ changes, loading, onPollNow }: EventViewsProps) {
               <MagnifyingGlass size={14} />
             </InputGroup.Addon>
             <Toolbar.Input
+              aria-label="Search events"
               placeholder="Search events"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
@@ -82,7 +89,7 @@ export function EventViews({ changes, loading, onPollNow }: EventViewsProps) {
         </Toolbar>
       </div>
       <div className="radar-table">
-        {loading && changes.length === 0 ? (
+        {connection === "connecting" && changes.length === 0 ? (
           <div className="radar-center">
             <Loader size="lg" />
             <Text variant="secondary">Connecting to echonet-radar…</Text>
@@ -97,20 +104,28 @@ export function EventViews({ changes, loading, onPollNow }: EventViewsProps) {
           </div>
         ) : changes.length === 0 ? (
           <div className="radar-center">
-            <Empty
-              icon={<Broadcast size={48} className="text-kumo-inactive" />}
-              title="No device activity yet"
-              description="Events appear here when ECHONET Lite properties change."
-              contents={
-                <Button
-                  variant="secondary"
-                  icon={<Repeat size={14} />}
-                  onClick={onPollNow}
-                >
-                  Poll now
-                </Button>
-              }
-            />
+            {connection === "closed" ? (
+              <Empty
+                icon={<WifiSlash size={48} className="text-kumo-inactive" />}
+                title="Disconnected"
+                description="Waiting for echonet-radar to come back…"
+              />
+            ) : (
+              <Empty
+                icon={<Broadcast size={48} className="text-kumo-inactive" />}
+                title="No device activity yet"
+                description="Events appear here when ECHONET Lite properties change."
+                contents={
+                  <Button
+                    variant="secondary"
+                    icon={<Repeat size={14} />}
+                    onClick={onPollNow}
+                  >
+                    Poll now
+                  </Button>
+                }
+              />
+            )}
           </div>
         ) : (
           <Table>
@@ -127,7 +142,7 @@ export function EventViews({ changes, loading, onPollNow }: EventViewsProps) {
             </Table.Header>
             <Table.Body>
               {rows.map((change, index) => (
-                <Table.Row key={`${change.atMs}-${index}`}>
+                <Table.Row key={eventKey(change, index)}>
                   <Table.Cell className="radar-col-time radar-mono">
                     <Text variant="mono-secondary">
                       {formatTime(change.atMs)}

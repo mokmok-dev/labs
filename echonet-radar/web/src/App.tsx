@@ -104,7 +104,7 @@ export function App() {
           </header>
           <EventViews
             changes={visible}
-            loading={connection === "connecting"}
+            connection={connection}
             onPollNow={handlePollNow}
           />
         </div>
