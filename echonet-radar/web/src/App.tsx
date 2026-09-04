@@ -1,47 +1,21 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Badge, Button, Table, Text } from "@cloudflare/kumo";
-import { Broadcast, Repeat } from "@phosphor-icons/react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Badge,
+  Button,
+  createKumoToastManager,
+  Sidebar,
+  Text,
+  Toasty,
+} from "@cloudflare/kumo";
+import { Repeat } from "@phosphor-icons/react";
+import { sameDevice, type DeviceKey } from "./device";
+import { DeviceSidebar } from "./DeviceSidebar";
+import { EventViews } from "./EventViews";
+import { useRadarSocket } from "./useRadarSocket";
 
-const MAX_EVENTS = 1000;
+const toastManager = createKumoToastManager();
 
-interface ChangePayload {
-  atMs: number;
-  source: string;
-  eoj: string;
-  epc: number;
-  edt: string;
-}
-
-type ServerMessage =
-  | { type: "snapshot"; changes: ChangePayload[]; status: string }
-  | { type: "change"; atMs: number; source: string; eoj: string; epc: number; edt: string }
-  | { type: "status"; message: string };
-
-const wsUrl = (): string => {
-  const configured = import.meta.env.VITE_WS_URL;
-  if (configured) return configured;
-  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-  return `${scheme}://${window.location.host}/ws`;
-};
-
-type Connection = "connecting" | "open" | "closed";
-
-function formatTime(atMs: number): string {
-  const time = new Date(atMs);
-  const now = new Date();
-  const sameDay =
-    time.getFullYear() === now.getFullYear() &&
-    time.getMonth() === now.getMonth() &&
-    time.getDate() === now.getDate();
-  const clock = time.toLocaleTimeString();
-  return sameDay ? clock : `${time.toLocaleDateString()} ${clock}`;
-}
-
-function formatEpc(epc: number): string {
-  return `0x${epc.toString(16).padStart(2, "0").toUpperCase()}`;
-}
-
-function connectionBadge(connection: Connection) {
+function connectionBadge(connection: "connecting" | "open" | "closed") {
   switch (connection) {
     case "open":
       return (
@@ -57,135 +31,84 @@ function connectionBadge(connection: Connection) {
 }
 
 export function App() {
-  const [changes, setChanges] = useState<ChangePayload[]>([]);
-  const [status, setStatus] = useState("connecting");
-  const [connection, setConnection] = useState<Connection>("connecting");
-  const socketRef = useRef<WebSocket | null>(null);
-
-  const connect = useCallback(() => {
-    const socket = new WebSocket(wsUrl());
-    socketRef.current = socket;
-    socket.onopen = () => setConnection("open");
-    socket.onclose = () => {
-      if (socketRef.current === socket) {
-        socketRef.current = null;
-        setConnection("closed");
-      }
-    };
-    socket.onmessage = (event) => {
-      const message = JSON.parse(event.data) as ServerMessage;
-      switch (message.type) {
-        case "snapshot":
-          setChanges(message.changes);
-          setStatus(message.status);
-          break;
-        case "change":
-          setChanges((previous) => [message, ...previous].slice(0, MAX_EVENTS));
-          break;
-        case "status":
-          setStatus(message.message);
-          break;
-      }
-    };
-  }, []);
+  const { changes, status, connection, pollNow } = useRadarSocket();
+  const [selected, setSelected] = useState<DeviceKey | null>(null);
+  const previousConnection = useRef(connection);
 
   useEffect(() => {
-    connect();
-    return () => {
-      socketRef.current?.close();
-      socketRef.current = null;
-    };
-  }, [connect]);
-
-  useEffect(() => {
-    if (connection !== "closed") return;
-    const timer = window.setTimeout(connect, 1000);
-    return () => window.clearTimeout(timer);
-  }, [connection, connect]);
-
-  const pollNow = useCallback(() => {
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ type: "pollNow" }));
+    if (
+      previousConnection.current === "open" &&
+      connection === "closed"
+    ) {
+      toastManager.add({
+        variant: "error",
+        title: "Connection lost",
+        description: "Reconnecting to echonet-radar…",
+      });
     }
-  }, []);
+    previousConnection.current = connection;
+  }, [connection]);
+
+  const handlePollNow = useCallback(() => {
+    if (pollNow()) {
+      toastManager.add({
+        variant: "info",
+        title: "Poll requested",
+        description: "A manual poll was sent to the radar.",
+      });
+    } else {
+      toastManager.add({
+        variant: "error",
+        title: "Not connected",
+        description: "Cannot poll while the websocket is down.",
+      });
+    }
+  }, [pollNow]);
+
+  const visible = useMemo(
+    () =>
+      selected === null
+        ? changes
+        : changes.filter((change) => sameDevice(selected, change)),
+    [changes, selected],
+  );
 
   return (
-    <div className="radar">
-      <header className="radar-header">
-        <div className="radar-title">
-          <Broadcast size={18} weight="duotone" />
-          <Text variant="heading" as="h1">
-            echonet-radar
-          </Text>
+    <Toasty toastManager={toastManager}>
+      <Sidebar.Provider defaultOpen collapsible="icon">
+        <DeviceSidebar
+          changes={changes}
+          connection={connection}
+          selected={selected}
+          onSelect={setSelected}
+        />
+        <div className="radar-main">
+          <header className="radar-header">
+            <div className="radar-status">
+              {connectionBadge(connection)}
+              <Text variant="secondary" size="sm">
+                {status}
+              </Text>
+              <span className="radar-mono">
+                <Text variant="mono-secondary">{visible.length} events</Text>
+              </span>
+            </div>
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<Repeat size={14} />}
+              onClick={handlePollNow}
+            >
+              Poll now
+            </Button>
+          </header>
+          <EventViews
+            changes={visible}
+            connection={connection}
+            onPollNow={handlePollNow}
+          />
         </div>
-        <div className="radar-status">
-          {connectionBadge(connection)}
-          <Text variant="secondary" size="sm">
-            {status}
-          </Text>
-          <Text variant="mono-secondary" size="sm">
-            {changes.length} events
-          </Text>
-          <Button
-            variant="secondary"
-            size="sm"
-            icon={<Repeat size={14} />}
-            onClick={pollNow}
-          >
-            Poll now
-          </Button>
-        </div>
-      </header>
-
-      <main className="radar-table">
-        <Table>
-          <Table.Header sticky>
-            <Table.Row>
-              <Table.Head className="radar-col-time">Time</Table.Head>
-              <Table.Head className="radar-col-source">Source</Table.Head>
-              <Table.Head className="radar-col-eoj">EOJ</Table.Head>
-              <Table.Head className="radar-col-epc">EPC</Table.Head>
-              <Table.Head>EDT</Table.Head>
-            </Table.Row>
-          </Table.Header>
-          <Table.Body>
-            {changes.map((change, index) => (
-              <Table.Row key={`${change.atMs}-${index}`}>
-                <Table.Cell className="radar-col-time radar-mono">
-                  <Text variant="mono-secondary" size="sm">
-                    {formatTime(change.atMs)}
-                  </Text>
-                </Table.Cell>
-                <Table.Cell className="radar-col-source radar-mono">
-                  <Text variant="mono-secondary" size="sm">
-                    {change.source}
-                  </Text>
-                </Table.Cell>
-                <Table.Cell className="radar-col-eoj radar-mono">
-                  <Text variant="mono" size="sm">
-                    {change.eoj}
-                  </Text>
-                </Table.Cell>
-                <Table.Cell className="radar-col-epc radar-mono">
-                  <Text variant="mono" size="sm">
-                    {formatEpc(change.epc)}
-                  </Text>
-                </Table.Cell>
-                <Table.Cell>
-                  <Text size="sm">{change.edt}</Text>
-                </Table.Cell>
-              </Table.Row>
-            ))}
-          </Table.Body>
-        </Table>
-        {changes.length === 0 && (
-          <div className="radar-empty">
-            <Text variant="secondary">
-              Waiting for ECHONET Lite device activity…
-            </Text>
-          </div>
-        )}
-      </main>
-    </div>
+      </Sidebar.Provider>
+    </Toasty>
   );
 }
