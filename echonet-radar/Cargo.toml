@@ -1,5 +1,5 @@
 [package]
-description = "ratatui dashboard for ECHONET Lite devices"
+description = "GPUI dashboard for ECHONET Lite devices"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 name = "echonet-radar"
@@ -7,12 +7,18 @@ rust-version = "1.98"
 version.workspace = true
 
 [dependencies]
+axum.workspace = true
 echonet-lite.workspace = true
 echonet-lite-udp.workspace = true
-ratatui.workspace = true
+gpui-kit.workspace = true
+gpui-wry.workspace = true
+rust-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 usage = { workspace = true, features = ["completions"] }
 workspace-hack.workspace = true
+wry.workspace = true
 
 [lints]
 workspace = true
