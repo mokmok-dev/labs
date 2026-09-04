@@ -149,10 +149,16 @@
             packages = with pkgs; [
               cargo-hakari
               nodejs_24
+              playwright-test
               pnpm
               rustToolchain
               sccache
             ];
+
+            # Node API scripts resolve browsers from nixpkgs instead of
+            # ~/.cache/ms-playwright. Keep the playwright npm version in
+            # .agents/skills/demo-video matched with nixpkgs.
+            PLAYWRIGHT_BROWSERS_PATH = toString pkgs.playwright-driver.passthru.browsers;
 
             shellHook = ''
               export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
