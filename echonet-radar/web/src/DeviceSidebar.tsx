@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { Broadcast, Cpu, Stack } from "@phosphor-icons/react";
 import { Empty, Meter, Sidebar, Text } from "@cloudflare/kumo";
 import { sameDevice, summarizeDevices, type DeviceKey } from "./device";
@@ -17,7 +18,7 @@ export function DeviceSidebar({
   selected,
   onSelect,
 }: DeviceSidebarProps) {
-  const groups = summarizeDevices(changes);
+  const groups = useMemo(() => summarizeDevices(changes), [changes]);
 
   return (
     <Sidebar>
