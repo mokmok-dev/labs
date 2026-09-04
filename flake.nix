@@ -39,7 +39,7 @@
           webDeps = pkgs.fetchPnpmDeps {
             pname = "echonet-radar-web";
             version = "0.0.0";
-            inherit webSrc;
+            src = webSrc;
             inherit (pkgs) pnpm;
             fetcherVersion = 4;
             hash = "sha256-ZIyJkfwT2wRF6tz0MLjwvYQFSgu4ebCH2kNfWwJLRmM=";
