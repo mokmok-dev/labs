@@ -26,6 +26,7 @@
         {
           config,
           pkgs,
+          lib,
           system,
           ...
         }:
@@ -33,9 +34,70 @@
           rustToolchain = pkgs.rust-bin.stable.latest.default;
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
           src = pkgs.lib.cleanSourceWith { src = ./.; };
+
+          webSrc = pkgs.lib.cleanSourceWith { src = ./echonet-radar/web; };
+          webDeps = pkgs.fetchPnpmDeps {
+            pname = "echonet-radar-web";
+            version = "0.0.0";
+            inherit webSrc;
+            inherit (pkgs) pnpm;
+            fetcherVersion = 4;
+            hash = "sha256-ZIyJkfwT2wRF6tz0MLjwvYQFSgu4ebCH2kNfWwJLRmM=";
+          };
+          webAssets = pkgs.stdenv.mkDerivation {
+            pname = "echonet-radar-web";
+            version = "0.0.0";
+            src = webSrc;
+            pnpmDeps = webDeps;
+            nativeBuildInputs = [
+              pkgs.nodejs_24
+              pkgs.pnpm
+              pkgs.pnpmConfigHook
+            ];
+            buildPhase = ''
+              runHook preBuild
+              pnpm build
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out
+              cp -r dist/. $out/
+              runHook postInstall
+            '';
+          };
+
+          # GPUI and wry need these to link and run on Linux. macOS uses the
+          # system frameworks (Metal, WebKit) and needs nothing extra.
+          guiNativeBuildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.pkg-config
+          ];
+          guiBuildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux (
+            with pkgs;
+            [
+              wayland
+              vulkan-headers
+              vulkan-loader
+              libxcb
+              libxkbcommon
+              fontconfig
+              glib
+              gtk3
+              webkitgtk_4_1
+            ]
+          );
+
           commonArgs = {
             inherit src;
             strictDeps = true;
+            nativeBuildInputs = guiNativeBuildInputs;
+            buildInputs = guiBuildInputs;
+            # rust-embed requires `web/dist` at compile time; stage the built
+            # UI before cargo touches the crate.
+            postPatch = ''
+              mkdir -p echonet-radar/web/dist
+              cp -r ${webAssets}/. echonet-radar/web/dist/
+            '';
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
         in
@@ -46,13 +108,16 @@
           };
 
           checks = {
-            clippy = craneLib.cargoClippy {
-              inherit
-                src
-                cargoArtifacts
-                ;
-              cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
-            };
+            clippy = craneLib.cargoClippy (
+              commonArgs
+              // {
+                inherit
+                  src
+                  cargoArtifacts
+                  ;
+                cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
+              }
+            );
             hakari = craneLib.mkCargoDerivation {
               inherit src;
               pname = "labs-hakari";
@@ -83,6 +148,8 @@
 
             packages = with pkgs; [
               cargo-hakari
+              nodejs_24
+              pnpm
               rustToolchain
               sccache
             ];
@@ -97,6 +164,9 @@
               cargoArtifacts
               commonArgs
               craneLib
+              lib
+              pkgs
+              webAssets
               ;
           };
 
