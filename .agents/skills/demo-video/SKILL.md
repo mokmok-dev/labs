@@ -13,8 +13,11 @@ description: |
 PRの変更内容を分析し、Playwrightで画面操作を録画してデモ動画を生成するスキル。
 クリック箇所にリップル強調、画面下部にステップ説明のアノテーションを表示する。
 
-本リポジトリ（console: React + TanStack Router + Vite の SPA）向けに設計している。
-ログイン認証は不要（`/api/*` は未接続のため、画面遷移のみを対象とする）。
+本リポジトリの `echonet-radar` webview UI（`echonet-radar/web`: React + Vite、
+単一ページ・ルーティングなし）向けに設計している。ログイン認証は不要。
+WebSocket（`/ws`）で ECHONET Lite のデバイス検出イベントを受け取っており、
+未接続時は「reconnecting」バッジと空テーブル
+（Waiting for ECHONET Lite device activity…）が表示される。
 
 ## 使い方
 
@@ -45,8 +48,9 @@ PRの変更内容を分析し、Playwrightで画面操作を録画してデモ�
 gh pr view <PR番号> --json title,body,files,baseRefName
 ```
 
-変更ファイルから影響する画面・ルートを特定する。
-ルートは `apps/console/src/routes/` のファイルベースルーティングに対応する。
+変更ファイルから影響する画面要素を特定する。
+UIは `echonet-radar/web/src/`（単一ページの `App.tsx`）、
+Rust側（webview・WSサーバー）は `echonet-radar/src/`。
 
 #### 2. シナリオ提案
 
@@ -75,7 +79,7 @@ node -e '
     const b = await h.launchBrowser(true);
     const c = await b.newContext({ viewport: { width: 1280, height: 720 } });
     const p = await c.newPage();
-    await p.goto("http://localhost:5173/table");
+    await p.goto("http://localhost:5173/");
     await p.waitForLoadState("networkidle");
     console.log("==== A11Y ====");
     console.log(await h.snapshotA11y(p));
@@ -142,11 +146,19 @@ await browser.close();
 #### 5. 録画実行
 
 ```bash
-pnpm dev &                        # 開発サーバー起動（別ターミナル）
+pnpm --dir echonet-radar/web dev &    # vite devサーバー（スタイル確認用）
 node .agents/skills/demo-video/scripts/run_all.mjs
 ```
 
-コミット済みのデフォルトシナリオ（全画面を巡回）は
+データが入った状態で録画する場合は Rust アプリを起動し、表示されたURLを
+`DEMO_BASE_URL` に指定する（埋め込みUI + 実デバイス検出の `/ws` が含まれる）。
+
+```bash
+cargo run -p echonet-radar            # 起動時に http://127.0.0.1:<port> を表示
+DEMO_BASE_URL=http://127.0.0.1:<port> node .agents/skills/demo-video/scripts/run_all.mjs
+```
+
+コミット済みのデフォルトシナリオ（単一ページのヘッダー・テーブル確認）は
 `.agents/skills/demo-video/scripts/run_all.mjs`。PR固有のシナリオは
 `.tmp/demo/` に置いた専用スクリプトで実行する。
 
@@ -156,8 +168,8 @@ node .agents/skills/demo-video/scripts/run_all.mjs
 ls -la .tmp/demo/videos/*.mp4
 ```
 
-出力先パスをユーザーに報告する。MP4 は PR コメントへ手動添付できる
-（GitHub はコメントの `<video>` 埋め込みで mp4 を再生できる）。
+出力先パスをユーザーに報告する。ffmpeg が無い場合は WebM のまま出力される
+（GitHub コメントの `<video>` 埋め込みで再生できるのは MP4 のみ）。
 
 ### パターンB: 既存スクリプト実行
 
@@ -169,19 +181,22 @@ node <指定されたスクリプトパス>
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
-| `DEMO_BASE_URL` | `http://localhost:5173` | 対象サーバーURL（vite dev） |
+| `DEMO_BASE_URL` | `http://localhost:5173` | 対象サーバーURL（vite dev または cargo run で表示されるURL） |
 | `DEMO_HEADLESS` | `true` | ヘッドレスモード（falseで表示） |
 
 ## 前提条件
 
-- Nix devShell: `nix develop`（`flake.nix` が `playwright-test`, `ffmpeg`,
-  `PLAYWRIGHT_BROWSERS_PATH`（nixpkgs製Chromium）を提供）
-- `playwright` npmパッケージ: ルート `package.json` の devDependencies で管理
-  （バージョンは `pnpm-workspace.yaml` の catalog と nixpkgs の playwright と一致させる）
-- フォールバック: nixpkgs の Chromium がビルドできない環境では
-  `npx playwright install chromium` で取得したブラウザを使う
-  （`PLAYWRIGHT_BROWSERS_PATH` を unset すれば自動検出）
-- 対象サーバーが起動済み（`pnpm dev`）
+- Node.js 24（Nix devShell `nix develop` / direnv で提供）
+- `playwright` npmパッケージ: スキルディレクトリ内
+  （`.agents/skills/demo-video/package.json`）で管理。初回のみインストールする:
+
+  ```bash
+  pnpm --dir .agents/skills/demo-video install
+  pnpm --dir .agents/skills/demo-video exec playwright install chromium
+  ```
+
+- ffmpeg: MP4変換に使用。PATHに無い場合は変換をスキップし、WebM のまま出力する
+- 対象サーバーが起動済み（vite dev または `cargo run -p echonet-radar`）
 
 ## 出力
 
