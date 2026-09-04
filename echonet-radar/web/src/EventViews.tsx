@@ -79,7 +79,7 @@ export function EventViews({ changes, connection, onPollNow }: EventViewsProps) 
             <InputGroup.Addon>
               <MagnifyingGlass size={14} />
             </InputGroup.Addon>
-            <Toolbar.Input
+            <InputGroup.Input
               aria-label="Search events"
               placeholder="Search events"
               value={query}
