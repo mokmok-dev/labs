@@ -1,5 +1,5 @@
 import ReactDOM from "react-dom/client";
-import "@cloudflare/kumo/styles";
+import "@cloudflare/kumo/styles/standalone";
 import "./index.css";
 import { App } from "./App";
 
