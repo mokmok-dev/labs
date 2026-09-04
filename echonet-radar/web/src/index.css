@@ -53,6 +53,11 @@ body {
   position: relative;
 }
 
+.radar-mono {
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
 .radar-col-time {
   width: 140px;
   white-space: nowrap;
