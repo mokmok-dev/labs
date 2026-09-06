@@ -1,4 +1,4 @@
-import type { ChangePayload } from "./types";
+import type { ChangePayload, DevicePayload } from "./types";
 
 export interface DeviceKey {
   source: string;
@@ -18,19 +18,22 @@ export interface DeviceGroup {
   devices: DeviceSummary[];
 }
 
-export function summarizeDevices(changes: ChangePayload[]): DeviceGroup[] {
+export function summarizeDevices(
+  changes: ChangePayload[],
+  devices: DevicePayload[],
+): DeviceGroup[] {
   const groups = new Map<string, Map<string, DeviceSummary>>();
   for (const change of changes) {
-    let devices = groups.get(change.source);
-    if (!devices) {
-      devices = new Map();
-      groups.set(change.source, devices);
+    let group = groups.get(change.source);
+    if (!group) {
+      group = new Map();
+      groups.set(change.source, group);
     }
-    const existing = devices.get(change.eoj);
+    const existing = group.get(change.eoj);
     if (existing) {
       existing.events += 1;
     } else {
-      devices.set(change.eoj, {
+      group.set(change.eoj, {
         source: change.source,
         eoj: change.eoj,
         events: 1,
@@ -39,10 +42,28 @@ export function summarizeDevices(changes: ChangePayload[]): DeviceGroup[] {
       });
     }
   }
+  // Devices discovered by the radar but silent so far appear immediately,
+  // without waiting for their first observed value.
+  for (const device of devices) {
+    let group = groups.get(device.source);
+    if (!group) {
+      group = new Map();
+      groups.set(device.source, group);
+    }
+    if (!group.has(device.eoj)) {
+      group.set(device.eoj, {
+        source: device.source,
+        eoj: device.eoj,
+        events: 0,
+        lastActivityMs: 0,
+        lastEdt: "",
+      });
+    }
+  }
   return [...groups.entries()]
-    .map(([source, devices]) => ({
+    .map(([source, group]) => ({
       source,
-      devices: [...devices.values()].sort(
+      devices: [...group.values()].sort(
         (a, b) => b.lastActivityMs - a.lastActivityMs,
       ),
     }))

@@ -2,10 +2,11 @@ import { useMemo } from "react";
 import { Broadcast, Cpu, Stack } from "@phosphor-icons/react";
 import { Empty, Sidebar, Text } from "@cloudflare/kumo";
 import { sameDevice, summarizeDevices, type DeviceKey } from "./device";
-import type { ChangePayload, Connection } from "./types";
+import type { ChangePayload, Connection, DevicePayload } from "./types";
 
 interface DeviceSidebarProps {
   changes: ChangePayload[];
+  devices: DevicePayload[];
   connection: Connection;
   selected: DeviceKey | null;
   onSelect: (device: DeviceKey | null) => void;
@@ -13,11 +14,15 @@ interface DeviceSidebarProps {
 
 export function DeviceSidebar({
   changes,
+  devices,
   connection,
   selected,
   onSelect,
 }: DeviceSidebarProps) {
-  const groups = useMemo(() => summarizeDevices(changes), [changes]);
+  const groups = useMemo(
+    () => summarizeDevices(changes, devices),
+    [changes, devices],
+  );
 
   return (
     <Sidebar>
@@ -67,7 +72,11 @@ export function DeviceSidebar({
                     key={`${device.source}/${device.eoj}`}
                     icon={Cpu}
                     active={selected !== null && sameDevice(selected, device)}
-                    tooltip={`${device.eoj} — ${device.lastEdt}`}
+                    tooltip={
+                      device.lastEdt
+                        ? `${device.eoj} — ${device.lastEdt}`
+                        : device.eoj
+                    }
                     onClick={() =>
                       onSelect({ source: device.source, eoj: device.eoj })
                     }

@@ -27,10 +27,11 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{StatusCode, Uri, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use echonet_lite::frame::Eoj;
 use echonet_lite_udp::EchoNetSocket;
 use echonet_radar::{
-    ChangeEvent, Command, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, RadarConfig,
-    RadarEvent, run_service,
+    ChangeEvent, Command, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, DeviceEvent,
+    RadarConfig, RadarEvent, run_service,
 };
 use gpui_kit::component::{ActiveTheme as _, Root, Theme, TitleBar, h_flex, v_flex};
 use gpui_kit::{
@@ -191,6 +192,14 @@ fn run_network(
     result
 }
 
+/// Render an EOJ in the canonical `0x013001` wire format.
+fn format_eoj(eoj: Eoj) -> String {
+    format!(
+        "0x{:02X}{:02X}{:02X}",
+        eoj.class_group, eoj.class, eoj.instance
+    )
+}
+
 /// One observed change, serialized for the web UI.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -211,12 +220,27 @@ impl ChangePayload {
         Self {
             at_ms: u64::try_from(at_ms).unwrap_or(0),
             source: change.source,
-            eoj: format!(
-                "0x{:02X}{:02X}{:02X}",
-                change.eoj.class_group, change.eoj.class, change.eoj.instance
-            ),
+            eoj: format_eoj(change.eoj),
             epc: change.epc,
             edt: change.edt,
+        }
+    }
+}
+
+/// A device object known to the radar, listed in the sidebar before any of its
+/// values are observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevicePayload {
+    source: SocketAddr,
+    eoj: String,
+}
+
+impl DevicePayload {
+    fn from_device(device: &DeviceEvent) -> Self {
+        Self {
+            source: device.source,
+            eoj: format_eoj(device.eoj),
         }
     }
 }
@@ -227,9 +251,11 @@ impl ChangePayload {
 enum ServerMessage {
     Snapshot {
         changes: Vec<ChangePayload>,
+        devices: Vec<DevicePayload>,
         status: String,
     },
     Change(Box<ChangePayload>),
+    Device(DevicePayload),
     Status {
         message: String,
     },
@@ -242,10 +268,12 @@ enum ClientMessage {
     PollNow,
 }
 
-/// Shared bridge history: recent changes plus the latest status message.
+/// Shared bridge history: recent changes, known devices, and the latest status
+/// message.
 #[derive(Debug, Default)]
 struct History {
     changes: VecDeque<ChangePayload>,
+    devices: Vec<DevicePayload>,
     status: String,
 }
 
@@ -256,6 +284,15 @@ impl History {
     ) {
         self.changes.push_front(change);
         self.changes.truncate(MAX_EVENTS);
+    }
+
+    fn register_device(
+        &mut self,
+        device: DevicePayload,
+    ) {
+        if !self.devices.contains(&device) {
+            self.devices.push(device);
+        }
     }
 }
 
@@ -329,6 +366,11 @@ fn pump_events(
                 lock_history(history).push(payload.clone());
                 ServerMessage::Change(Box::new(payload))
             },
+            RadarEvent::Device(device) => {
+                let payload = DevicePayload::from_device(&device);
+                lock_history(history).register_device(payload.clone());
+                ServerMessage::Device(payload)
+            },
             RadarEvent::Status(status) => {
                 lock_history(history).status.clone_from(&status);
                 ServerMessage::Status { message: status }
@@ -359,6 +401,7 @@ async fn handle_socket(
         let history = lock_history(&state.history);
         serde_json::to_string(&ServerMessage::Snapshot {
             changes: history.changes.iter().cloned().collect(),
+            devices: history.devices.clone(),
             status: history.status.clone(),
         })
     };
@@ -545,6 +588,17 @@ mod tests {
         })
     }
 
+    fn device(
+        class_group: u8,
+        class: u8,
+        instance: u8,
+    ) -> DevicePayload {
+        DevicePayload {
+            source: "192.0.2.1:3610".parse().unwrap(),
+            eoj: format_eoj(Eoj::new(class_group, class, instance)),
+        }
+    }
+
     #[test]
     fn change_payload_uses_camel_case_wire_format() {
         let value = serde_json::to_value(payload(0x01, 0x30, 0x01, 0x80, "ON")).unwrap();
@@ -557,15 +611,61 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_message_carries_changes_and_status() {
+    fn snapshot_message_carries_changes_devices_and_status() {
         let message = ServerMessage::Snapshot {
             changes: vec![payload(0x01, 0x30, 0x01, 0x80, "ON")],
+            devices: vec![device(0x01, 0x30, 0x01)],
             status: String::from("starting"),
         };
         let value = serde_json::to_value(message).unwrap();
         assert_eq!(value.get("type"), Some(&serde_json::json!("snapshot")));
         assert_eq!(value.get("status"), Some(&serde_json::json!("starting")));
         assert!(value.get("changes").unwrap().is_array());
+        assert!(value.get("devices").unwrap().is_array());
+    }
+
+    #[test]
+    fn device_message_uses_wire_format() {
+        let value = serde_json::to_value(ServerMessage::Device(device(0x01, 0x30, 0x01))).unwrap();
+        assert_eq!(value.get("type"), Some(&serde_json::json!("device")));
+        assert_eq!(
+            value.get("source"),
+            Some(&serde_json::json!("192.0.2.1:3610"))
+        );
+        assert_eq!(value.get("eoj"), Some(&serde_json::json!("0x013001")));
+    }
+
+    #[test]
+    fn history_register_device_dedupes_by_source_and_eoj() {
+        let mut history = History::default();
+        history.register_device(device(0x01, 0x30, 0x01));
+        history.register_device(device(0x01, 0x30, 0x01));
+        history.register_device(device(0x01, 0x30, 0x02));
+        assert_eq!(history.devices.len(), 2);
+    }
+
+    #[test]
+    fn pump_events_announces_devices_and_dedupes_history() {
+        let (sender, receiver) = mpsc::channel();
+        let history: SharedHistory = Arc::new(Mutex::new(History::default()));
+        let (broadcast, _) = tokio::sync::broadcast::channel(8);
+        let mut feed = broadcast.subscribe();
+
+        for _ in 0..2 {
+            sender
+                .send(RadarEvent::Device(DeviceEvent {
+                    source: "192.0.2.1:3610".parse().unwrap(),
+                    eoj: Eoj::new(0x01, 0x30, 0x01),
+                }))
+                .unwrap();
+        }
+        drop(sender);
+        pump_events(receiver, &history, &broadcast);
+
+        assert_eq!(lock_history(&history).devices.len(), 1);
+        let json = feed.try_recv().unwrap();
+        assert!(json.contains(r#""type":"device""#));
+        assert!(json.contains(r#""eoj":"0x013001""#));
     }
 
     #[test]

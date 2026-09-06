@@ -1,15 +1,17 @@
 //! ECHONET Lite state-change discovery and logging for `echonet-radar`.
 //!
-//! The service keeps the transport and terminal rendering separate: this module
-//! owns protocol state and emits [`RadarEvent`]s, while the binary renders the
-//! resulting time-series feed with ratatui.
+//! The service keeps the transport and rendering separate: this module owns
+//! protocol state and emits [`RadarEvent`]s, while the binary renders the
+//! resulting time-series feed in its web UI.
 //!
 //! The radar performs periodic discovery (every minute) to learn which device
 //! objects exist, and periodic value polling (every 15 seconds) to detect state
-//! changes. Any property whose raw EDT differs from the last known value is
-//! reported as a [`RadarEvent::Change`]. When a device pushes an INF telegram,
-//! its properties are processed immediately so the change is rendered without
-//! waiting for the next poll round.
+//! changes. Devices are announced as [`RadarEvent::Device`] as soon as they are
+//! tracked, so they can be listed before any value is observed. Any property
+//! whose raw EDT differs from the last known value is reported as a
+//! [`RadarEvent::Change`]. When a device pushes an INF telegram, its properties
+//! are processed immediately so the change is rendered without waiting for the
+//! next poll round.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -163,11 +165,22 @@ pub struct ChangeEvent {
     pub edt: String,
 }
 
+/// A device object that the radar just learned about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceEvent {
+    /// Address from which the device was discovered.
+    pub source: SocketAddr,
+    /// The newly tracked device object.
+    pub eoj: Eoj,
+}
+
 /// An event emitted by the radar service for the terminal to render.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RadarEvent {
     /// A property value changed on a device object.
     Change(ChangeEvent),
+    /// A device object became tracked, before any value was observed for it.
+    Device(DeviceEvent),
     /// A status message for the header (discovery, errors, poll rounds).
     Status(String),
 }
@@ -453,7 +466,6 @@ struct ServiceState {
     values: HashMap<DeviceId, BTreeMap<u8, Vec<u8>>>,
     source_ports: HashMap<DeviceId, u16>,
     pending: HashMap<u16, PendingRequest>,
-    discovery_tid: Option<u16>,
     next_tid: u16,
     first_refresh_done: bool,
     status: String,
@@ -472,7 +484,6 @@ impl ServiceState {
             values: HashMap::new(),
             source_ports: HashMap::new(),
             pending: HashMap::new(),
-            discovery_tid: None,
             next_tid: 0,
             first_refresh_done: false,
             status: String::from("waiting for discovery"),
@@ -487,16 +498,10 @@ impl ServiceState {
         let _ = self.events.send(RadarEvent::Status(message));
     }
 
-    fn allocate_tid(
-        &mut self,
-        replace_discovery: bool,
-    ) -> io::Result<u16> {
+    fn allocate_tid(&mut self) -> io::Result<u16> {
         for _ in 0..=u32::from(u16::MAX) {
             self.next_tid = self.next_tid.wrapping_add(1);
             if self.next_tid == 0 || self.pending.contains_key(&self.next_tid) {
-                continue;
-            }
-            if !replace_discovery && self.discovery_tid == Some(self.next_tid) {
                 continue;
             }
             return Ok(self.next_tid);
@@ -519,15 +524,13 @@ impl ServiceState {
         &mut self,
         socket: &EchoNetSocket,
     ) -> io::Result<()> {
-        let tid = self.allocate_tid(true)?;
+        let tid = self.allocate_tid()?;
         let header = discovery_header(tid);
         let properties = [Property {
             epc: DISCOVERY_EPC,
             edt: EMPTY_EDT,
         }];
-        socket.send_frame(header, &properties).await.map(|_| ())?;
-        self.discovery_tid = Some(tid);
-        Ok(())
+        socket.send_frame(header, &properties).await.map(|_| ())
     }
 
     async fn send_property_map(
@@ -535,7 +538,7 @@ impl ServiceState {
         socket: &EchoNetSocket,
         key: DeviceKey,
     ) -> io::Result<()> {
-        let tid = self.allocate_tid(false)?;
+        let tid = self.allocate_tid()?;
         self.pending.insert(
             tid,
             PendingRequest::PropertyMap {
@@ -573,7 +576,7 @@ impl ServiceState {
         key: DeviceKey,
         epcs: Vec<u8>,
     ) -> io::Result<()> {
-        let tid = self.allocate_tid(false)?;
+        let tid = self.allocate_tid()?;
         let properties: Vec<_> = epcs
             .iter()
             .copied()
@@ -658,7 +661,7 @@ impl ServiceState {
             self.process_inf(socket, header, properties, source).await;
             return;
         }
-        if self.is_discovery_response(header, &properties) {
+        if Self::is_discovery_response(header, &properties) {
             self.process_discovery(socket, properties, source).await;
             return;
         }
@@ -694,15 +697,42 @@ impl ServiceState {
         }
     }
 
+    /// Whether a frame is a node-profile instance list. Matching is by shape
+    /// rather than transaction ID so responses that arrive after a newer
+    /// discovery round (slow devices are common on the wire) still register.
     fn is_discovery_response(
-        &self,
         header: FrameHeader,
         properties: &[(u8, Vec<u8>)],
     ) -> bool {
-        self.discovery_tid == Some(header.tid)
-            && header.esv.code() == GET_RESPONSE_ESV_CODE
+        header.esv.code() == GET_RESPONSE_ESV_CODE
             && header.seoj.class_code() == NODE_PROFILE_CLASS_CODE
             && properties.iter().any(|(epc, _)| *epc == DISCOVERY_EPC)
+    }
+
+    /// Track a device object for polling if it is not known yet, announcing it
+    /// as [`RadarEvent::Device`]. Returns whether the object was new.
+    fn register_device(
+        &mut self,
+        source: SocketAddr,
+        eoj: Eoj,
+    ) -> bool {
+        let is_new = match self.poll_epcs.entry(DeviceId {
+            ip: source.ip(),
+            eoj,
+        }) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(fallback_poll_epcs(eoj.class_code()));
+                true
+            },
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        };
+        if is_new {
+            let _ = self
+                .events
+                .send(RadarEvent::Device(DeviceEvent { source, eoj }));
+        }
+        self.remember_source(source.ip(), eoj, source.port());
+        is_new
     }
 
     async fn process_discovery(
@@ -727,15 +757,9 @@ impl ServiceState {
             if eoj.class_code() == NODE_PROFILE_CLASS_CODE {
                 continue;
             }
-            let id = DeviceId {
-                ip: source.ip(),
-                eoj,
-            };
-            self.poll_epcs.entry(id).or_insert_with(|| {
+            if self.register_device(source, eoj) {
                 count += 1;
-                fallback_poll_epcs(eoj.class_code())
-            });
-            self.remember_source(source.ip(), eoj, source.port());
+            }
             if !self.has_pending_map(DeviceKey {
                 address: source,
                 eoj,
@@ -840,18 +864,10 @@ impl ServiceState {
             address: source,
             eoj: header.seoj,
         };
-        let id = key.id();
         // Track INF-sourced devices so later polling keeps watching them, and
         // request their property map so polling uses the real Get-able set
         // rather than the fallback list.
-        let is_new = match self.poll_epcs.entry(id) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(fallback_poll_epcs(header.seoj.class_code()));
-                true
-            },
-            std::collections::hash_map::Entry::Occupied(_) => false,
-        };
-        self.remember_source(source.ip(), header.seoj, source.port());
+        let is_new = self.register_device(source, header.seoj);
         if is_new
             && !self.has_pending_map(key)
             && let Err(error) = self.send_property_map(socket, key).await
@@ -1259,6 +1275,11 @@ mod tests {
             )
             .await;
 
+        let RadarEvent::Device(device) = receiver.recv().unwrap() else {
+            panic!("expected a device event");
+        };
+        assert_eq!(device.source.ip(), source.ip());
+        assert_eq!(device.eoj, Eoj::new(0x01, 0x30, 0x01));
         let RadarEvent::Change(change) = receiver.recv().unwrap() else {
             panic!("expected a change event");
         };
@@ -1282,7 +1303,6 @@ mod tests {
         let key = air_conditioner(source);
 
         // Discover the device object.
-        service.discovery_tid = Some(1);
         service
             .process_frame(
                 &socket,
@@ -1357,7 +1377,6 @@ mod tests {
         let (mut service, _receiver) = service();
         let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
 
-        service.discovery_tid = Some(1);
         service
             .process_frame(
                 &socket,
@@ -1441,7 +1460,78 @@ mod tests {
                 source,
             )
             .await;
+        // The device itself is still announced; no change event is drawn.
+        assert!(matches!(receiver.recv().unwrap(), RadarEvent::Device(_)));
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn late_discovery_response_still_registers_devices() {
+        let socket = test_socket().await;
+        let (mut service, receiver) = service();
+        let source: SocketAddr = "192.0.2.9:3610".parse().unwrap();
+
+        // A reply shaped like an instance list but with a TID this service
+        // never allocated (a slow reply to a long-forgotten round, or another
+        // controller's discovery) must still register the device.
+        service
+            .process_frame(
+                &socket,
+                FrameHeader {
+                    tid: 0xBEEF,
+                    seoj: Eoj::new(0x0E, 0xF0, 0x00),
+                    deoj: CONTROLLER_EOJ,
+                    esv: Esv::from_code(GET_RESPONSE_ESV_CODE),
+                },
+                vec![(DISCOVERY_EPC, vec![1, 0x01, 0x30, 0x01])],
+                source,
+            )
+            .await;
+
+        let RadarEvent::Device(device) = receiver.recv().unwrap() else {
+            panic!("expected a device event");
+        };
+        assert_eq!(device.source.ip(), source.ip());
+        assert_eq!(device.eoj, Eoj::new(0x01, 0x30, 0x01));
+        // Exactly one device announcement; the rest are status updates.
+        let extra_devices = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter(|event| matches!(event, RadarEvent::Device(_)))
+            .count();
+        assert_eq!(extra_devices, 0);
+        let id = DeviceId {
+            ip: source.ip(),
+            eoj: Eoj::new(0x01, 0x30, 0x01),
+        };
+        assert!(service.poll_epcs.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn rediscovered_devices_are_not_announced_twice() {
+        let socket = test_socket().await;
+        let (mut service, receiver) = service();
+        let source: SocketAddr = "192.0.2.10:3610".parse().unwrap();
+        let instance_list = vec![(DISCOVERY_EPC, vec![1, 0x01, 0x30, 0x01])];
+
+        for tid in [1, 2] {
+            service
+                .process_frame(
+                    &socket,
+                    FrameHeader {
+                        tid,
+                        seoj: Eoj::new(0x0E, 0xF0, 0x00),
+                        deoj: CONTROLLER_EOJ,
+                        esv: Esv::from_code(GET_RESPONSE_ESV_CODE),
+                    },
+                    instance_list.clone(),
+                    source,
+                )
+                .await;
+        }
+
+        let device_events = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter(|event| matches!(event, RadarEvent::Device(_)))
+            .count();
+        assert_eq!(device_events, 1);
     }
 
     async fn test_socket() -> EchoNetSocket {
