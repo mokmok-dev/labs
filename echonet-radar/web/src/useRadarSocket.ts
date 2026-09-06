@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ChangePayload, Connection, ServerMessage } from "./types";
+import type { ChangePayload, Connection, DevicePayload, ServerMessage } from "./types";
 
 export const MAX_EVENTS = 1000;
 const RECONNECT_DELAY_MS = 1000;
@@ -13,6 +13,7 @@ const wsUrl = (): string => {
 
 interface RadarSocket {
   changes: ChangePayload[];
+  devices: DevicePayload[];
   status: string;
   connection: Connection;
   pollNow: () => boolean;
@@ -20,6 +21,7 @@ interface RadarSocket {
 
 export function useRadarSocket(): RadarSocket {
   const [changes, setChanges] = useState<ChangePayload[]>([]);
+  const [devices, setDevices] = useState<DevicePayload[]>([]);
   const [status, setStatus] = useState("connecting");
   const [connection, setConnection] = useState<Connection>("connecting");
   const [attempt, setAttempt] = useState(0);
@@ -41,10 +43,20 @@ export function useRadarSocket(): RadarSocket {
       switch (message.type) {
         case "snapshot":
           setChanges(message.changes);
+          setDevices(message.devices);
           setStatus(message.status);
           break;
         case "change":
           setChanges((previous) => [message, ...previous].slice(0, MAX_EVENTS));
+          break;
+        case "device":
+          setDevices((previous) =>
+            previous.some(
+              (device) => device.source === message.source && device.eoj === message.eoj,
+            )
+              ? previous
+              : [...previous, { source: message.source, eoj: message.eoj }],
+          );
           break;
         case "status":
           setStatus(message.message);
@@ -76,5 +88,5 @@ export function useRadarSocket(): RadarSocket {
     return false;
   }, []);
 
-  return { changes, status, connection, pollNow };
+  return { changes, devices, status, connection, pollNow };
 }

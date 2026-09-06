@@ -31,7 +31,7 @@ function connectionBadge(connection: "connecting" | "open" | "closed") {
 }
 
 export function App() {
-  const { changes, status, connection, pollNow } = useRadarSocket();
+  const { changes, devices, status, connection, pollNow } = useRadarSocket();
   const [selected, setSelected] = useState<DeviceKey | null>(null);
   const previousConnection = useRef(connection);
 
@@ -78,6 +78,7 @@ export function App() {
       <Sidebar.Provider defaultOpen collapsible="icon">
         <DeviceSidebar
           changes={changes}
+          devices={devices}
           connection={connection}
           selected={selected}
           onSelect={setSelected}
