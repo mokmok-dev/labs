@@ -1,22 +1,23 @@
-//! End-to-end test of the shipped `echonet-radar-cli` binary.
+//! End-to-end tests of the shipped `echonet-radar-cli` binary.
 //!
-//! The test spawns the real executable (`CARGO_BIN_EXE_echonet-radar-cli`) in
-//! its default passive mode, waits for its `listening on` line, injects real
-//! ECHONET Lite telegrams over loopback unicast to port 3610, and asserts the
-//! decoded stdout lines it prints. Multicast delivery is environment dependent,
-//! so both the injected frames and the child's multicast join travel the
-//! loopback path, mirroring `echonet-lite-udp/tests/udp.rs`.
+//! Both tests spawn the real executable (`CARGO_BIN_EXE_echonet-radar-cli`) and
+//! drive it over loopback unicast to port 3610, which is the transport path the
+//! crate's own tests use because multicast delivery is environment dependent.
+//! One test injects telegrams at the listener; the other stands in for a device
+//! and answers the write the binary sends. They share port 3610, so they take
+//! turns (see [`PORT_LOCK`]).
 
 use std::error::Error;
 use std::io::{BufRead, BufReader, Read};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::DateTime;
-use echonet_lite::frame::{Eoj, Esv, FrameHeader, Property, write};
+use echonet_lite::frame::{Eoj, Esv, FrameHeader, Property, parse, write};
 
 /// The ECHONET Lite port the tool always listens on.
 const PORT: u16 = 3610;
@@ -24,6 +25,8 @@ const PORT: u16 = 3610;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time allowed for the child to log one attempt's telegrams.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Time a stand-in device waits for a request.
+const DEVICE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Attempts allowed to get the frames into the child's socket.
 ///
 /// Port 3610 is shared with any other ECHONET Lite listener running on the host:
@@ -33,6 +36,15 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// [`EchoNetSocket`]: echonet_lite_udp::EchoNetSocket
 const DELIVERY_ATTEMPTS: usize = 3;
+
+/// Held for the duration of each test: both tests bind port 3610, and a second
+/// socket on that port would take datagrams by 4-tuple hash.
+static PORT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialize the tests that share port 3610.
+fn exclusive_port() -> MutexGuard<'static, ()> {
+    PORT_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The shipped binary under test.
 const BINARY: &str = env!("CARGO_BIN_EXE_echonet-radar-cli");
@@ -61,8 +73,14 @@ impl Cli {
     /// socket is still bound to the wildcard address, so frames addressed to
     /// `127.0.0.1:3610` arrive.
     fn spawn() -> Result<Self, Box<dyn Error>> {
+        Self::spawn_with(&[])
+    }
+
+    /// Spawn the shipped binary with `extra` arguments.
+    fn spawn_with(extra: &[&str]) -> Result<Self, Box<dyn Error>> {
         let mut child = Command::new(BINARY)
             .args(["--interface", "127.0.0.1"])
+            .args(extra)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -74,6 +92,11 @@ impl Cli {
             stdout: forward_lines(stdout),
             stderr: forward_lines(stderr),
         })
+    }
+
+    /// Wait for the child to finish and report its exit status.
+    fn wait(&mut self) -> Result<ExitStatus, Box<dyn Error>> {
+        Ok(self.child.wait()?)
     }
 
     /// Block until the child reports that it is listening, so no frame is
@@ -160,7 +183,7 @@ impl Drop for Cli {
 
 /// What the child logged during one read: lines from the injecting peer, and
 /// lines from anything else on port 3610 (a failure report needs both).
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Collected {
     from_peer: Vec<String>,
     others: Vec<String>,
@@ -444,11 +467,121 @@ fn assert_malformed_datagram_is_skipped(
 
 #[test]
 fn logs_one_decoded_line_per_frame_on_port_3610() -> Result<(), Box<dyn Error>> {
+    let _port = exclusive_port();
+
     let cli = Cli::spawn()?;
     cli.wait_until_listening()?;
 
     let peer = assert_telegrams_are_logged(&cli, &injections()?)?;
     assert_malformed_datagram_is_skipped(&cli, &peer)?;
+
+    Ok(())
+}
+
+/// A stand-in device: it reads one write request, applies it to the value it
+/// holds, and answers the way a device does.
+struct FakeDevice {
+    socket: UdpSocket,
+    address: SocketAddr,
+    /// The value the device holds after the write it answered.
+    value: Vec<u8>,
+}
+
+impl FakeDevice {
+    fn bind() -> Result<Self, Box<dyn Error>> {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        socket.set_read_timeout(Some(DEVICE_TIMEOUT))?;
+        Ok(Self {
+            address: socket.local_addr()?,
+            socket,
+            value: Vec::new(),
+        })
+    }
+
+    /// The last request the device answered, as `(header, epc, edt)`.
+    fn serve_one_write(&mut self) -> Result<(FrameHeader, u8, Vec<u8>), Box<dyn Error>> {
+        let mut buffer = [0u8; 256];
+        let (length, source) = self.socket.recv_from(&mut buffer)?;
+        let (header, epc, edt) = {
+            let frame = parse(&buffer[..length])
+                .map_err(|error| format!("the device received a malformed datagram: {error}"))?;
+            let header = frame.header();
+            let property = frame
+                .properties()
+                .next()
+                .ok_or("the device received a write without properties")?;
+            (header, property.epc, property.edt.to_vec())
+        };
+
+        // Apply the write, then answer with the value the device now holds.
+        self.value.clone_from(&edt);
+        let mut reply = [0u8; 256];
+        let length = write(
+            FrameHeader {
+                tid: header.tid,
+                seoj: Eoj::new(0x02, 0x6B, 0x01),
+                deoj: header.seoj,
+                esv: Esv::from_code(0x71),
+            },
+            &[Property {
+                epc,
+                edt: &self.value,
+            }],
+            &mut reply,
+        )
+        .map_err(|error| format!("the reply does not fit the buffer: {error}"))?;
+        self.socket.send_to(&reply[..length], source)?;
+        Ok((header, epc, edt))
+    }
+}
+
+#[test]
+fn writes_a_property_and_prints_the_devices_answer() -> Result<(), Box<dyn Error>> {
+    let _port = exclusive_port();
+
+    let mut device = FakeDevice::bind()?;
+    let mut cli = Cli::spawn_with(&[
+        "--to",
+        &device.address.to_string(),
+        "--eoj",
+        "0x026B01",
+        "--set",
+        "0xD1=0x2A",
+    ])?;
+
+    let (header, epc, edt) = device.serve_one_write()?;
+    assert_eq!(header.seoj, Eoj::new(0x05, 0xFF, 0x01));
+    assert_eq!(header.deoj, Eoj::new(0x02, 0x6B, 0x01));
+    assert_eq!(
+        header.esv.code(),
+        0x61,
+        "a write request carries the standard SetC service code"
+    );
+    assert_eq!((epc, edt.as_slice()), (0xD1, [0x2A].as_slice()));
+    assert_eq!(
+        device.value,
+        vec![0x2A],
+        "the device did not apply the write the binary sent"
+    );
+
+    let status = cli.wait()?;
+    let answer =
+        "0x026B01->0x05FF01 ESV=0x71 [EPC=0xD1 Temperature of supplied water setting 42 Celsius]";
+    let collected = cli.collect_lines_from(device.address, 1, ATTEMPT_TIMEOUT);
+    assert_eq!(
+        collected.from_peer.len(),
+        1,
+        "the binary did not print the device's answer: {collected:#?}"
+    );
+    assert!(
+        collected.from_peer[0].ends_with(&answer),
+        "unexpected answer line: {:#?}",
+        collected.from_peer
+    );
+    assert!(
+        status.success(),
+        "write mode exited with {status} after a successful write"
+    );
 
     Ok(())
 }

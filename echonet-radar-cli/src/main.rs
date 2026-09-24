@@ -7,12 +7,20 @@
 //! (`echonet-radar-core`), discovers devices, polls their properties and prints
 //! each state change.
 //!
+//! `--to`, `--eoj` and `--set` write one property to a device and print the
+//! device's answer, which is how appliances are controlled. The request is
+//! checked against the ECHONET Lite MRA tables first, so a property the target
+//! class cannot take (or a value outside its range) never reaches the
+//! appliance. The write is sent from the standard port because devices answer
+//! that port; a listener already bound to it may receive the answer instead.
+//!
 //! If nothing arrives, check that the host firewall allows inbound UDP to
 //! `224.0.23.0:3610` and that the host shares an L2 segment with the devices.
 //!
 //! ```text
 //! echonet-radar-cli --interface 192.168.1.2
 //! echonet-radar-cli --interface 192.168.1.2 --active
+//! echonet-radar-cli --to 192.168.1.20 --eoj 0x026B01 --set 0xD1=0x28
 //! ```
 
 use std::fmt::Write as _;
@@ -24,17 +32,27 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use clap::Parser;
-use echonet_lite::ecodec::lookup;
-use echonet_lite::frame::{Eoj, Frame, FrameHeader, Property, parse};
+use echonet_lite::ecodec::{Access, decode, lookup};
+use echonet_lite::frame::{Eoj, Esv, Frame, FrameHeader, Property, parse};
 use echonet_lite_udp::EchoNetSocket;
 use echonet_radar_core::{
-    ChangeEvent, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, DeviceEvent, RadarConfig,
-    RadarEvent, format_edt, run_service,
+    CONTROLLER_EOJ, ChangeEvent, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, DeviceEvent,
+    RadarConfig, RadarEvent, format_edt, run_service,
 };
 
 /// Receive buffer size. ECHONET Lite frames are at most 256 bytes; the extra
 /// room absorbs datagrams from other applications on port 3610.
 const RECEIVE_BUFFER_LEN: usize = 512;
+
+/// The standard ECHONET Lite write request service code (`SetC`, answered).
+///
+/// `echonet_lite::frame::Esv` predates the standard service-code names, so this
+/// path sends wire codes directly, as the service does for Get (`0x62`).
+const SET_REQUEST_ESV_CODE: u8 = 0x61;
+/// The standard write response service code (`SetC_Res`).
+const SET_RESPONSE_ESV_CODE: u8 = 0x71;
+/// Time allowed for a device to answer a write.
+const WRITE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Command-line arguments.
 #[derive(Debug, Parser)]
@@ -65,6 +83,35 @@ struct Arguments {
         value_name = "SECONDS"
     )]
     update_interval_seconds: u64,
+    /// Write to a device and print its answer, instead of listening.
+    ///
+    /// The address may carry a port (`192.168.100.20:3610`); without one the
+    /// standard ECHONET Lite port is used.
+    #[arg(
+        long,
+        value_name = "IP[:PORT]",
+        requires_all = ["eoj", "set"],
+        value_parser = parse_device
+    )]
+    to: Option<SocketAddr>,
+    /// Object to write to, e.g. `0x026B01`.
+    #[arg(long, value_name = "EOJ", requires = "to", value_parser = parse_eoj)]
+    eoj: Option<Eoj>,
+    /// Property to write as `EPC=EDT` in hex, e.g. `0xD1=0x28`.
+    #[arg(
+        long,
+        value_name = "EPC=EDT",
+        requires = "to",
+        value_parser = parse_property
+    )]
+    set: Option<WriteProperty>,
+}
+
+/// A property write: the EPC and the bytes to send as its EDT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WriteProperty {
+    epc: u8,
+    edt: Vec<u8>,
 }
 
 impl Arguments {
@@ -91,6 +138,12 @@ async fn main() -> ExitCode {
 
 /// Join the multicast group and run in passive or active mode.
 async fn run(arguments: Arguments) -> io::Result<()> {
+    if let (Some(device), Some(eoj), Some(property)) =
+        (arguments.to, arguments.eoj, arguments.set.as_ref())
+    {
+        return write_property(arguments.interface, device, eoj, property).await;
+    }
+
     let socket = EchoNetSocket::bind_default_multicast(arguments.interface)
         .await
         .map_err(|error| {
@@ -166,6 +219,186 @@ async fn run_active(
     let result = run_service(socket, config, events, command_receiver, shutdown_receiver).await;
     let _ = printer.await;
     result
+}
+
+/// Write one property to a device and print the device's answer.
+///
+/// The request is sent from a socket bound to the standard ECHONET Lite port:
+/// the water heater on this LAN answers that port rather than the port the
+/// request came from, so an ephemeral socket never sees the answer.
+async fn write_property(
+    interface: Ipv4Addr,
+    device: SocketAddr,
+    eoj: Eoj,
+    property: &WriteProperty,
+) -> io::Result<()> {
+    validate_write(eoj.class_code(), property)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+
+    let socket = EchoNetSocket::bind_default_multicast(interface).await?;
+
+    let tid = write_tid();
+    socket
+        .send_frame_to(
+            set_request_header(tid, eoj),
+            &[Property {
+                epc: property.epc,
+                edt: &property.edt,
+            }],
+            device,
+        )
+        .await?;
+    eprintln!(
+        "echonet-radar-cli: wrote EPC=0x{:02X}={} to {} at {device}",
+        property.epc,
+        format_bytes(&property.edt),
+        format_eoj(eoj),
+    );
+
+    let deadline = tokio::time::Instant::now() + WRITE_RESPONSE_TIMEOUT;
+    let mut buffer = [0u8; RECEIVE_BUFFER_LEN];
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let received = tokio::time::timeout(remaining, socket.recv(&mut buffer))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "no answer from {device} within {} seconds",
+                        WRITE_RESPONSE_TIMEOUT.as_secs()
+                    ),
+                )
+            })?;
+        let (length, source) = received?;
+        let Ok(frame) = parse(&buffer[..length]) else {
+            continue;
+        };
+        if frame.header().tid != tid {
+            continue;
+        }
+        println!("{}", log_line(SystemTime::now(), source, &frame));
+        let code = frame.header().esv.code();
+        return if code == SET_RESPONSE_ESV_CODE {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "the device did not accept the write (ESV=0x{code:02X})"
+            )))
+        };
+    }
+}
+
+/// The header of the `SetC` telegram this tool sends to write a property.
+const fn set_request_header(
+    tid: u16,
+    eoj: Eoj,
+) -> FrameHeader {
+    FrameHeader {
+        tid,
+        seoj: CONTROLLER_EOJ,
+        deoj: eoj,
+        esv: Esv::Unknown(SET_REQUEST_ESV_CODE),
+    }
+}
+
+/// A transaction ID for this invocation.
+///
+/// A device may read a repeated transaction ID as a retransmission of a request
+/// it has already answered, so the ID comes from the clock rather than from a
+/// constant.
+fn write_tid() -> u16 {
+    let Ok(elapsed) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
+        return 1;
+    };
+    let nanos = elapsed.subsec_nanos().to_le_bytes();
+    u16::from_le_bytes([nanos[0], nanos[1]]).max(1)
+}
+
+/// Refuse a write the MRA tables say the device cannot take.
+///
+/// The tables state which properties a class supports for Set and how long and
+/// how large their values may be, so a typo is caught here rather than sent to
+/// an appliance.
+fn validate_write(
+    class_code: u16,
+    property: &WriteProperty,
+) -> Result<(), String> {
+    let epc = property.epc;
+    let Some(info) = lookup(class_code, epc) else {
+        return Err(format!(
+            "EPC=0x{epc:02X} is not defined for class 0x{class_code:04X}"
+        ));
+    };
+    if !matches!(info.set, Access::Required | Access::Optional) {
+        return Err(format!(
+            "EPC=0x{epc:02X} ({}) cannot be set on class 0x{class_code:04X}",
+            info.name
+        ));
+    }
+    decode(class_code, epc, &property.edt).map_err(|error| {
+        format!(
+            "the value for EPC=0x{epc:02X} ({}) is not valid: {error}",
+            info.name
+        )
+    })?;
+    Ok(())
+}
+
+/// Parse a device address, defaulting to the standard ECHONET Lite port.
+fn parse_device(value: &str) -> Result<SocketAddr, String> {
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return Ok(address);
+    }
+    value
+        .parse::<Ipv4Addr>()
+        .map(|ip| SocketAddr::from((ip, echonet_lite_udp::MULTICAST_PORT)))
+        .map_err(|_| format!("{value} is neither an IPv4 address nor address:port"))
+}
+
+/// Parse a three-byte EOJ in hex, with an optional `0x` prefix.
+fn parse_eoj(value: &str) -> Result<Eoj, String> {
+    match parse_hex(value)?.as_slice() {
+        [class_group, class, instance] => Ok(Eoj::new(*class_group, *class, *instance)),
+        _ => Err(format!("{value} is not a three-byte EOJ, e.g. 0x026B01")),
+    }
+}
+
+/// Parse `EPC=EDT` in hex, e.g. `0xD1=0x28`.
+fn parse_property(value: &str) -> Result<WriteProperty, String> {
+    let (epc, edt) = value
+        .split_once('=')
+        .ok_or_else(|| format!("{value} is not in EPC=EDT form, e.g. 0xD1=0x28"))?;
+    let epc = parse_hex(epc)?;
+    let [epc] = epc.as_slice() else {
+        return Err(format!("{value} must name a one-byte EPC, e.g. 0xD1=0x28"));
+    };
+    let edt = parse_hex(edt)?;
+    if edt.is_empty() {
+        return Err(format!("{value} leaves the value empty"));
+    }
+    Ok(WriteProperty { epc: *epc, edt })
+}
+
+/// Parse an even-length hex byte string, with an optional `0x` prefix.
+fn parse_hex(value: &str) -> Result<Vec<u8>, String> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.is_empty() || !digits.len().is_multiple_of(2) {
+        return Err(format!("{value} is not an even number of hex digits"));
+    }
+    digits
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let text = String::from_utf8_lossy(pair);
+            u8::from_str_radix(&text, 16).map_err(|error| format!("{value} is not hex: {error}"))
+        })
+        .collect()
 }
 
 /// Render a passive frame line with an ISO 8601 timestamp.
@@ -525,5 +758,126 @@ mod tests {
             "192.0.2.1:3610 0x001101->0x05FF01 ESV=0x63 \
              [EPC=0xE0 Measured temperature value 26 Celsius]"
         );
+    }
+
+    #[test]
+    fn write_arguments_are_parsed() {
+        assert_eq!(parse_eoj("0x026B01").unwrap(), Eoj::new(0x02, 0x6B, 0x01));
+        assert_eq!(parse_eoj("026B01").unwrap(), Eoj::new(0x02, 0x6B, 0x01));
+        assert!(parse_eoj("0x026B").is_err(), "a short EOJ must be refused");
+        assert!(parse_eoj("0xZZ6B01").is_err(), "non-hex must be refused");
+
+        assert_eq!(
+            parse_property("0xD1=0x28").unwrap(),
+            WriteProperty {
+                epc: 0xD1,
+                edt: vec![0x28],
+            }
+        );
+        assert_eq!(
+            parse_property("D1=0104").unwrap(),
+            WriteProperty {
+                epc: 0xD1,
+                edt: vec![0x01, 0x04],
+            }
+        );
+        assert!(
+            parse_property("0xD1").is_err(),
+            "a missing value must be refused"
+        );
+        assert!(
+            parse_property("0xD1=").is_err(),
+            "an empty value must be refused"
+        );
+        assert!(
+            parse_property("0xD100=0x28").is_err(),
+            "a two-byte EPC must be refused"
+        );
+
+        // A bare address takes the standard port; an explicit one wins.
+        assert_eq!(
+            parse_device("192.168.100.20").unwrap(),
+            "192.168.100.20:3610".parse().unwrap()
+        );
+        assert_eq!(
+            parse_device("127.0.0.1:3611").unwrap(),
+            "127.0.0.1:3611".parse().unwrap()
+        );
+        assert!(parse_device("not-an-address").is_err());
+    }
+
+    #[test]
+    fn write_mode_needs_the_target_the_object_and_the_value() {
+        let arguments = Arguments::parse_from([
+            "echonet-radar-cli",
+            "--to",
+            "192.168.100.20",
+            "--eoj",
+            "0x026B01",
+            "--set",
+            "0xD1=0x28",
+        ]);
+        assert_eq!(
+            arguments.to.unwrap(),
+            "192.168.100.20:3610".parse().unwrap()
+        );
+        assert!(arguments.eoj.is_some());
+
+        // Listing one of the three without the others is a usage error.
+        assert!(
+            Arguments::try_parse_from(["echonet-radar-cli", "--to", "192.168.100.20"]).is_err()
+        );
+        assert!(Arguments::try_parse_from(["echonet-radar-cli", "--set", "0xD1=0x28"]).is_err());
+    }
+
+    #[test]
+    fn writes_are_checked_against_the_tables_before_they_are_sent() {
+        let heater = 0x026B;
+        // The supplied water temperature setting accepts 0..100 Celsius.
+        assert!(validate_write(heater, &parse_property("0xD1=0x28").unwrap()).is_ok());
+        assert!(
+            validate_write(heater, &parse_property("0xD1=0xFF").unwrap()).is_err(),
+            "a value above the table range must be refused"
+        );
+        assert!(
+            validate_write(heater, &parse_property("0xD1=0x2800").unwrap()).is_err(),
+            "a value of the wrong length must be refused"
+        );
+        assert!(
+            validate_write(heater, &parse_property("0x9F=0x00").unwrap()).is_err(),
+            "a property the class does not define must be refused"
+        );
+        // Version information is readable but not settable on that class.
+        assert!(
+            validate_write(heater, &parse_property("0x82=0x00000001").unwrap()).is_err(),
+            "a property the tables say is not settable must be refused"
+        );
+    }
+
+    #[test]
+    fn write_request_uses_the_standard_setc_service_code() {
+        let bytes = encode(
+            set_request_header(1, Eoj::new(0x02, 0x6B, 0x01)),
+            &[Property {
+                epc: 0xD1,
+                edt: &[0x28],
+            }],
+        );
+        assert_eq!(
+            bytes,
+            [
+                0x10, 0x81, 0x00, 0x01, 0x05, 0xFF, 0x01, 0x02, 0x6B, 0x01, 0x61, 0x01, 0xD1, 0x01,
+                0x28,
+            ],
+            "the write must go out as a SetC telegram"
+        );
+    }
+
+    #[test]
+    fn a_write_carries_a_usable_transaction_id() {
+        // A device may treat a repeated transaction ID as a retransmission of a
+        // request it already answered, so the ID is taken from the clock; zero
+        // is not used.
+        assert_ne!(write_tid(), 0);
     }
 }
