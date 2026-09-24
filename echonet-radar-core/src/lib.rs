@@ -422,16 +422,20 @@ fn format_with_unit(
     value
 }
 
+/// Render raw bytes as hex, each byte marked with `0x`.
+///
+/// A bare `10` reads as the number ten, and several properties that carry raw
+/// bytes are temperatures or settings a reader would take for decimals.
 fn format_bytes(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return String::from("(empty)");
     }
-    let mut value = String::with_capacity(bytes.len() * 3 - 1);
+    let mut value = String::with_capacity(bytes.len() * 5 - 1);
     for (index, byte) in bytes.iter().enumerate() {
         if index > 0 {
             value.push(' ');
         }
-        let _ = write!(value, "{byte:02X}");
+        let _ = write!(value, "0x{byte:02X}");
     }
     value
 }
@@ -1209,7 +1213,7 @@ mod tests {
 
     #[test]
     fn unknown_values_are_kept_as_hex() {
-        assert_eq!(format_value(0xFFFF, 0x80, &[0x01, 0xAF]), "01 AF");
+        assert_eq!(format_value(0xFFFF, 0x80, &[0x01, 0xAF]), "0x01 0xAF");
     }
 
     #[test]
@@ -1218,9 +1222,9 @@ mod tests {
         assert_eq!(format_edt(0x0130, 0x80, &[0x30]), "Operation status ON");
         assert_eq!(
             format_edt(0x0130, 0xBB, &[0x01, 0x1E]),
-            "Measured value of room temperature 01 1E"
+            "Measured value of room temperature 0x01 0x1E"
         );
-        assert_eq!(format_edt(0xFFFF, 0x80, &[0x01]), "EPC 0x80 01");
+        assert_eq!(format_edt(0xFFFF, 0x80, &[0x01]), "EPC 0x80 0x01");
     }
 
     #[test]

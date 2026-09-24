@@ -328,7 +328,7 @@ fn injections() -> Result<Vec<Injection>, Box<dyn Error>> {
                     edt: &[0x01, 0xAF],
                 }],
             )?,
-            expected: "0xFFFF01->0x05FF01 ESV=0x63 [EPC=0xE1 01 AF]",
+            expected: "0xFFFF01->0x05FF01 ESV=0x63 [EPC=0xE1 0x01 0xAF]",
         },
         Injection {
             bytes: encode(

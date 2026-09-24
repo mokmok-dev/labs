@@ -586,16 +586,21 @@ fn property_owner(
     lookup(SUPER_CLASS_CODE, epc).map(|_| SUPER_CLASS_CODE)
 }
 
+/// Render raw bytes with a `0x` on every byte.
+///
+/// Without the prefix a byte such as `10` reads as the number ten, and the air
+/// conditioner's set temperature and room temperature are raw bytes that a
+/// reader has already mistaken for decimal degrees.
 fn format_bytes(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return String::from("(empty)");
     }
-    let mut value = String::with_capacity(bytes.len() * 3 - 1);
+    let mut value = String::with_capacity(bytes.len() * 5 - 1);
     for (index, byte) in bytes.iter().enumerate() {
         if index > 0 {
             value.push(' ');
         }
-        let _ = write!(value, "{byte:02X}");
+        let _ = write!(value, "0x{byte:02X}");
     }
     value
 }
@@ -754,7 +759,7 @@ mod tests {
         let frame = parse(&bytes).unwrap();
         assert_eq!(
             format_frame(source(), &frame),
-            "192.0.2.1:3610 0xFFFF01->0x05FF01 ESV=0x63 [EPC=0xE1 01 AF]"
+            "192.0.2.1:3610 0xFFFF01->0x05FF01 ESV=0x63 [EPC=0xE1 0x01 0xAF]"
         );
     }
 
