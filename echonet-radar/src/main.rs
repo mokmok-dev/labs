@@ -47,11 +47,12 @@ use serde::{Deserialize, Serialize};
 /// Maximum number of change events kept in the bridge history.
 const MAX_EVENTS: usize = 1000;
 
-/// Log ECHONET Lite device state changes as a time-series feed.
+/// Command-line arguments.
 #[derive(Debug, Parser)]
 #[command(
     name = "echonet-radar",
-    about = "Log ECHONET Lite device state changes as a time-series feed"
+    about = "Log ECHONET Lite device state changes as a time-series feed",
+    version
 )]
 struct Arguments {
     /// IPv4 interface used for multicast membership.
