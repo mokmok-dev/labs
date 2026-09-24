@@ -60,6 +60,12 @@ const SUPER_CLASS_CODE: u16 = 0x0000;
 const WRITE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Time allowed for a device to answer the Set property map request.
 const MAP_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Why an expected answer may never arrive, even though the device answered.
+///
+/// Devices send their answer to the standard port rather than to the port the
+/// request came from, and any other process bound to that port shares it
+/// (`SO_REUSEPORT`), so the kernel can hand that process the answer.
+const SHARED_PORT_HINT: &str = "another process bound to port 3610 may have received it, because devices answer the standard port";
 
 /// Command-line arguments.
 #[derive(Debug, Parser)]
@@ -247,7 +253,7 @@ async fn write_property(
     let accepted = fetch_set_map(&socket, device, eoj).await;
     if accepted.is_none() {
         eprintln!(
-            "echonet-radar-cli: {device} did not report a Set property map (EPC=0x{SET_PROPERTY_MAP_EPC:02X})"
+            "echonet-radar-cli: {device} did not report a Set property map (EPC=0x{SET_PROPERTY_MAP_EPC:02X}); {SHARED_PORT_HINT}"
         );
     }
     validate_write(eoj.class_code(), property, accepted.as_deref())
@@ -272,13 +278,7 @@ async fn write_property(
     );
 
     let Some((answer, source)) = recv_answer(&socket, tid, WRITE_RESPONSE_TIMEOUT).await else {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "no answer from {device} within {} seconds",
-                WRITE_RESPONSE_TIMEOUT.as_secs()
-            ),
-        ));
+        return Err(no_answer_error(device));
     };
     let Ok(frame) = parse(&answer) else {
         return Err(io::Error::other(format!(
@@ -294,6 +294,17 @@ async fn write_property(
             "the device did not accept the write (ESV=0x{code:02X})"
         )))
     }
+}
+
+/// The error reported when a device does not answer a write.
+fn no_answer_error(device: SocketAddr) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "no answer from {device} within {} seconds; {SHARED_PORT_HINT}",
+            WRITE_RESPONSE_TIMEOUT.as_secs()
+        ),
+    )
 }
 
 /// Ask a device which properties it accepts Set for, via EPC `0x9E`.
@@ -882,6 +893,21 @@ mod tests {
             format_frame(source(), &frame),
             "192.0.2.1:3610 0x026B01->0x05FF01 ESV=0x71 \
              [EPC=0x93 Remote control setting ON, EPC=0x8F Power-saving operation setting OFF]"
+        );
+    }
+
+    #[test]
+    fn a_missing_answer_explains_the_shared_port() {
+        let error = no_answer_error("192.0.2.1:3610".parse().unwrap());
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let message = error.to_string();
+        assert!(
+            message.contains("no answer from 192.0.2.1:3610 within 5 seconds"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("port 3610"),
+            "the message must name the shared port: {message}"
         );
     }
 
