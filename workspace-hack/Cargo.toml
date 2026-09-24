@@ -13,6 +13,8 @@ version = "0.0.0"
 
 ### BEGIN HAKARI SECTION
 [dependencies]
+anstyle = { version = "1" }
+chrono = { version = "0.4", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
 getrandom = { version = "0.3", default-features = false, features = ["std"] }
 indexmap = { version = "2", features = ["serde"] }
@@ -26,11 +28,10 @@ serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "preserve_order", "raw_value"] }
 smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
-usage-argv = { version = "6", default-features = false, features = ["complete", "diagnostics"] }
-usage-rs = { version = "6", features = ["completions"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [build-dependencies]
+anstyle = { version = "1" }
 crossbeam-utils = { version = "0.8" }
 getrandom = { version = "0.3", default-features = false, features = ["std"] }
 indexmap = { version = "2", features = ["serde"] }

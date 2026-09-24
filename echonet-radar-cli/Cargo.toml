@@ -1,25 +1,19 @@
 [package]
-description = "GPUI dashboard for ECHONET Lite devices"
+description = "Stream ECHONET Lite telegrams observed on the LAN to stdout"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
-name = "echonet-radar"
+name = "echonet-radar-cli"
 rust-version = "1.98"
 version.workspace = true
 
 [dependencies]
-axum.workspace = true
+chrono.workspace = true
 clap.workspace = true
 echonet-lite.workspace = true
 echonet-lite-udp.workspace = true
 echonet-radar-core.workspace = true
-gpui-kit.workspace = true
-gpui-wry.workspace = true
-rust-embed.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
 workspace-hack.workspace = true
-wry.workspace = true
 
 [lints]
 workspace = true

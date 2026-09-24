@@ -9,12 +9,12 @@ mod ir;
 
 use std::path::{Path, PathBuf};
 
-use usage::Cli;
+use clap::Parser;
 
 /// Generates Rust sources for the `echonet-lite` crate from the pinned ECHONET
 /// Lite Machine Readable Appendix (MRA).
-#[derive(Cli)]
-#[usage(bin = "echonet-lite-codegen", version)]
+#[derive(Parser)]
+#[command(name = "echonet-lite-codegen", version)]
 struct CodegenArgs {
     /// Vendor specification directory to read from. Defaults to the
     /// workspace's `vendor/MRA_v1.4.0`.
