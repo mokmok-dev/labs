@@ -478,8 +478,11 @@ fn logs_one_decoded_line_per_frame_on_port_3610() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-/// A stand-in device: it reads one write request, applies it to the value it
-/// holds, and answers the way a device does.
+/// A request as a device receives it: its header, sender, and properties.
+type Request = (FrameHeader, SocketAddr, Vec<(u8, Vec<u8>)>);
+
+/// A stand-in device: it reports a Set property map, serves one write, applies
+/// it to the value it holds, and answers the way a device does.
 struct FakeDevice {
     socket: UdpSocket,
     address: SocketAddr,
@@ -498,40 +501,76 @@ impl FakeDevice {
         })
     }
 
-    /// The last request the device answered, as `(header, epc, edt)`.
-    fn serve_one_write(&mut self) -> Result<(FrameHeader, u8, Vec<u8>), Box<dyn Error>> {
+    /// Read one request addressed to this device.
+    fn recv_request(&self) -> Result<Request, Box<dyn Error>> {
         let mut buffer = [0u8; 256];
         let (length, source) = self.socket.recv_from(&mut buffer)?;
-        let (header, epc, edt) = {
-            let frame = parse(&buffer[..length])
-                .map_err(|error| format!("the device received a malformed datagram: {error}"))?;
-            let header = frame.header();
-            let property = frame
-                .properties()
-                .next()
-                .ok_or("the device received a write without properties")?;
-            (header, property.epc, property.edt.to_vec())
-        };
+        let frame = parse(&buffer[..length])
+            .map_err(|error| format!("the device received a malformed datagram: {error}"))?;
+        let properties = frame
+            .properties()
+            .map(|property| (property.epc, property.edt.to_vec()))
+            .collect();
+        Ok((frame.header(), source, properties))
+    }
 
-        // Apply the write, then answer with the value the device now holds.
-        self.value.clone_from(&edt);
+    /// Answer a request the way a device does.
+    fn answer(
+        &self,
+        request: FrameHeader,
+        source: SocketAddr,
+        code: u8,
+        properties: &[(u8, Vec<u8>)],
+    ) -> Result<(), Box<dyn Error>> {
+        let properties: Vec<Property<'_>> = properties
+            .iter()
+            .map(|(epc, edt)| Property { epc: *epc, edt })
+            .collect();
         let mut reply = [0u8; 256];
         let length = write(
             FrameHeader {
-                tid: header.tid,
+                tid: request.tid,
                 seoj: Eoj::new(0x02, 0x6B, 0x01),
-                deoj: header.seoj,
-                esv: Esv::from_code(0x71),
+                deoj: request.seoj,
+                esv: Esv::from_code(code),
             },
-            &[Property {
-                epc,
-                edt: &self.value,
-            }],
+            &properties,
             &mut reply,
         )
         .map_err(|error| format!("the reply does not fit the buffer: {error}"))?;
         self.socket.send_to(&reply[..length], source)?;
-        Ok((header, epc, edt))
+        Ok(())
+    }
+
+    /// Report a Set property map, then serve one write.
+    ///
+    /// Returns the write as `(header, epc, edt)`, with the value the device
+    /// applied.
+    fn serve_map_and_write(&mut self) -> Result<(FrameHeader, u8, Vec<u8>), Box<dyn Error>> {
+        // The tool reads the map before it writes, because a device refuses a
+        // write for a property outside it.
+        let (request, source, properties) = self.recv_request()?;
+        assert_eq!(
+            request.esv.code(),
+            0x62,
+            "the Set property map is read with a Get request"
+        );
+        assert_eq!(
+            properties,
+            vec![(0x9E, Vec::new())],
+            "the map request names EPC 0x9E"
+        );
+        self.answer(request, source, 0x72, &[(0x9E, vec![1, 0xD1])])?;
+
+        let (request, source, properties) = self.recv_request()?;
+        let (epc, edt) = properties
+            .first()
+            .cloned()
+            .ok_or("the device received a write without properties")?;
+        // Apply the write, then answer with the value the device now holds.
+        self.value.clone_from(&edt);
+        self.answer(request, source, 0x71, &[(epc, self.value.clone())])?;
+        Ok((request, epc, edt))
     }
 }
 
@@ -549,7 +588,7 @@ fn writes_a_property_and_prints_the_devices_answer() -> Result<(), Box<dyn Error
         "0xD1=0x2A",
     ])?;
 
-    let (header, epc, edt) = device.serve_one_write()?;
+    let (header, epc, edt) = device.serve_map_and_write()?;
     assert_eq!(header.seoj, Eoj::new(0x05, 0xFF, 0x01));
     assert_eq!(header.deoj, Eoj::new(0x02, 0x6B, 0x01));
     assert_eq!(

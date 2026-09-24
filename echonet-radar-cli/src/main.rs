@@ -32,12 +32,12 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use clap::Parser;
-use echonet_lite::ecodec::{Access, decode, lookup};
+use echonet_lite::ecodec::{Access, PropertyInfo, decode, lookup};
 use echonet_lite::frame::{Eoj, Esv, Frame, FrameHeader, Property, parse};
 use echonet_lite_udp::EchoNetSocket;
 use echonet_radar_core::{
     CONTROLLER_EOJ, ChangeEvent, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, DeviceEvent,
-    RadarConfig, RadarEvent, format_edt, run_service,
+    RadarConfig, RadarEvent, format_edt, get_header, parse_property_map, run_service,
 };
 
 /// Receive buffer size. ECHONET Lite frames are at most 256 bytes; the extra
@@ -51,8 +51,15 @@ const RECEIVE_BUFFER_LEN: usize = 512;
 const SET_REQUEST_ESV_CODE: u8 = 0x61;
 /// The standard write response service code (`SetC_Res`).
 const SET_RESPONSE_ESV_CODE: u8 = 0x71;
+/// The EPC of the Set property map: the properties a device accepts Set for.
+const SET_PROPERTY_MAP_EPC: u8 = 0x9E;
+/// The class code of the super class, which defines the properties every object
+/// carries (installation location, version information and so on).
+const SUPER_CLASS_CODE: u16 = 0x0000;
 /// Time allowed for a device to answer a write.
 const WRITE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Time allowed for a device to answer the Set property map request.
+const MAP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command-line arguments.
 #[derive(Debug, Parser)]
@@ -223,19 +230,28 @@ async fn run_active(
 
 /// Write one property to a device and print the device's answer.
 ///
-/// The request is sent from a socket bound to the standard ECHONET Lite port:
-/// the water heater on this LAN answers that port rather than the port the
-/// request came from, so an ephemeral socket never sees the answer.
+/// Before anything is sent, the device is asked which properties it accepts Set
+/// for (`0x9E`, the Set property map) and the write is refused when the EPC is
+/// missing from that map: a device answers such a write with an error status.
+/// The request itself is sent from a socket bound to the standard ECHONET Lite
+/// port, because the water heater on this LAN answers that port rather than the
+/// port the request came from.
 async fn write_property(
     interface: Ipv4Addr,
     device: SocketAddr,
     eoj: Eoj,
     property: &WriteProperty,
 ) -> io::Result<()> {
-    validate_write(eoj.class_code(), property)
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-
     let socket = EchoNetSocket::bind_default_multicast(interface).await?;
+
+    let accepted = fetch_set_map(&socket, device, eoj).await;
+    if accepted.is_none() {
+        eprintln!(
+            "echonet-radar-cli: {device} did not report a Set property map (EPC=0x{SET_PROPERTY_MAP_EPC:02X})"
+        );
+    }
+    validate_write(eoj.class_code(), property, accepted.as_deref())
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
 
     let tid = write_tid();
     socket
@@ -255,37 +271,85 @@ async fn write_property(
         format_eoj(eoj),
     );
 
-    let deadline = tokio::time::Instant::now() + WRITE_RESPONSE_TIMEOUT;
+    let Some((answer, source)) = recv_answer(&socket, tid, WRITE_RESPONSE_TIMEOUT).await else {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "no answer from {device} within {} seconds",
+                WRITE_RESPONSE_TIMEOUT.as_secs()
+            ),
+        ));
+    };
+    let Ok(frame) = parse(&answer) else {
+        return Err(io::Error::other(format!(
+            "the answer from {device} is not an ECHONET Lite frame"
+        )));
+    };
+    println!("{}", log_line(SystemTime::now(), source, &frame));
+    let code = frame.header().esv.code();
+    if code == SET_RESPONSE_ESV_CODE {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "the device did not accept the write (ESV=0x{code:02X})"
+        )))
+    }
+}
+
+/// Ask a device which properties it accepts Set for, via EPC `0x9E`.
+///
+/// Returns the EPCs the device lists, or `None` when it does not answer, does
+/// not carry the map, or sends a map that cannot be parsed.
+async fn fetch_set_map(
+    socket: &EchoNetSocket,
+    device: SocketAddr,
+    eoj: Eoj,
+) -> Option<Vec<u8>> {
+    let tid = write_tid();
+    let properties = [Property {
+        epc: SET_PROPERTY_MAP_EPC,
+        edt: &[],
+    }];
+    socket
+        .send_frame_to(get_header(tid, eoj), &properties, device)
+        .await
+        .ok()?;
+    let (answer, _) = recv_answer(socket, tid, MAP_READ_TIMEOUT).await?;
+    set_map_from_answer(&answer)
+}
+
+/// The Set property map carried by an answer frame, if it has one.
+fn set_map_from_answer(bytes: &[u8]) -> Option<Vec<u8>> {
+    let frame = parse(bytes).ok()?;
+    let map = frame
+        .properties()
+        .find(|property| property.epc == SET_PROPERTY_MAP_EPC)?;
+    parse_property_map(map.edt).ok()
+}
+
+/// Read datagrams until one carries `tid`, or `timeout` elapses.
+///
+/// Port 3610 carries traffic from other ECHONET Lite nodes, so answers are
+/// matched by transaction ID rather than taken as they come.
+async fn recv_answer(
+    socket: &EchoNetSocket,
+    tid: u16,
+    timeout: Duration,
+) -> Option<(Vec<u8>, SocketAddr)> {
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut buffer = [0u8; RECEIVE_BUFFER_LEN];
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let received = tokio::time::timeout(remaining, socket.recv(&mut buffer))
+        let (length, source) = tokio::time::timeout(remaining, socket.recv(&mut buffer))
             .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "no answer from {device} within {} seconds",
-                        WRITE_RESPONSE_TIMEOUT.as_secs()
-                    ),
-                )
-            })?;
-        let (length, source) = received?;
+            .ok()?
+            .ok()?;
         let Ok(frame) = parse(&buffer[..length]) else {
             continue;
         };
-        if frame.header().tid != tid {
-            continue;
+        if frame.header().tid == tid {
+            return Some((buffer[..length].to_vec(), source));
         }
-        println!("{}", log_line(SystemTime::now(), source, &frame));
-        let code = frame.header().esv.code();
-        return if code == SET_RESPONSE_ESV_CODE {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "the device did not accept the write (ESV=0x{code:02X})"
-            )))
-        };
     }
 }
 
@@ -315,17 +379,20 @@ fn write_tid() -> u16 {
     u16::from_le_bytes([nanos[0], nanos[1]]).max(1)
 }
 
-/// Refuse a write the MRA tables say the device cannot take.
+/// Refuse a write the device or the MRA tables say cannot be taken.
 ///
-/// The tables state which properties a class supports for Set and how long and
-/// how large their values may be, so a typo is caught here rather than sent to
-/// an appliance.
+/// `accepted` is the device's own Set property map (`0x9E`) when it reported
+/// one: a device answers a write for a property missing from that map with an
+/// error status, so the write is refused here instead of on the wire. The
+/// tables then state how long and how large the value may be, so a typo is
+/// caught before it reaches an appliance.
 fn validate_write(
     class_code: u16,
     property: &WriteProperty,
+    accepted: Option<&[u8]>,
 ) -> Result<(), String> {
     let epc = property.epc;
-    let Some(info) = lookup(class_code, epc) else {
+    let Some(info) = property_metadata(class_code, epc) else {
         return Err(format!(
             "EPC=0x{epc:02X} is not defined for class 0x{class_code:04X}"
         ));
@@ -336,13 +403,34 @@ fn validate_write(
             info.name
         ));
     }
-    decode(class_code, epc, &property.edt).map_err(|error| {
+    if let Some(accepted) = accepted
+        && !accepted.contains(&epc)
+    {
+        return Err(format!(
+            "the device does not accept Set for EPC=0x{epc:02X} ({}); its Set property map lists {}",
+            info.name,
+            format_bytes(accepted)
+        ));
+    }
+    decode(info.class, epc, &property.edt).map_err(|error| {
         format!(
             "the value for EPC=0x{epc:02X} ({}) is not valid: {error}",
             info.name
         )
     })?;
     Ok(())
+}
+
+/// Property metadata for an EPC, falling back to the super class.
+///
+/// A class table lists only the properties the class itself defines, so the
+/// properties every object carries (installation location, version information
+/// and so on) come from the super class.
+fn property_metadata(
+    class_code: u16,
+    epc: u8,
+) -> Option<&'static PropertyInfo> {
+    lookup(class_code, epc).or_else(|| lookup(SUPER_CLASS_CODE, epc))
 }
 
 /// Parse a device address, defaulting to the standard ECHONET Lite port.
@@ -834,24 +922,95 @@ mod tests {
     fn writes_are_checked_against_the_tables_before_they_are_sent() {
         let heater = 0x026B;
         // The supplied water temperature setting accepts 0..100 Celsius.
-        assert!(validate_write(heater, &parse_property("0xD1=0x28").unwrap()).is_ok());
+        assert!(validate_write(heater, &parse_property("0xD1=0x28").unwrap(), None).is_ok());
         assert!(
-            validate_write(heater, &parse_property("0xD1=0xFF").unwrap()).is_err(),
+            validate_write(heater, &parse_property("0xD1=0xFF").unwrap(), None).is_err(),
             "a value above the table range must be refused"
         );
         assert!(
-            validate_write(heater, &parse_property("0xD1=0x2800").unwrap()).is_err(),
+            validate_write(heater, &parse_property("0xD1=0x2800").unwrap(), None).is_err(),
             "a value of the wrong length must be refused"
         );
         assert!(
-            validate_write(heater, &parse_property("0x9F=0x00").unwrap()).is_err(),
-            "a property the class does not define must be refused"
-        );
-        // Version information is readable but not settable on that class.
-        assert!(
-            validate_write(heater, &parse_property("0x82=0x00000001").unwrap()).is_err(),
+            validate_write(heater, &parse_property("0xC9=0x01").unwrap(), None).is_err(),
             "a property the tables say is not settable must be refused"
         );
+        // Installation location lives in the super class, not in the class
+        // table, and the device accepts it.
+        assert!(validate_write(heater, &parse_property("0x81=0x00").unwrap(), None).is_ok());
+        assert_eq!(
+            property_metadata(heater, 0x81).map(|info| info.name),
+            Some("Installation location")
+        );
+    }
+
+    #[test]
+    fn writes_are_refused_when_the_device_set_map_lacks_the_property() {
+        let heater = 0x026B;
+        // The water heater's own Set map, as the device reports it.
+        let accepted = [
+            0x81, 0x8F, 0x90, 0x91, 0x93, 0x97, 0x98, 0xB0, 0xB4, 0xB6, 0xC0, 0xC7, 0xCA, 0xE3,
+            0xE4,
+        ];
+        assert!(
+            validate_write(
+                heater,
+                &parse_property("0xB4=0x00").unwrap(),
+                Some(&accepted)
+            )
+            .is_ok(),
+            "a property in the device map is allowed"
+        );
+        let refused = validate_write(
+            heater,
+            &parse_property("0xD1=0x28").unwrap(),
+            Some(&accepted),
+        );
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|message| message.contains("does not accept Set for EPC=0xD1")),
+            "a property missing from the device map must be refused: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn the_set_map_is_read_out_of_an_answer_frame() {
+        /// A response from a device that carries one property.
+        fn answer(
+            tid: u16,
+            epc: u8,
+            edt: &[u8],
+        ) -> Vec<u8> {
+            encode(
+                FrameHeader {
+                    tid,
+                    seoj: Eoj::new(0x02, 0x6B, 0x01),
+                    deoj: Eoj::new(0x05, 0xFF, 0x01),
+                    esv: Esv::from_code(0x72),
+                },
+                &[Property { epc, edt }],
+            )
+        }
+
+        // Compact form: a count of 15 or less, then the EPCs.
+        assert_eq!(
+            set_map_from_answer(&answer(1, SET_PROPERTY_MAP_EPC, &[2, 0xB4, 0xD3])),
+            Some(vec![0xB4, 0xD3])
+        );
+
+        // Bitmap form: a count above 15, then 16 bytes covering 0x80..=0xFF.
+        let mut bitmap = vec![0x80];
+        bitmap.extend([0xFF; 16]);
+        let map = set_map_from_answer(&answer(2, SET_PROPERTY_MAP_EPC, &bitmap))
+            .expect("a full bitmap parses");
+        assert_eq!(
+            (map.len(), map.first(), map.last()),
+            (128, Some(&0x80), Some(&0xFF))
+        );
+
+        // An answer that does not carry the map yields nothing.
+        assert_eq!(set_map_from_answer(&answer(3, 0x80, &[0x30])), None);
     }
 
     #[test]
