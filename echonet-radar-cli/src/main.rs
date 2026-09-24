@@ -553,11 +553,13 @@ fn format_property(
     )
 }
 
-/// The class code of whichever EOJ defines `epc` in this frame.
+/// The class code of whichever table defines `epc` for this frame.
 ///
 /// Responses and notifications carry the device in `seoj`, but requests carry it
 /// in `deoj` (the sending controller owns no such property); the frame has no
-/// value to decode against the other one.
+/// value to decode against the other one. Properties every object carries (the
+/// super class: installation location, remote control setting and so on) are
+/// defined by neither, and are rendered from the super class table.
 fn property_owner(
     header: FrameHeader,
     epc: u8,
@@ -567,7 +569,10 @@ fn property_owner(
         return Some(seoj);
     }
     let deoj = header.deoj.class_code();
-    lookup(deoj, epc).map(|_| deoj)
+    if lookup(deoj, epc).is_some() {
+        return Some(deoj);
+    }
+    lookup(SUPER_CLASS_CODE, epc).map(|_| SUPER_CLASS_CODE)
 }
 
 fn format_bytes(bytes: &[u8]) -> String {
@@ -729,14 +734,16 @@ mod tests {
                 esv: Esv::PropertyNotification,
             },
             &[Property {
-                epc: 0x8F,
+                // Defined by neither the controller class in DEOJ nor the super
+                // class, so there is no name or decoder for it.
+                epc: 0xE1,
                 edt: &[0x01, 0xAF],
             }],
         );
         let frame = parse(&bytes).unwrap();
         assert_eq!(
             format_frame(source(), &frame),
-            "192.0.2.1:3610 0xFFFF01->0x05FF01 ESV=0x63 [EPC=0x8F 01 AF]"
+            "192.0.2.1:3610 0xFFFF01->0x05FF01 ESV=0x63 [EPC=0xE1 01 AF]"
         );
     }
 
@@ -845,6 +852,36 @@ mod tests {
             format_frame(source(), &frame),
             "192.0.2.1:3610 0x001101->0x05FF01 ESV=0x63 \
              [EPC=0xE0 Measured temperature value 26 Celsius]"
+        );
+    }
+
+    #[test]
+    fn super_class_properties_are_named_in_log_lines() {
+        // Remote control setting (0x93) and power-saving operation setting
+        // (0x8F) are defined by the super class, not by the device class.
+        let bytes = encode(
+            FrameHeader {
+                tid: 8,
+                seoj: Eoj::new(0x02, 0x6B, 0x01),
+                deoj: Eoj::new(0x05, 0xFF, 0x01),
+                esv: Esv::PropertyReadResponse,
+            },
+            &[
+                Property {
+                    epc: 0x93,
+                    edt: &[0x41],
+                },
+                Property {
+                    epc: 0x8F,
+                    edt: &[0x42],
+                },
+            ],
+        );
+        let frame = parse(&bytes).unwrap();
+        assert_eq!(
+            format_frame(source(), &frame),
+            "192.0.2.1:3610 0x026B01->0x05FF01 ESV=0x71 \
+             [EPC=0x93 Remote control setting ON, EPC=0x8F Power-saving operation setting OFF]"
         );
     }
 

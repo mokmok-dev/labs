@@ -275,7 +275,7 @@ const fn header(
 /// Together they cover a device notification, a request whose property belongs
 /// to the addressed object rather than the sender, a value labelled with a unit
 /// from the MRA tables, an object absent from those tables, a telegram with two
-/// properties, and a fractional value.
+/// properties, a fractional value, and a property no table defines.
 fn injections() -> Result<Vec<Injection>, Box<dyn Error>> {
     let controller = Eoj::new(0x05, 0xFF, 0x01);
     let air_conditioner = Eoj::new(0x01, 0x30, 0x01);
@@ -324,11 +324,11 @@ fn injections() -> Result<Vec<Injection>, Box<dyn Error>> {
             bytes: encode(
                 header(4, unknown_object, controller, Esv::PropertyNotification),
                 &[Property {
-                    epc: 0x8F,
+                    epc: 0xE1,
                     edt: &[0x01, 0xAF],
                 }],
             )?,
-            expected: "0xFFFF01->0x05FF01 ESV=0x63 [EPC=0x8F 01 AF]",
+            expected: "0xFFFF01->0x05FF01 ESV=0x63 [EPC=0xE1 01 AF]",
         },
         Injection {
             bytes: encode(
