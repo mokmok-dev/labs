@@ -165,16 +165,26 @@
             '';
           };
 
-          packages = import ./echonet-radar/package.nix {
-            inherit
-              cargoArtifacts
-              commonArgs
-              craneLib
-              lib
-              pkgs
-              webAssets
-              ;
-          };
+          packages =
+            (import ./echonet-radar/package.nix {
+              inherit
+                cargoArtifacts
+                commonArgs
+                craneLib
+                lib
+                pkgs
+                webAssets
+                ;
+            })
+            // {
+              echonet-radar-cli = import ./echonet-radar-cli/package.nix {
+                inherit
+                  cargoArtifacts
+                  commonArgs
+                  craneLib
+                  ;
+              };
+            };
 
           pre-commit.settings = {
             hooks = {

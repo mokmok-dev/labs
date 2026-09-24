@@ -1,0 +1,16 @@
+[package]
+description = "Headless ECHONET Lite discovery and state-change service"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+name = "echonet-radar-core"
+rust-version = "1.98"
+version.workspace = true
+
+[dependencies]
+echonet-lite.workspace = true
+echonet-lite-udp.workspace = true
+tokio.workspace = true
+workspace-hack.workspace = true
+
+[lints]
+workspace = true

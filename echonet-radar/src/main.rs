@@ -27,6 +27,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{StatusCode, Uri, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use clap::Parser;
 use echonet_lite::frame::Eoj;
 use echonet_lite_udp::EchoNetSocket;
 use echonet_radar::{
@@ -42,36 +43,25 @@ use gpui_kit::{div, px, size};
 use gpui_wry::WebView;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use usage::Cli;
 
 /// Maximum number of change events kept in the bridge history.
 const MAX_EVENTS: usize = 1000;
 
 /// Log ECHONET Lite device state changes as a time-series feed.
-//
-// `default = "..."` is required beside `default_value_t`: the literal feeds the
-// emitted portable spec, the Rust expression supplies the runtime value.
-#[derive(Debug, Cli)]
-#[usage(bin = "echonet-radar", version, completion)]
+#[derive(Debug, Parser)]
+#[command(
+    name = "echonet-radar",
+    about = "Log ECHONET Lite device state changes as a time-series feed"
+)]
 struct Arguments {
     /// IPv4 interface used for multicast membership.
-    #[usage(long, default = "0.0.0.0", value_name = "IP")]
+    #[arg(long, default_value = "0.0.0.0", value_name = "IP")]
     interface: Ipv4Addr,
     /// Discovery interval in seconds.
-    #[usage(
-        long,
-        default = "60",
-        default_value_t = DEFAULT_DISCOVERY_INTERVAL.as_secs(),
-        value_name = "SECONDS"
-    )]
+    #[arg(long, default_value_t = DEFAULT_DISCOVERY_INTERVAL.as_secs(), value_name = "SECONDS")]
     discovery_interval_seconds: u64,
     /// Value-polling interval in seconds.
-    #[usage(
-        long,
-        default = "15",
-        default_value_t = DEFAULT_UPDATE_INTERVAL.as_secs(),
-        value_name = "SECONDS"
-    )]
+    #[arg(long, default_value_t = DEFAULT_UPDATE_INTERVAL.as_secs(), value_name = "SECONDS")]
     update_interval_seconds: u64,
 }
 
