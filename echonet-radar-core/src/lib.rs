@@ -756,6 +756,23 @@ impl ServiceState {
                 return;
             },
         };
+        let pollable = instances
+            .iter()
+            .filter(|eoj| is_pollable_object(**eoj))
+            .count();
+        if pollable == 0 {
+            // A node that announces only its node profile and controller
+            // instances still proves it answered discovery: a controller-only
+            // node, such as a controller under development, would otherwise
+            // read as "no devices".
+            self.status = format!(
+                "{} answered discovery with {} instance(s) and no device object",
+                source.ip(),
+                instances.len()
+            );
+            self.send_status(self.status.clone());
+            return;
+        }
         let mut count = 0;
         for eoj in instances {
             if !is_pollable_object(eoj) {
@@ -1490,6 +1507,43 @@ mod tests {
             eoj: Eoj::new(0x02, 0x6B, 0x01),
         };
         assert_eq!(standard.listen_address(), standard.address);
+    }
+
+    #[tokio::test]
+    async fn a_controller_only_discovery_answer_is_reported() {
+        let socket = test_socket().await;
+        let (mut service, receiver) = service();
+        let source: SocketAddr = "192.0.2.13:3610".parse().unwrap();
+
+        // The Remo E and the controller under development both announce a
+        // single controller instance and no appliance.
+        service
+            .process_frame(
+                &socket,
+                FrameHeader {
+                    tid: 1,
+                    seoj: Eoj::new(0x0E, 0xF0, 0x00),
+                    deoj: CONTROLLER_EOJ,
+                    esv: Esv::from_code(GET_RESPONSE_ESV_CODE),
+                },
+                vec![(DISCOVERY_EPC, vec![1, 0x05, 0xFF, 0x01])],
+                source,
+            )
+            .await;
+
+        let statuses: Vec<String> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|event| match event {
+                RadarEvent::Status(status) => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![String::from(
+                "192.0.2.13 answered discovery with 1 instance(s) and no device object"
+            )]
+        );
+        assert!(service.poll_epcs.is_empty());
     }
 
     #[tokio::test]
