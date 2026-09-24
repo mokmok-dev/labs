@@ -29,6 +29,8 @@ use echonet_lite_udp::EchoNetSocket;
 pub const CONTROLLER_EOJ: Eoj = Eoj::new(0x05, 0xFF, 0x01);
 /// The wildcard node-profile EOJ used for discovery requests.
 pub const DISCOVERY_NODE_PROFILE_EOJ: Eoj = Eoj::new(0x0E, 0xF0, 0x00);
+/// The controller class: the class of the node that drives other objects.
+pub const CONTROLLER_CLASS_CODE: u16 = 0x05FF;
 /// The node-profile class code.
 pub const NODE_PROFILE_CLASS_CODE: u16 = 0x0EF0;
 /// The D6 self-node instance-list EPC.
@@ -717,6 +719,9 @@ impl ServiceState {
         source: SocketAddr,
         eoj: Eoj,
     ) -> bool {
+        if !is_pollable_object(eoj) {
+            return false;
+        }
         let is_new = match self.poll_epcs.entry(DeviceId {
             ip: source.ip(),
             eoj,
@@ -755,7 +760,7 @@ impl ServiceState {
         };
         let mut count = 0;
         for eoj in instances {
-            if eoj.class_code() == NODE_PROFILE_CLASS_CODE {
+            if !is_pollable_object(eoj) {
                 continue;
             }
             if self.register_device(source, eoj) {
@@ -906,6 +911,23 @@ impl ServiceState {
         };
         let _ = self.events.send(RadarEvent::Change(change));
     }
+}
+
+/// Whether an EOJ is an object this radar polls.
+///
+/// A node announces its node profile, and a node that drives other objects
+/// announces a controller instance beside the appliances it controls. A
+/// controller's own properties are its identity and the count and index of the
+/// devices it drives, so they are not appliance state this radar watches; on
+/// this LAN the controller instances of two different controllers came back in
+/// the discovery list. Controllers also send from the same EOJ this radar uses
+/// ([`CONTROLLER_EOJ`]), which makes one of them easy to mistake for our own
+/// traffic in a passive log.
+const fn is_pollable_object(eoj: Eoj) -> bool {
+    !matches!(
+        eoj.class_code(),
+        NODE_PROFILE_CLASS_CODE | CONTROLLER_CLASS_CODE
+    )
 }
 
 fn fallback_poll_epcs(class_code: u16) -> Vec<u8> {
@@ -1504,6 +1526,79 @@ mod tests {
             eoj: Eoj::new(0x01, 0x30, 0x01),
         };
         assert!(service.poll_epcs.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn controller_and_node_profile_instances_are_not_devices() {
+        // A controller node announces its node profile and its controller
+        // instance beside the appliances it drives; only the appliances hold
+        // state this radar polls.
+        let socket = test_socket().await;
+        let (mut service, receiver) = service();
+        let source: SocketAddr = "192.0.2.11:3610".parse().unwrap();
+
+        service
+            .process_frame(
+                &socket,
+                FrameHeader {
+                    tid: 0xF00D,
+                    seoj: DISCOVERY_NODE_PROFILE_EOJ,
+                    deoj: CONTROLLER_EOJ,
+                    esv: Esv::from_code(GET_RESPONSE_ESV_CODE),
+                },
+                vec![(
+                    DISCOVERY_EPC,
+                    vec![
+                        4, 0x0E, 0xF0, 0x01, 0x05, 0xFF, 0x01, 0x02, 0x6B, 0x01, 0x01, 0x30, 0x01,
+                    ],
+                )],
+                source,
+            )
+            .await;
+
+        let announced: Vec<Eoj> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|event| match event {
+                RadarEvent::Device(device) => Some(device.eoj),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            announced,
+            vec![Eoj::new(0x02, 0x6B, 0x01), Eoj::new(0x01, 0x30, 0x01)]
+        );
+        assert!(!service.poll_epcs.contains_key(&DeviceId {
+            ip: source.ip(),
+            eoj: Eoj::new(0x05, 0xFF, 0x01),
+        }));
+        assert_eq!(service.poll_epcs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn controller_notification_does_not_register_a_device() {
+        // Another controller pushing an INF must not become a polled object.
+        let socket = test_socket().await;
+        let (mut service, receiver) = service();
+        let source: SocketAddr = "192.0.2.12:3610".parse().unwrap();
+
+        service
+            .process_frame(
+                &socket,
+                FrameHeader {
+                    tid: 7,
+                    seoj: CONTROLLER_EOJ,
+                    deoj: Eoj::new(0x02, 0x6B, 0x01),
+                    esv: Esv::PropertyNotification,
+                },
+                vec![(0x80, vec![0x30])],
+                source,
+            )
+            .await;
+
+        assert!(service.poll_epcs.is_empty());
+        let devices = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter(|event| matches!(event, RadarEvent::Device(_)))
+            .count();
+        assert_eq!(devices, 0);
     }
 
     #[tokio::test]
