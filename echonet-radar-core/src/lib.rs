@@ -144,6 +144,21 @@ impl DeviceKey {
             eoj: self.eoj,
         }
     }
+
+    /// The address to send a request to.
+    ///
+    /// Devices listen on the standard ECHONET Lite port but differ in the port
+    /// they send *from*: the air conditioner on this LAN answers from an
+    /// ephemeral port, so a request sent to the port a frame arrived from never
+    /// reaches it.
+    fn listen_address(&self) -> SocketAddr {
+        listen_address(self.address.ip())
+    }
+}
+
+/// The address a device object listens on: its IP at the standard port.
+fn listen_address(ip: IpAddr) -> SocketAddr {
+    SocketAddr::from((ip, echonet_lite_udp::MULTICAST_PORT))
 }
 
 /// Identity of a device object, excluding the source port.
@@ -471,7 +486,6 @@ struct ServiceState {
     events: Sender<RadarEvent>,
     poll_epcs: HashMap<DeviceId, Vec<u8>>,
     values: HashMap<DeviceId, BTreeMap<u8, Vec<u8>>>,
-    source_ports: HashMap<DeviceId, u16>,
     pending: HashMap<u16, PendingRequest>,
     next_tid: u16,
     first_refresh_done: bool,
@@ -489,7 +503,6 @@ impl ServiceState {
             events,
             poll_epcs: HashMap::new(),
             values: HashMap::new(),
-            source_ports: HashMap::new(),
             pending: HashMap::new(),
             next_tid: 0,
             first_refresh_done: false,
@@ -568,7 +581,7 @@ impl ServiceState {
             },
         ];
         if let Err(error) = socket
-            .send_frame_to(get_header(tid, key.eoj), &properties, key.address)
+            .send_frame_to(get_header(tid, key.eoj), &properties, key.listen_address())
             .await
         {
             self.pending.remove(&tid);
@@ -601,7 +614,7 @@ impl ServiceState {
             },
         );
         if let Err(error) = socket
-            .send_frame_to(get_header(tid, key.eoj), &properties, key.address)
+            .send_frame_to(get_header(tid, key.eoj), &properties, key.listen_address())
             .await
         {
             self.pending.remove(&tid);
@@ -614,15 +627,12 @@ impl ServiceState {
         &mut self,
         socket: &EchoNetSocket,
     ) -> io::Result<()> {
-        // Refresh each known device object using its freshest source port.
         let keys: Vec<DeviceKey> = self
             .poll_epcs
             .keys()
-            .filter_map(|id| {
-                self.source_address(*id).map(|address| DeviceKey {
-                    address,
-                    eoj: id.eoj,
-                })
+            .map(|id| DeviceKey {
+                address: listen_address(id.ip),
+                eoj: id.eoj,
             })
             .collect();
         // A transient send failure for one device must not skip the rest of
@@ -645,16 +655,6 @@ impl ServiceState {
             return Err(error);
         }
         Ok(())
-    }
-
-    /// The freshest known source address for a device object.
-    fn source_address(
-        &self,
-        id: DeviceId,
-    ) -> Option<SocketAddr> {
-        self.source_ports
-            .get(&id)
-            .map(|port| SocketAddr::from((id.ip, *port)))
     }
 
     async fn process_frame(
@@ -688,11 +688,6 @@ impl ServiceState {
             self.send_status(self.status.clone());
             return;
         }
-
-        let key = pending.key();
-        // The answer proves the device is reachable at this source; remember
-        // the freshest contact port for subsequent unicast requests.
-        self.remember_source(key.address.ip(), key.eoj, source.port());
 
         match pending {
             PendingRequest::PropertyMap { key, .. } => {
@@ -741,7 +736,6 @@ impl ServiceState {
                 .events
                 .send(RadarEvent::Device(DeviceEvent { source, eoj }));
         }
-        self.remember_source(source.ip(), eoj, source.port());
         is_new
     }
 
@@ -797,17 +791,6 @@ impl ServiceState {
         }
         self.status = format!("discovered {count} new device object(s)");
         self.send_status(self.status.clone());
-    }
-
-    fn remember_source(
-        &mut self,
-        ip: IpAddr,
-        eoj: Eoj,
-        port: u16,
-    ) {
-        let id = DeviceId { ip, eoj };
-        let entry = self.source_ports.entry(id).or_insert(port);
-        *entry = port;
     }
 
     fn has_pending_map(
@@ -1490,6 +1473,23 @@ mod tests {
         // The device itself is still announced; no change event is drawn.
         assert!(matches!(receiver.recv().unwrap(), RadarEvent::Device(_)));
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn requests_go_to_the_standard_port_not_the_sender_port() {
+        // The air conditioner on this LAN answers from an ephemeral port; it
+        // listens on the standard one, where requests must go.
+        let key = DeviceKey {
+            address: "192.0.2.1:49153".parse().unwrap(),
+            eoj: Eoj::new(0x01, 0x30, 0x01),
+        };
+        assert_eq!(key.listen_address(), "192.0.2.1:3610".parse().unwrap());
+
+        let standard = DeviceKey {
+            address: "192.0.2.2:3610".parse().unwrap(),
+            eoj: Eoj::new(0x02, 0x6B, 0x01),
+        };
+        assert_eq!(standard.listen_address(), standard.address);
     }
 
     #[tokio::test]
