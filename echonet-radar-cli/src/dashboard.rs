@@ -375,9 +375,8 @@ impl Dashboard {
         self.power_source(now).map(|source| source.watts)
     }
 
-    /// `None` while any reported unit is stale, so a plotted point never
-    /// mixes fresh and stale unit readings. A unit that has never reported is
-    /// excluded; the summary marks such a total as partial.
+    /// A stale unit invalidates the total: summing the rest would read as a
+    /// real drop in generation.
     fn solar_watts(
         &self,
         now: SystemTime,
@@ -506,7 +505,8 @@ impl Dashboard {
             SeriesState::Current { watts, .. } => Some(*watts),
             SeriesState::Stale { last, .. } => Some(*last),
         };
-        // A stale detail plus the stats overflows an 80-column panel.
+        // The detail plus the stats do not fit the 80-column layout this
+        // panel targets.
         let show_stats = !matches!(
             &state,
             SeriesState::Stale {
