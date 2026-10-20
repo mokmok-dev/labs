@@ -617,6 +617,7 @@ fn print_event(event: RadarEvent) {
             let line = format_device(&device);
             let _ = writeln!(io::stdout(), "{line}");
         },
+        RadarEvent::Seen(_) => {},
         RadarEvent::Status(status) => {
             eprintln!("echonet-radar-cli: {status}");
         },
@@ -631,7 +632,7 @@ fn format_change(change: &ChangeEvent) -> String {
         change.source,
         format_eoj(change.eoj),
         change.epc,
-        change.edt,
+        change.text,
     )
 }
 
@@ -834,7 +835,8 @@ mod tests {
             source: source(),
             eoj: Eoj::new(0x01, 0x30, 0x01),
             epc: 0x80,
-            edt: String::from("Operation status ON"),
+            text: String::from("Operation status ON"),
+            raw_edt: Vec::new(),
         });
         assert!(line.contains("192.0.2.1:3610 0x013001 EPC=0x80 Operation status ON"));
     }

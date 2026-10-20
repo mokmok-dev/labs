@@ -213,7 +213,7 @@ impl ChangePayload {
             source: change.source,
             eoj: format_eoj(change.eoj),
             epc: change.epc,
-            edt: change.edt,
+            edt: change.text,
         }
     }
 }
@@ -362,6 +362,7 @@ fn pump_events(
                 lock_history(history).register_device(payload.clone());
                 ServerMessage::Device(payload)
             },
+            RadarEvent::Seen(_) => continue,
             RadarEvent::Status(status) => {
                 lock_history(history).status.clone_from(&status);
                 ServerMessage::Status { message: status }
@@ -575,7 +576,8 @@ mod tests {
             source: "192.0.2.1:3610".parse::<SocketAddr>().unwrap(),
             eoj: Eoj::new(class_group, class, instance),
             epc,
-            edt: String::from(edt),
+            text: String::from(edt),
+            raw_edt: Vec::new(),
         })
     }
 
