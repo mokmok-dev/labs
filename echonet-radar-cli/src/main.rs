@@ -5,7 +5,9 @@
 //! anything, so it only reports traffic already on the wire. With `--active` it
 //! runs the same discovery and value-polling service as the `echonet-radar` GUI
 //! (`echonet-radar-core`), discovers devices, polls their properties and prints
-//! each state change.
+//! each state change. With `--tui` that service backs a full-screen dashboard
+//! instead: instantaneous power over the last two minutes and one row per
+//! device object with its key properties.
 //!
 //! `--to`, `--eoj` and `--set` write one property to a device and print the
 //! device's answer, which is how appliances are controlled. The request is
@@ -20,11 +22,14 @@
 //! ```text
 //! echonet-radar-cli --interface 192.168.1.2
 //! echonet-radar-cli --interface 192.168.1.2 --active
+//! echonet-radar-cli --interface 192.168.1.2 --tui
 //! echonet-radar-cli --to 192.168.1.20 --eoj 0x026B01 --set 0xD1=0x28
 //! ```
 
+mod dashboard;
+
 use std::fmt::Write as _;
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -32,6 +37,7 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use clap::Parser;
+use dashboard::run as run_dashboard;
 use echonet_lite::ecodec::{Access, PropertyInfo, decode, lookup};
 use echonet_lite::frame::{Eoj, Esv, Frame, FrameHeader, Property, parse};
 use echonet_lite_udp::EchoNetSocket;
@@ -82,6 +88,9 @@ struct Arguments {
     /// multicast traffic.
     #[arg(long)]
     active: bool,
+    /// Show a full-screen dashboard; implies `--active`.
+    #[arg(long, conflicts_with_all = ["to", "eoj", "set"])]
+    tui: bool,
     /// Discovery interval in seconds (active mode only).
     #[arg(
         long,
@@ -155,6 +164,16 @@ async fn run(arguments: Arguments) -> io::Result<()> {
         (arguments.to, arguments.eoj, arguments.set.as_ref())
     {
         return write_property(arguments.interface, device, eoj, property).await;
+    }
+
+    if arguments.tui && !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        return Err(io::Error::other(
+            "--tui needs a terminal on stdin and stdout",
+        ));
+    }
+
+    if arguments.tui {
+        return run_dashboard(arguments.radar_config());
     }
 
     let socket = EchoNetSocket::bind_default_multicast(arguments.interface)
@@ -697,6 +716,24 @@ mod tests {
         let config = arguments.radar_config();
         assert_eq!(config.discovery_interval, DEFAULT_DISCOVERY_INTERVAL);
         assert_eq!(config.update_interval, DEFAULT_UPDATE_INTERVAL);
+    }
+
+    #[test]
+    fn tui_flag_conflicts_with_write_mode() {
+        assert!(Arguments::parse_from(["echonet-radar-cli", "--tui"]).tui);
+        assert!(
+            Arguments::try_parse_from([
+                "echonet-radar-cli",
+                "--tui",
+                "--to",
+                "192.168.100.20",
+                "--eoj",
+                "0x026B01",
+                "--set",
+                "0xD1=0x28",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

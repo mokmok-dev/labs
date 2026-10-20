@@ -22,6 +22,9 @@ echonet-radar-cli = { version = "0.0.0", path = "./echonet-radar-cli" }
 echonet-radar-core = { version = "0.0.0", path = "./echonet-radar-core" }
 gpui-kit = "0.6"
 gpui-wry = "0.6"
+ratatui = { version = "0.30", default-features = false, features = [
+  "crossterm",
+] }
 rust-embed = "8"
 # gpui-wry builds its webviews with the lb-wry fork; use the same package so
 # builder types match when echonet-radar constructs its own webview.
