@@ -575,50 +575,10 @@ impl FakeDevice {
 }
 
 #[test]
-fn tui_without_a_terminal_is_refused() -> Result<(), Box<dyn Error>> {
-    let _port = exclusive_port();
-
-    let mut child = Command::new(BINARY)
-        // An address with no interface proves the terminal check came first:
-        // a bind attempt would fail with a different message.
-        .args(["--interface", "203.0.113.1", "--tui"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let stderr = child.stderr.take().ok_or("child stderr was not piped")?;
-    let stderr = forward_lines(stderr);
-
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("the TUI did not exit without a terminal".into());
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-
-    let message = stderr.iter().collect::<Vec<_>>().join("\n");
-    assert!(
-        !status.success(),
-        "the TUI exited successfully without a terminal: {message}"
-    );
-    assert!(
-        message.contains("needs a terminal"),
-        "the failure does not name the missing terminal: {message}"
-    );
-    Ok(())
-}
-
-#[test]
-fn tui_with_a_write_argument_is_a_usage_error() -> Result<(), Box<dyn Error>> {
+fn listen_with_a_write_argument_is_a_usage_error() -> Result<(), Box<dyn Error>> {
     let output = Command::new(BINARY)
         .args([
-            "--tui",
+            "--listen",
             "--to",
             "192.168.100.20",
             "--eoj",
