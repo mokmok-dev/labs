@@ -396,18 +396,14 @@ impl Dashboard {
         if let Some(source) = self.power_source(now) {
             return SeriesState::Current {
                 watts: source.watts,
-                age: now
-                    .duration_since(source.row.last_seen)
-                    .unwrap_or(Duration::ZERO),
+                age: reading_age(now, source.row.last_seen),
                 detail: Some(format_eoj(source.row.eoj)),
             };
         }
         if let Some(source) = self.last_power_source() {
             return SeriesState::Stale {
                 last: source.watts,
-                age: now
-                    .duration_since(source.row.last_seen)
-                    .unwrap_or(Duration::ZERO),
+                age: reading_age(now, source.row.last_seen),
                 detail: None,
             };
         }
@@ -443,10 +439,7 @@ impl Dashboard {
         }
         let age = units
             .iter()
-            .map(|unit| {
-                now.duration_since(unit.row.last_seen)
-                    .unwrap_or(Duration::ZERO)
-            })
+            .map(|unit| reading_age(now, unit.row.last_seen))
             .max()
             .unwrap_or(Duration::ZERO);
         let partial = (units.len() < pv_count).then(|| format!("{} of {pv_count} PV", units.len()));
@@ -488,15 +481,14 @@ impl Dashboard {
         series: Series,
         seed: Option<i64>,
     ) -> Option<(i64, i64)> {
-        let mut peak = seed;
+        let mut peak = seed?;
         let mut total = 0i64;
         let mut count = 0i64;
         for watts in self.samples.iter().filter_map(|sample| sample.get(series)) {
-            peak = Some(peak.map_or(watts, |peak| peak.max(watts)));
+            peak = peak.max(watts);
             total = total.saturating_add(watts);
-            count += 1;
+            count = count.saturating_add(1);
         }
-        let peak = peak?;
         Some((peak, total.checked_div(count).unwrap_or(peak)))
     }
 
@@ -849,6 +841,13 @@ fn total_watts(units: &[PowerSource<'_>]) -> i64 {
     units
         .iter()
         .fold(0i64, |total, unit| total.saturating_add(unit.watts))
+}
+
+fn reading_age(
+    now: SystemTime,
+    last_seen: SystemTime,
+) -> Duration {
+    now.duration_since(last_seen).unwrap_or(Duration::ZERO)
 }
 
 fn cell_text(
