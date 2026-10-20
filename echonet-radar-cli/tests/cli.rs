@@ -575,6 +575,29 @@ impl FakeDevice {
 }
 
 #[test]
+fn listen_with_a_write_argument_is_a_usage_error() -> Result<(), Box<dyn Error>> {
+    let output = Command::new(BINARY)
+        .args([
+            "--listen",
+            "--to",
+            "192.168.100.20",
+            "--eoj",
+            "0x026B01",
+            "--set",
+            "0xD1=0x28",
+        ])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "unexpected usage error: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn writes_a_property_and_prints_the_devices_answer() -> Result<(), Box<dyn Error>> {
     let _port = exclusive_port();
 

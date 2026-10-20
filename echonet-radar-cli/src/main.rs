@@ -1,11 +1,15 @@
 //! Observe ECHONET Lite state on the LAN from the terminal.
 //!
-//! The tool joins the ECHONET Lite multicast group (`224.0.23.0:3610`). By
-//! default it is passive: it prints one line per received frame and never sends
-//! anything, so it only reports traffic already on the wire. With `--active` it
-//! runs the same discovery and value-polling service as the `echonet-radar` GUI
-//! (`echonet-radar-core`), discovers devices, polls their properties and prints
-//! each state change.
+//! The tool joins the ECHONET Lite multicast group (`224.0.23.0:3610`). In a
+//! terminal it runs the same discovery and value-polling service as the
+//! `echonet-radar` GUI (`echonet-radar-core`) and draws a full-screen
+//! dashboard: instantaneous power over the last two minutes and one row per
+//! device object with its key properties.
+//!
+//! When stdout is not a terminal the tool is passive by default: it prints one
+//! line per received frame and never sends anything, so a pipe captures traffic
+//! already on the wire. `--listen` forces that passive listener in a terminal;
+//! `--active` forces polling when piped, where the changes print as lines.
 //!
 //! `--to`, `--eoj` and `--set` write one property to a device and print the
 //! device's answer, which is how appliances are controlled. The request is
@@ -19,12 +23,15 @@
 //!
 //! ```text
 //! echonet-radar-cli --interface 192.168.1.2
-//! echonet-radar-cli --interface 192.168.1.2 --active
+//! echonet-radar-cli --interface 192.168.1.2 --listen
+//! echonet-radar-cli --interface 192.168.1.2 --active | tee changes.log
 //! echonet-radar-cli --to 192.168.1.20 --eoj 0x026B01 --set 0xD1=0x28
 //! ```
 
+mod dashboard;
+
 use std::fmt::Write as _;
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -32,6 +39,7 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use clap::Parser;
+use dashboard::run as run_dashboard;
 use echonet_lite::ecodec::{Access, PropertyInfo, decode, lookup};
 use echonet_lite::frame::{Eoj, Esv, Frame, FrameHeader, Property, parse};
 use echonet_lite_udp::EchoNetSocket;
@@ -78,18 +86,22 @@ struct Arguments {
     /// IPv4 interface used for multicast membership.
     #[arg(long, default_value = "0.0.0.0", value_name = "IP")]
     interface: Ipv4Addr,
-    /// Actively discover devices and poll their values instead of only watching
-    /// multicast traffic.
+    /// Poll device properties. A terminal shows the dashboard; piped output
+    /// prints the changes as lines.
     #[arg(long)]
     active: bool,
-    /// Discovery interval in seconds (active mode only).
+    /// Only watch multicast traffic, even in a terminal. The default when
+    /// stdout is not a terminal.
+    #[arg(long, conflicts_with_all = ["active", "to", "eoj", "set"])]
+    listen: bool,
+    /// Discovery interval in seconds (when polling).
     #[arg(
         long,
         default_value_t = DEFAULT_DISCOVERY_INTERVAL.as_secs(),
         value_name = "SECONDS"
     )]
     discovery_interval_seconds: u64,
-    /// Value-polling interval in seconds (active mode only).
+    /// Value-polling interval in seconds (when polling).
     #[arg(
         long,
         default_value_t = DEFAULT_UPDATE_INTERVAL.as_secs(),
@@ -137,6 +149,32 @@ impl Arguments {
     }
 }
 
+/// What the tool shows while it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Output {
+    /// Active service on the dashboard, which needs a terminal for keys.
+    Dashboard,
+    /// Active service as one line per change.
+    ActiveLog,
+    /// Passive listener as one line per frame.
+    PassiveLog,
+}
+
+const fn output(
+    arguments: &Arguments,
+    interactive: bool,
+) -> Output {
+    if arguments.listen {
+        Output::PassiveLog
+    } else if interactive {
+        Output::Dashboard
+    } else if arguments.active {
+        Output::ActiveLog
+    } else {
+        Output::PassiveLog
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let arguments = Arguments::parse();
@@ -149,12 +187,18 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Join the multicast group and run in passive or active mode.
+/// Show what the tool observes on the terminal, the pipe, or the socket.
 async fn run(arguments: Arguments) -> io::Result<()> {
     if let (Some(device), Some(eoj), Some(property)) =
         (arguments.to, arguments.eoj, arguments.set.as_ref())
     {
         return write_property(arguments.interface, device, eoj, property).await;
+    }
+
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let output = output(&arguments, interactive);
+    if output == Output::Dashboard {
+        return run_dashboard(arguments.radar_config());
     }
 
     let socket = EchoNetSocket::bind_default_multicast(arguments.interface)
@@ -176,7 +220,7 @@ async fn run(arguments: Arguments) -> io::Result<()> {
         arguments.interface
     );
 
-    if arguments.active {
+    if output == Output::ActiveLog {
         eprintln!(
             "echonet-radar-cli: active mode (discovery {}s, polling {}s)",
             arguments.discovery_interval_seconds, arguments.update_interval_seconds
@@ -617,6 +661,7 @@ fn print_event(event: RadarEvent) {
             let line = format_device(&device);
             let _ = writeln!(io::stdout(), "{line}");
         },
+        RadarEvent::Seen(_) => {},
         RadarEvent::Status(status) => {
             eprintln!("echonet-radar-cli: {status}");
         },
@@ -631,7 +676,7 @@ fn format_change(change: &ChangeEvent) -> String {
         change.source,
         format_eoj(change.eoj),
         change.epc,
-        change.edt,
+        change.text,
     )
 }
 
@@ -665,8 +710,25 @@ mod tests {
     }
 
     #[test]
-    fn passive_is_the_default() {
-        assert!(!Arguments::parse_from(["echonet-radar-cli"]).active);
+    fn neither_mode_flag_is_set_by_default() {
+        let arguments = Arguments::parse_from(["echonet-radar-cli"]);
+        assert!(!arguments.active);
+        assert!(!arguments.listen);
+    }
+
+    #[test]
+    fn a_terminal_shows_the_dashboard_and_a_pipe_shows_a_log() {
+        let plain = Arguments::parse_from(["echonet-radar-cli"]);
+        assert_eq!(output(&plain, true), Output::Dashboard);
+        assert_eq!(output(&plain, false), Output::PassiveLog);
+
+        let active = Arguments::parse_from(["echonet-radar-cli", "--active"]);
+        assert_eq!(output(&active, true), Output::Dashboard);
+        assert_eq!(output(&active, false), Output::ActiveLog);
+
+        let listen = Arguments::parse_from(["echonet-radar-cli", "--listen"]);
+        assert_eq!(output(&listen, true), Output::PassiveLog);
+        assert_eq!(output(&listen, false), Output::PassiveLog);
     }
 
     #[test]
@@ -696,6 +758,25 @@ mod tests {
         let config = arguments.radar_config();
         assert_eq!(config.discovery_interval, DEFAULT_DISCOVERY_INTERVAL);
         assert_eq!(config.update_interval, DEFAULT_UPDATE_INTERVAL);
+    }
+
+    #[test]
+    fn listen_conflicts_with_active_and_write_mode() {
+        assert!(Arguments::parse_from(["echonet-radar-cli", "--listen"]).listen);
+        assert!(Arguments::try_parse_from(["echonet-radar-cli", "--listen", "--active"]).is_err());
+        assert!(
+            Arguments::try_parse_from([
+                "echonet-radar-cli",
+                "--listen",
+                "--to",
+                "192.168.100.20",
+                "--eoj",
+                "0x026B01",
+                "--set",
+                "0xD1=0x28",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -834,7 +915,8 @@ mod tests {
             source: source(),
             eoj: Eoj::new(0x01, 0x30, 0x01),
             epc: 0x80,
-            edt: String::from("Operation status ON"),
+            text: String::from("Operation status ON"),
+            raw_edt: Vec::new(),
         });
         assert!(line.contains("192.0.2.1:3610 0x013001 EPC=0x80 Operation status ON"));
     }
