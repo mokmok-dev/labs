@@ -1,8 +1,6 @@
 .direnv
 .pre-commit-config.yaml
-node_modules
 result
 result-*
 target
-echonet-radar/web/dist
 .tmp

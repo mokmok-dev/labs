@@ -26,7 +26,6 @@
         {
           config,
           pkgs,
-          lib,
           system,
           ...
         }:
@@ -35,69 +34,9 @@
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
           src = pkgs.lib.cleanSourceWith { src = ./.; };
 
-          webSrc = pkgs.lib.cleanSourceWith { src = ./echonet-radar/web; };
-          webDeps = pkgs.fetchPnpmDeps {
-            pname = "echonet-radar-web";
-            version = "0.0.0";
-            src = webSrc;
-            inherit (pkgs) pnpm;
-            fetcherVersion = 4;
-            hash = "sha256-ZIyJkfwT2wRF6tz0MLjwvYQFSgu4ebCH2kNfWwJLRmM=";
-          };
-          webAssets = pkgs.stdenv.mkDerivation {
-            pname = "echonet-radar-web";
-            version = "0.0.0";
-            src = webSrc;
-            pnpmDeps = webDeps;
-            nativeBuildInputs = [
-              pkgs.nodejs_24
-              pkgs.pnpm
-              pkgs.pnpmConfigHook
-            ];
-            buildPhase = ''
-              runHook preBuild
-              pnpm build
-              runHook postBuild
-            '';
-            installPhase = ''
-              runHook preInstall
-              mkdir -p $out
-              cp -r dist/. $out/
-              runHook postInstall
-            '';
-          };
-
-          # GPUI and wry need these to link and run on Linux. macOS uses the
-          # system frameworks (Metal, WebKit) and needs nothing extra.
-          guiNativeBuildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-            pkgs.pkg-config
-          ];
-          guiBuildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux (
-            with pkgs;
-            [
-              wayland
-              vulkan-headers
-              vulkan-loader
-              libxcb
-              libxkbcommon
-              fontconfig
-              glib
-              gtk3
-              webkitgtk_4_1
-            ]
-          );
-
           commonArgs = {
             inherit src;
             strictDeps = true;
-            nativeBuildInputs = guiNativeBuildInputs;
-            buildInputs = guiBuildInputs;
-            # rust-embed requires `web/dist` at compile time; stage the built
-            # UI before cargo touches the crate.
-            postPatch = ''
-              mkdir -p echonet-radar/web/dist
-              cp -r ${webAssets}/. echonet-radar/web/dist/
-            '';
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
         in
@@ -148,43 +87,24 @@
 
             packages = with pkgs; [
               cargo-hakari
-              nodejs_24
-              playwright-test
-              pnpm
               rustToolchain
               sccache
             ];
-
-            # Node API scripts resolve browsers from nixpkgs instead of
-            # ~/.cache/ms-playwright. Keep the playwright npm version in
-            # .agents/skills/demo-video matched with nixpkgs.
-            PLAYWRIGHT_BROWSERS_PATH = toString pkgs.playwright-driver.passthru.browsers;
 
             shellHook = ''
               export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
             '';
           };
 
-          packages =
-            (import ./echonet-radar/package.nix {
+          packages = {
+            echonet-radar-cli = import ./echonet-radar-cli/package.nix {
               inherit
                 cargoArtifacts
                 commonArgs
                 craneLib
-                lib
-                pkgs
-                webAssets
                 ;
-            })
-            // {
-              echonet-radar-cli = import ./echonet-radar-cli/package.nix {
-                inherit
-                  cargoArtifacts
-                  commonArgs
-                  craneLib
-                  ;
-              };
             };
+          };
 
           pre-commit.settings = {
             hooks = {

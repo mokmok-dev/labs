@@ -12,50 +12,9 @@ version = "0.0.0"
 # are managed by hakari.
 
 ### BEGIN HAKARI SECTION
-[dependencies]
-anstyle = { version = "1" }
-bitflags = { version = "2", default-features = false, features = ["std"] }
-chrono = { version = "0.4", features = ["serde"] }
-crossbeam-utils = { version = "0.8" }
-derive_more = { version = "2", features = ["add", "add_assign", "deref", "deref_mut", "display", "from", "from_str", "is_variant", "mul", "mul_assign", "not"] }
-getrandom = { version = "0.3", default-features = false, features = ["std"] }
-hashbrown = { version = "0.17" }
-indexmap = { version = "2", features = ["serde"] }
-itertools = { version = "0.14" }
-log = { version = "0.4", default-features = false, features = ["kv_unstable_serde"] }
-memchr = { version = "2" }
-num-traits = { version = "0.2", features = ["i128", "libm"] }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
-regex-syntax = { version = "0.8" }
-rust-i18n-support = { version = "4", default-features = false, features = ["codegen"] }
-serde = { version = "1", features = ["alloc", "derive", "rc"] }
-serde_core = { version = "1", features = ["alloc", "rc"] }
-serde_json = { version = "1", features = ["alloc", "preserve_order", "raw_value"] }
-smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
-strum = { version = "0.28", features = ["derive"] }
-thiserror = { version = "2" }
-zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
-
 [build-dependencies]
-anstyle = { version = "1" }
-crossbeam-utils = { version = "0.8" }
-derive_more-impl = { version = "2", features = ["add", "add_assign", "deref", "deref_mut", "display", "from", "from_str", "is_variant", "mul", "mul_assign", "not"] }
-getrandom = { version = "0.3", default-features = false, features = ["std"] }
-hashbrown = { version = "0.17" }
-indexmap = { version = "2", features = ["serde"] }
-log = { version = "0.4", default-features = false, features = ["kv_unstable_serde"] }
-memchr = { version = "2" }
-num-traits = { version = "0.2", features = ["i128", "libm"] }
-proc-macro2 = { version = "1", features = ["span-locations"] }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
-regex-syntax = { version = "0.8" }
-rust-i18n-support = { version = "4", default-features = false, features = ["codegen"] }
-serde = { version = "1", features = ["alloc", "derive", "rc"] }
-serde_core = { version = "1", features = ["alloc", "rc"] }
-serde_json = { version = "1", features = ["alloc", "preserve_order", "raw_value"] }
-smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
-syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full"] }
-syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
-zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
+proc-macro2 = { version = "1" }
+quote = { version = "1" }
+syn = { version = "3", features = ["extra-traits", "full"] }
 
 ### END HAKARI SECTION
