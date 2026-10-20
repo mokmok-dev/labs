@@ -1,9 +1,8 @@
 //! ECHONET Lite state-change discovery and logging.
 //!
-//! This crate is the headless core shared by the `echonet-radar` GUI shell and
-//! the `echonet-radar-cli` terminal monitor. The service keeps the transport and
-//! rendering separate: it owns protocol state and emits [`RadarEvent`]s, leaving
-//! the caller to render them.
+//! This crate is the headless core behind the `echonet-radar-cli` terminal
+//! monitor. The service keeps the transport and rendering separate: it owns
+//! protocol state and emits [`RadarEvent`]s, leaving the caller to render them.
 //!
 //! The radar performs periodic discovery (every minute) to learn which device
 //! objects exist, and periodic value polling (every 15 seconds) to detect state
@@ -221,7 +220,7 @@ pub enum RadarEvent {
     /// A tracked object answered a poll or sent an INF notification, with or
     /// without a value change.
     Seen(SeenEvent),
-    /// A status message for the status line (discovery, errors, poll rounds).
+    /// A status message about discovery, errors, and poll rounds.
     Status(String),
 }
 
@@ -1188,8 +1187,15 @@ fn can_inf(
 /// Run the asynchronous discovery, polling, and INF-watching service until
 /// shutdown.
 ///
-/// The receiver is a Tokio watch channel so a terminal thread can request a
-/// clean stop without interrupting a pending UDP receive.
+/// `events` is a standard-library sender drained by the caller. The service
+/// sends on it inline, so a consumer that cannot keep up must move the receiver
+/// to a blocking thread.
+///
+/// `commands` requests an immediate value poll without moving the scheduled
+/// round.
+///
+/// The service stops when `shutdown` changes to `true` or when its sender is
+/// dropped. A value already set before the call is not observed.
 ///
 /// # Errors
 ///

@@ -1,10 +1,10 @@
 //! Observe ECHONET Lite state on the LAN from the terminal.
 //!
 //! The tool joins the ECHONET Lite multicast group (`224.0.23.0:3610`). In a
-//! terminal it runs the same discovery and value-polling service as the
-//! `echonet-radar` GUI (`echonet-radar-core`) and draws a full-screen
-//! dashboard: instantaneous power over the last two minutes and one row per
-//! device object with its key properties.
+//! terminal it runs the discovery and value-polling service from
+//! `echonet-radar-core` and draws a full-screen dashboard: instantaneous power
+//! over the last two minutes and one row per device object with its key
+//! properties.
 //!
 //! When stdout is not a terminal the tool is passive by default: it prints one
 //! line per received frame and never sends anything, so a pipe captures traffic
