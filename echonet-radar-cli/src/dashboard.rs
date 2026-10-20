@@ -95,6 +95,7 @@ enum SeriesState {
     },
     Stale {
         last: i64,
+        age: Duration,
         detail: Option<String>,
     },
 }
@@ -374,8 +375,9 @@ impl Dashboard {
         self.power_source(now).map(|source| source.watts)
     }
 
-    /// `None` while any reported unit is stale, and `None` before any unit
-    /// reports, so a plotted point always covers the whole roof.
+    /// `None` while any reported unit is stale, so a plotted point never
+    /// mixes fresh and stale unit readings. A unit that has never reported is
+    /// excluded; the summary marks such a total as partial.
     fn solar_watts(
         &self,
         now: SystemTime,
@@ -384,7 +386,7 @@ impl Dashboard {
         if units.is_empty() || units.iter().any(|unit| !self.is_fresh(unit.row, now)) {
             return None;
         }
-        Some(units.iter().map(|unit| unit.watts).sum())
+        Some(total_watts(&units))
     }
 
     fn consumption_state(
@@ -403,6 +405,9 @@ impl Dashboard {
         if let Some(source) = self.last_power_source() {
             return SeriesState::Stale {
                 last: source.watts,
+                age: now
+                    .duration_since(source.row.last_seen)
+                    .unwrap_or(Duration::ZERO),
                 detail: None,
             };
         }
@@ -418,15 +423,22 @@ impl Dashboard {
         now: SystemTime,
     ) -> SeriesState {
         let pv_count = self.pv_objects().count();
-        let units = self.solar_units();
         if pv_count == 0 {
             return SeriesState::Waiting {
                 detail: String::from("no PV unit"),
             };
         }
+        let units = self.solar_units();
         if units.is_empty() {
+            let answered = self.pv_objects().any(|row| {
+                power_epc(SOLAR_CLASS_CODE).is_some_and(|epc| row.values.contains_key(&epc))
+            });
             return SeriesState::Waiting {
-                detail: String::from("waiting for the first poll"),
+                detail: String::from(if answered {
+                    "PV reports no value"
+                } else {
+                    "waiting for the first poll"
+                }),
             };
         }
         let age = units
@@ -437,13 +449,26 @@ impl Dashboard {
             })
             .max()
             .unwrap_or(Duration::ZERO);
-        let detail = (units.len() < pv_count).then(|| format!("{} of {pv_count} PV", units.len()));
+        let partial = (units.len() < pv_count).then(|| format!("{} of {pv_count} PV", units.len()));
+        let stale = units
+            .iter()
+            .filter(|unit| !self.is_fresh(unit.row, now))
+            .count();
+        let stale_detail = partial.clone().or_else(|| {
+            (stale > 0 && stale < units.len())
+                .then(|| format!("{stale} of {} PV stale", units.len()))
+        });
         self.solar_watts(now).map_or_else(
             || SeriesState::Stale {
-                last: units.iter().map(|unit| unit.watts).sum(),
-                detail: None,
+                last: total_watts(&units),
+                age,
+                detail: stale_detail,
             },
-            |watts| SeriesState::Current { watts, age, detail },
+            |watts| SeriesState::Current {
+                watts,
+                age,
+                detail: partial,
+            },
         )
     }
 
@@ -489,6 +514,14 @@ impl Dashboard {
             SeriesState::Current { watts, .. } => Some(*watts),
             SeriesState::Stale { last, .. } => Some(*last),
         };
+        // A stale detail plus the stats overflows an 80-column panel.
+        let show_stats = !matches!(
+            &state,
+            SeriesState::Stale {
+                detail: Some(_),
+                ..
+            }
+        );
         match state {
             SeriesState::Waiting { detail } => {
                 spans.push(Span::styled(format!(" · {detail}"), dim()));
@@ -506,17 +539,17 @@ impl Dashboard {
                     Style::new().fg(age_color(self.config.update_interval, age)),
                 ));
             },
-            SeriesState::Stale { last, detail } => {
-                spans.push(Span::styled(
-                    format!(" · no recent reading (last {last} W)"),
-                    Style::new().fg(EXPIRED),
-                ));
+            SeriesState::Stale { last, age, detail } => {
                 if let Some(detail) = detail {
                     spans.push(Span::styled(format!(" · {detail}"), dim()));
                 }
+                spans.push(Span::styled(
+                    format!(" · no reading for {} · last {last} W", format_age(age)),
+                    Style::new().fg(EXPIRED),
+                ));
             },
         }
-        if let Some((peak, average)) = self.series_stats(series, seed) {
+        if show_stats && let Some((peak, average)) = self.series_stats(series, seed) {
             spans.push(Span::styled(
                 format!("   peak {peak} W   avg {average} W"),
                 dim(),
@@ -810,6 +843,12 @@ fn power_reading(
     let stored = row.values.get(&epc)?;
     let watts = instantaneous_watts(class_code, &stored.raw)?;
     Some(PowerSource { row, watts })
+}
+
+fn total_watts(units: &[PowerSource<'_>]) -> i64 {
+    units
+        .iter()
+        .fold(0i64, |total, unit| total.saturating_add(unit.watts))
 }
 
 fn cell_text(
@@ -1282,7 +1321,8 @@ mod tests {
         assert_eq!(dashboard.consumption_watts(now), None);
         let state = dashboard.series_state(Series::Consumption, now);
         let line = text(&dashboard.series_line(Series::Consumption, state));
-        assert!(line.contains("no recent reading (last 580 W)"), "{line}");
+        assert!(line.contains("no reading for 31s"), "{line}");
+        assert!(line.contains("last 580 W"), "{line}");
     }
 
     #[test]
@@ -1411,7 +1451,88 @@ mod tests {
         assert_eq!(dashboard.solar_watts(stale_at), None);
         let state = dashboard.series_state(Series::Solar, stale_at);
         let line = text(&dashboard.series_line(Series::Solar, state));
-        assert!(line.contains("no recent reading (last 1540 W)"), "{line}");
+        assert!(line.contains("1 of 2 PV stale"), "{line}");
+        assert!(line.contains("no reading for 31s"), "{line}");
+        assert!(line.contains("last 1540 W"), "{line}");
+    }
+
+    #[test]
+    fn a_stale_partial_solar_series_keeps_its_note() {
+        let mut dashboard = dashboard(10);
+        let start = SystemTime::UNIX_EPOCH;
+        let ip = "192.168.100.26";
+        dashboard.apply(device(ip, 0x02, 0x79, 0x01));
+        dashboard.apply(device(ip, 0x02, 0x79, 0x02));
+        dashboard.apply(change(
+            start,
+            ip,
+            Eoj::new(0x02, 0x79, 0x01),
+            0xE0,
+            &[0x04, 0xD8],
+        ));
+
+        let stale_at = start + Duration::from_secs(31);
+        assert_eq!(dashboard.solar_watts(stale_at), None);
+        let state = dashboard.series_state(Series::Solar, stale_at);
+        let line = text(&dashboard.series_line(Series::Solar, state));
+        assert!(line.contains("1 of 2 PV"), "{line}");
+        assert!(line.contains("no reading for 31s"), "{line}");
+        assert!(line.contains("last 1240 W"), "{line}");
+    }
+
+    #[test]
+    fn a_current_consumption_and_stale_solar_draw_both_lines() {
+        let mut dashboard = dashboard(10);
+        let now = SystemTime::now();
+        let stale_at = now.checked_sub(Duration::from_secs(40)).unwrap();
+        let ip = "192.168.100.26";
+        dashboard.apply(change(
+            now,
+            ip,
+            Eoj::new(0x02, 0x87, 0x01),
+            0xC6,
+            &[0, 0, 2, 0x44],
+        ));
+        dashboard.apply(change(
+            stale_at,
+            ip,
+            Eoj::new(0x02, 0x79, 0x01),
+            0xE0,
+            &[0x04, 0xD8],
+        ));
+        dashboard.apply(change(
+            stale_at,
+            ip,
+            Eoj::new(0x02, 0x79, 0x02),
+            0xE0,
+            &[0x01, 0x2C],
+        ));
+        dashboard.apply(seen(now, ip, Eoj::new(0x02, 0x79, 0x01)));
+
+        for (width, height) in [(100, 30), (80, 24)] {
+            let screen = screen(&mut dashboard, width, height);
+            assert!(screen.contains("consumption 580 W"), "{screen}");
+            assert!(screen.contains("1 of 2 PV stale"), "{screen}");
+            assert!(screen.contains("last 1540 W"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn a_pv_unit_reporting_no_value_is_not_waiting_for_its_first_poll() {
+        let mut dashboard = dashboard(10);
+        let start = SystemTime::UNIX_EPOCH;
+        dashboard.apply(change(
+            start,
+            "192.168.100.26",
+            Eoj::new(0x02, 0x79, 0x01),
+            0xE0,
+            &[0xFF, 0xFF],
+        ));
+
+        assert_eq!(dashboard.solar_watts(start), None);
+        let state = dashboard.series_state(Series::Solar, start);
+        let line = text(&dashboard.series_line(Series::Solar, state));
+        assert!(line.contains("PV reports no value"), "{line}");
     }
 
     #[test]
@@ -1484,6 +1605,26 @@ mod tests {
         assert_eq!(
             dashboard.series_stats(Series::Solar, Some(1000)),
             Some((1000, 500))
+        );
+    }
+
+    #[test]
+    fn chart_bounds_span_both_series() {
+        let mut dashboard = dashboard(10);
+        dashboard.samples.push_back(sample(Some(100), Some(1000)));
+
+        let bounds = dashboard.chart_bounds();
+        assert!(bounds[0] < 0.0, "{bounds:?}");
+        assert!(bounds[1] > 1000.0, "{bounds:?}");
+    }
+
+    #[test]
+    fn series_index_matches_the_series_order() {
+        assert!(
+            SERIES
+                .iter()
+                .enumerate()
+                .all(|(index, series)| series.index() == index)
         );
     }
 
