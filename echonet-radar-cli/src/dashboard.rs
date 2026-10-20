@@ -35,7 +35,69 @@ const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 const STALE_POLLS: u32 = 3;
 /// The utility meter first, then the distribution board.
 const POWER_PRIORITY: [u16; 2] = [0x0288, 0x0287];
+const SOLAR_CLASS_CODE: u16 = 0x0279;
+const SOLAR: Color = Color::LightYellow;
 const KEY_POLL: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Series {
+    Consumption,
+    Solar,
+}
+
+const SERIES: [Series; 2] = [Series::Consumption, Series::Solar];
+
+impl Series {
+    const fn index(self) -> usize {
+        match self {
+            Self::Consumption => 0,
+            Self::Solar => 1,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Consumption => "consumption",
+            Self::Solar => "solar",
+        }
+    }
+
+    const fn color(self) -> Color {
+        match self {
+            Self::Consumption => VALUE,
+            Self::Solar => SOLAR,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sample {
+    watts: [Option<i64>; SERIES.len()],
+}
+
+impl Sample {
+    const fn get(
+        self,
+        series: Series,
+    ) -> Option<i64> {
+        self.watts[series.index()]
+    }
+}
+
+enum SeriesState {
+    Waiting {
+        detail: String,
+    },
+    Current {
+        watts: i64,
+        age: Duration,
+        detail: Option<String>,
+    },
+    Stale {
+        last: i64,
+        detail: Option<String>,
+    },
+}
 
 #[derive(Clone, Copy)]
 struct KeyItem {
@@ -154,7 +216,7 @@ struct Dashboard {
     started: Instant,
     status: Option<(SystemTime, String)>,
     objects: BTreeMap<(IpAddr, u16, u8), ObjectRow>,
-    samples: VecDeque<Option<i64>>,
+    samples: VecDeque<Sample>,
     scroll: usize,
     visible_rows: usize,
 }
@@ -216,11 +278,19 @@ impl Dashboard {
         &mut self,
         now: SystemTime,
     ) {
-        let watts = self.consumption_watts(now);
+        let mut sample = Sample {
+            watts: [None; SERIES.len()],
+        };
+        for series in SERIES {
+            sample.watts[series.index()] = match series {
+                Series::Consumption => self.consumption_watts(now),
+                Series::Solar => self.solar_watts(now),
+            };
+        }
         if self.samples.len() == SAMPLE_CAPACITY {
             self.samples.pop_front();
         }
-        self.samples.push_back(watts);
+        self.samples.push_back(sample);
     }
 
     fn scroll_by(
@@ -274,11 +344,185 @@ impl Dashboard {
         })
     }
 
+    fn pv_objects(&self) -> impl Iterator<Item = &ObjectRow> {
+        self.objects
+            .values()
+            .filter(|row| row.eoj.class_code() == SOLAR_CLASS_CODE)
+    }
+
+    fn has_pv(&self) -> bool {
+        self.pv_objects().next().is_some()
+    }
+
+    fn solar_units(&self) -> Vec<PowerSource<'_>> {
+        self.pv_objects()
+            .filter_map(|row| power_reading(row, SOLAR_CLASS_CODE))
+            .collect()
+    }
+
+    fn metering_objects(&self) -> impl Iterator<Item = &ObjectRow> {
+        self.objects.values().filter(|row| {
+            let class_code = row.eoj.class_code();
+            class_code == SOLAR_CLASS_CODE || POWER_PRIORITY.contains(&class_code)
+        })
+    }
+
     fn consumption_watts(
         &self,
         now: SystemTime,
     ) -> Option<i64> {
         self.power_source(now).map(|source| source.watts)
+    }
+
+    /// `None` while any reported unit is stale, and `None` before any unit
+    /// reports, so a plotted point always covers the whole roof.
+    fn solar_watts(
+        &self,
+        now: SystemTime,
+    ) -> Option<i64> {
+        let units = self.solar_units();
+        if units.is_empty() || units.iter().any(|unit| !self.is_fresh(unit.row, now)) {
+            return None;
+        }
+        Some(units.iter().map(|unit| unit.watts).sum())
+    }
+
+    fn consumption_state(
+        &self,
+        now: SystemTime,
+    ) -> SeriesState {
+        if let Some(source) = self.power_source(now) {
+            return SeriesState::Current {
+                watts: source.watts,
+                age: now
+                    .duration_since(source.row.last_seen)
+                    .unwrap_or(Duration::ZERO),
+                detail: Some(format_eoj(source.row.eoj)),
+            };
+        }
+        if let Some(source) = self.last_power_source() {
+            return SeriesState::Stale {
+                last: source.watts,
+                detail: None,
+            };
+        }
+        let detail = self.metering_object().map_or_else(
+            || String::from("no consumption meter"),
+            |row| format!("{} · waiting for the first poll", format_eoj(row.eoj)),
+        );
+        SeriesState::Waiting { detail }
+    }
+
+    fn solar_state(
+        &self,
+        now: SystemTime,
+    ) -> SeriesState {
+        let pv_count = self.pv_objects().count();
+        let units = self.solar_units();
+        if pv_count == 0 {
+            return SeriesState::Waiting {
+                detail: String::from("no PV unit"),
+            };
+        }
+        if units.is_empty() {
+            return SeriesState::Waiting {
+                detail: String::from("waiting for the first poll"),
+            };
+        }
+        let age = units
+            .iter()
+            .map(|unit| {
+                now.duration_since(unit.row.last_seen)
+                    .unwrap_or(Duration::ZERO)
+            })
+            .max()
+            .unwrap_or(Duration::ZERO);
+        let detail = (units.len() < pv_count).then(|| format!("{} of {pv_count} PV", units.len()));
+        self.solar_watts(now).map_or_else(
+            || SeriesState::Stale {
+                last: units.iter().map(|unit| unit.watts).sum(),
+                detail: None,
+            },
+            |watts| SeriesState::Current { watts, age, detail },
+        )
+    }
+
+    fn series_state(
+        &self,
+        series: Series,
+        now: SystemTime,
+    ) -> SeriesState {
+        match series {
+            Series::Consumption => self.consumption_state(now),
+            Series::Solar => self.solar_state(now),
+        }
+    }
+
+    fn series_stats(
+        &self,
+        series: Series,
+        seed: Option<i64>,
+    ) -> Option<(i64, i64)> {
+        let mut peak = seed;
+        let mut total = 0i64;
+        let mut count = 0i64;
+        for watts in self.samples.iter().filter_map(|sample| sample.get(series)) {
+            peak = Some(peak.map_or(watts, |peak| peak.max(watts)));
+            total = total.saturating_add(watts);
+            count += 1;
+        }
+        let peak = peak?;
+        Some((peak, total.checked_div(count).unwrap_or(peak)))
+    }
+
+    fn series_line(
+        &self,
+        series: Series,
+        state: SeriesState,
+    ) -> Line<'static> {
+        let mut spans = vec![Span::styled(
+            format!(" {}", series.label()),
+            Style::new().fg(series.color()),
+        )];
+        let seed = match &state {
+            SeriesState::Waiting { .. } => None,
+            SeriesState::Current { watts, .. } => Some(*watts),
+            SeriesState::Stale { last, .. } => Some(*last),
+        };
+        match state {
+            SeriesState::Waiting { detail } => {
+                spans.push(Span::styled(format!(" · {detail}"), dim()));
+            },
+            SeriesState::Current { watts, age, detail } => {
+                spans.push(Span::styled(
+                    format!(" {watts} W"),
+                    Style::new().fg(VALUE).add_modifier(Modifier::BOLD),
+                ));
+                if let Some(detail) = detail {
+                    spans.push(Span::styled(format!(" · {detail}"), dim()));
+                }
+                spans.push(Span::styled(
+                    format!(" · {} ago", format_age(age)),
+                    Style::new().fg(age_color(self.config.update_interval, age)),
+                ));
+            },
+            SeriesState::Stale { last, detail } => {
+                spans.push(Span::styled(
+                    format!(" · no recent reading (last {last} W)"),
+                    Style::new().fg(EXPIRED),
+                ));
+                if let Some(detail) = detail {
+                    spans.push(Span::styled(format!(" · {detail}"), dim()));
+                }
+            },
+        }
+        if let Some((peak, average)) = self.series_stats(series, seed) {
+            spans.push(Span::styled(
+                format!("   peak {peak} W   avg {average} W"),
+                dim(),
+            ));
+        }
+        Line::from(spans)
     }
 
     fn draw(
@@ -327,13 +571,22 @@ impl Dashboard {
         area: Rect,
     ) {
         let now = SystemTime::now();
-        let fresh = self.power_source(now);
-        let current = fresh.map(|source| source.watts);
-        let Some(source) = fresh.or_else(|| self.last_power_source()) else {
-            let (title, body) = self.metering_object().map_or_else(
+        let mut visible = vec![Series::Consumption];
+        if self.has_pv() {
+            visible.push(Series::Solar);
+        }
+        let states: Vec<SeriesState> = visible
+            .iter()
+            .map(|series| self.series_state(*series, now))
+            .collect();
+        if states
+            .iter()
+            .all(|state| matches!(state, SeriesState::Waiting { .. }))
+        {
+            let (title, body) = self.metering_objects().next().map_or_else(
                 || {
                     (
-                        String::from(" Power · no consumption meter"),
+                        String::from(" Power · no metering object"),
                         "waiting for a metering object",
                     )
                 },
@@ -349,78 +602,38 @@ impl Dashboard {
             frame.render_widget(block, area);
             frame.render_widget(Paragraph::new(Line::from(body).style(dim())), inner);
             return;
-        };
+        }
 
-        let age = source.row.last_seen.elapsed().unwrap_or(Duration::ZERO);
-        let title = Line::from(vec![
-            Span::styled(
-                format!(" Power · {} · ", format_eoj(source.row.eoj)),
-                accent(),
-            ),
-            Span::styled(
-                format!("{} ago", format_age(age)),
-                Style::new().fg(age_color(self.config.update_interval, age)),
-            ),
-        ]);
-        let block = panel(title);
+        let block = panel(Line::from(Span::styled(" Power", accent())));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        let summary_height = u16::try_from(visible.len()).unwrap_or(1);
         let [summary, chart_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-        frame.render_widget(
-            Paragraph::new(self.power_summary(current, source.watts)),
-            summary,
-        );
-        self.draw_chart(frame, chart_area);
-    }
-
-    fn power_summary(
-        &self,
-        current: Option<i64>,
-        last: i64,
-    ) -> Line<'static> {
-        let mut peak = last;
-        let mut total = 0i64;
-        let mut count = 0i64;
-        for sample in self.samples.iter().flatten() {
-            peak = peak.max(*sample);
-            total = total.saturating_add(*sample);
-            count = count.saturating_add(1);
-        }
-        let average = total.checked_div(count).unwrap_or(last);
-        let headline = current.map_or_else(
-            || {
-                Span::styled(
-                    format!(" no recent reading (last {last} W)"),
-                    Style::new().fg(EXPIRED),
-                )
-            },
-            |watts| {
-                Span::styled(
-                    format!(" {watts} W"),
-                    Style::new().fg(VALUE).add_modifier(Modifier::BOLD),
-                )
-            },
-        );
-        Line::from(vec![
-            headline,
-            Span::styled(format!("   peak {peak} W   avg {average} W"), dim()),
-        ])
+            Layout::vertical([Constraint::Length(summary_height), Constraint::Min(0)]).areas(inner);
+        let lines: Vec<Line<'static>> = visible
+            .iter()
+            .zip(states)
+            .map(|(series, state)| self.series_line(*series, state))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), summary);
+        self.draw_chart(frame, chart_area, &visible);
     }
 
     fn draw_chart(
         &self,
         frame: &mut Frame,
         area: Rect,
+        visible: &[Series],
     ) {
-        let runs = self.chart_runs();
+        let runs = self.chart_runs(visible);
         let datasets: Vec<Dataset<'_>> = runs
             .iter()
-            .map(|run| {
+            .map(|(series, run)| {
                 Dataset::default()
                     .marker(Marker::Braille)
                     .graph_type(GraphType::Line)
+                    .style(Style::new().fg(series.color()))
                     .fill_to_y(0.0)
                     .data(run.as_slice())
             })
@@ -435,20 +648,25 @@ impl Dashboard {
         frame.render_widget(chart, area);
     }
 
-    fn chart_runs(&self) -> Vec<Vec<(f64, f64)>> {
+    fn chart_runs(
+        &self,
+        visible: &[Series],
+    ) -> Vec<(Series, Vec<(f64, f64)>)> {
         let mut runs = Vec::new();
-        let mut run = Vec::new();
         let offset = SAMPLE_CAPACITY.saturating_sub(self.samples.len());
-        for (index, sample) in self.samples.iter().enumerate() {
-            if let Some(watts) = sample {
-                let x = chart_coordinate(i64::try_from(offset + index).unwrap_or(i64::MAX));
-                run.push((x, chart_coordinate(*watts)));
-            } else if !run.is_empty() {
-                runs.push(std::mem::take(&mut run));
+        for series in visible {
+            let mut run = Vec::new();
+            for (index, sample) in self.samples.iter().enumerate() {
+                if let Some(watts) = sample.get(*series) {
+                    let x = chart_coordinate(i64::try_from(offset + index).unwrap_or(i64::MAX));
+                    run.push((x, chart_coordinate(watts)));
+                } else if !run.is_empty() {
+                    runs.push((*series, std::mem::take(&mut run)));
+                }
             }
-        }
-        if !run.is_empty() {
-            runs.push(run);
+            if !run.is_empty() {
+                runs.push((*series, run));
+            }
         }
         runs
     }
@@ -456,9 +674,13 @@ impl Dashboard {
     fn chart_bounds(&self) -> [f64; 2] {
         let mut min = 0i64;
         let mut max = 0i64;
-        for watts in self.samples.iter().flatten() {
-            min = min.min(*watts);
-            max = max.max(*watts);
+        for sample in &self.samples {
+            for series in SERIES {
+                if let Some(watts) = sample.get(series) {
+                    min = min.min(watts);
+                    max = max.max(watts);
+                }
+            }
         }
         if min == 0 && max == 0 {
             return [0.0, 1.0];
@@ -864,6 +1086,25 @@ mod tests {
             .collect()
     }
 
+    fn text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn sample(
+        consumption: Option<i64>,
+        solar: Option<i64>,
+    ) -> Sample {
+        let mut sample = Sample {
+            watts: [None; SERIES.len()],
+        };
+        sample.watts[Series::Consumption.index()] = consumption;
+        sample.watts[Series::Solar.index()] = solar;
+        sample
+    }
+
     #[test]
     fn key_items_put_the_power_property_first() {
         let heater = key_items(0x026B);
@@ -1010,10 +1251,22 @@ mod tests {
         dashboard.apply(seen(start, "192.168.100.26", eoj));
 
         dashboard.sample(start + Duration::from_secs(29));
-        assert_eq!(dashboard.samples.back(), Some(&Some(580)));
+        assert_eq!(
+            dashboard
+                .samples
+                .back()
+                .and_then(|sample| sample.get(Series::Consumption)),
+            Some(580)
+        );
 
         dashboard.sample(start + Duration::from_secs(31));
-        assert_eq!(dashboard.samples.back(), Some(&None));
+        assert_eq!(
+            dashboard
+                .samples
+                .back()
+                .and_then(|sample| sample.get(Series::Consumption)),
+            None
+        );
     }
 
     #[test]
@@ -1027,13 +1280,211 @@ mod tests {
 
         let now = start + Duration::from_secs(31);
         assert_eq!(dashboard.consumption_watts(now), None);
-        let summary = dashboard.power_summary(None, 580);
-        let text: String = summary
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(text.contains("no recent reading (last 580 W)"), "{text}");
+        let state = dashboard.series_state(Series::Consumption, now);
+        let line = text(&dashboard.series_line(Series::Consumption, state));
+        assert!(line.contains("no recent reading (last 580 W)"), "{line}");
+    }
+
+    #[test]
+    fn one_tick_samples_both_series() {
+        let mut dashboard = dashboard(10);
+        let start = SystemTime::UNIX_EPOCH;
+        let ip = "192.168.100.26";
+        dashboard.apply(change(
+            start,
+            ip,
+            Eoj::new(0x02, 0x87, 0x01),
+            0xC6,
+            &[0, 0, 2, 0x44],
+        ));
+        dashboard.apply(change(
+            start,
+            ip,
+            Eoj::new(0x02, 0x79, 0x01),
+            0xE0,
+            &[0x04, 0xD8],
+        ));
+        dashboard.apply(change(
+            start,
+            ip,
+            Eoj::new(0x02, 0x79, 0x02),
+            0xE0,
+            &[0x01, 0x2C],
+        ));
+
+        dashboard.sample(start);
+        let sample = dashboard.samples.back().unwrap();
+        assert_eq!(sample.get(Series::Consumption), Some(580));
+        assert_eq!(sample.get(Series::Solar), Some(1540));
+
+        let state = dashboard.series_state(Series::Consumption, start + Duration::from_secs(5));
+        match state {
+            SeriesState::Current { age, .. } => {
+                assert_eq!(age, Duration::from_secs(5));
+            },
+            _ => panic!("expected a current consumption reading"),
+        }
+    }
+
+    #[test]
+    fn a_pv_unit_that_never_reported_leaves_a_partial_note() {
+        let mut dashboard = dashboard(10);
+        let start = SystemTime::UNIX_EPOCH;
+        let ip = "192.168.100.26";
+        dashboard.apply(device(ip, 0x02, 0x79, 0x01));
+        dashboard.apply(device(ip, 0x02, 0x79, 0x02));
+        dashboard.apply(change(
+            start,
+            ip,
+            Eoj::new(0x02, 0x79, 0x01),
+            0xE0,
+            &[0x04, 0xD8],
+        ));
+
+        dashboard.sample(start);
+        assert_eq!(
+            dashboard
+                .samples
+                .back()
+                .and_then(|sample| sample.get(Series::Solar)),
+            Some(1240)
+        );
+        let state = dashboard.series_state(Series::Solar, start);
+        let line = text(&dashboard.series_line(Series::Solar, state));
+        assert!(line.contains("1 of 2 PV"), "{line}");
+    }
+
+    #[test]
+    fn a_zero_pv_reading_is_a_value_not_a_gap() {
+        let mut dashboard = dashboard(10);
+        let start = SystemTime::UNIX_EPOCH;
+        let ip = "192.168.100.26";
+        dashboard.apply(change(
+            start,
+            ip,
+            Eoj::new(0x02, 0x79, 0x01),
+            0xE0,
+            &[0x00, 0x00],
+        ));
+        dashboard.apply(change(
+            start,
+            ip,
+            Eoj::new(0x02, 0x79, 0x02),
+            0xE0,
+            &[0x00, 0x00],
+        ));
+
+        dashboard.sample(start);
+        assert_eq!(
+            dashboard
+                .samples
+                .back()
+                .and_then(|sample| sample.get(Series::Solar)),
+            Some(0)
+        );
+        let state = dashboard.series_state(Series::Solar, start);
+        let line = text(&dashboard.series_line(Series::Solar, state));
+        assert!(line.contains("solar 0 W"), "{line}");
+    }
+
+    #[test]
+    fn a_stale_pv_unit_withholds_the_solar_total() {
+        let mut dashboard = dashboard(10);
+        let start = SystemTime::UNIX_EPOCH;
+        let ip = "192.168.100.26";
+        let first = Eoj::new(0x02, 0x79, 0x01);
+        dashboard.apply(change(start, ip, first, 0xE0, &[0x04, 0xD8]));
+        dashboard.apply(change(
+            start,
+            ip,
+            Eoj::new(0x02, 0x79, 0x02),
+            0xE0,
+            &[0x01, 0x2C],
+        ));
+        dashboard.apply(seen(start + Duration::from_secs(20), ip, first));
+
+        assert_eq!(
+            dashboard.solar_watts(start + Duration::from_secs(29)),
+            Some(1540)
+        );
+        let stale_at = start + Duration::from_secs(31);
+        assert_eq!(dashboard.solar_watts(stale_at), None);
+        let state = dashboard.series_state(Series::Solar, stale_at);
+        let line = text(&dashboard.series_line(Series::Solar, state));
+        assert!(line.contains("no recent reading (last 1540 W)"), "{line}");
+    }
+
+    #[test]
+    fn a_site_without_pv_keeps_the_consumption_only_layout() {
+        let mut dashboard = dashboard(10);
+        let now = SystemTime::now();
+        dashboard.apply(change(
+            now,
+            "192.168.100.26",
+            Eoj::new(0x02, 0x87, 0x01),
+            0xC6,
+            &[0, 0, 2, 0x44],
+        ));
+
+        let screen = screen(&mut dashboard, 100, 30);
+        assert!(screen.contains("consumption 580 W"), "{screen}");
+        assert!(!screen.contains("solar"), "{screen}");
+    }
+
+    #[test]
+    fn a_solar_only_site_draws_the_chart() {
+        let mut dashboard = dashboard(10);
+        let now = SystemTime::now();
+        dashboard.apply(change(
+            now,
+            "192.168.100.26",
+            Eoj::new(0x02, 0x79, 0x01),
+            0xE0,
+            &[0x04, 0xD8],
+        ));
+
+        let screen = screen(&mut dashboard, 100, 30);
+        assert!(screen.contains("no consumption meter"), "{screen}");
+        assert!(screen.contains("solar 1240 W"), "{screen}");
+    }
+
+    #[test]
+    fn each_series_keeps_its_own_gaps() {
+        let mut dashboard = dashboard(10);
+        for tick in [
+            sample(Some(100), None),
+            sample(Some(100), Some(1000)),
+            sample(None, Some(1000)),
+            sample(None, None),
+        ] {
+            dashboard.samples.push_back(tick);
+        }
+
+        let runs = dashboard.chart_runs(&SERIES);
+        assert_eq!(runs.len(), 2, "one run per series");
+        let first_x = |series: Series| {
+            let (_, run) = runs.iter().find(|(owner, _)| *owner == series).unwrap();
+            assert_eq!(run.len(), 2, "{series:?} run");
+            run[0].0
+        };
+        let offset = first_x(Series::Solar) - first_x(Series::Consumption);
+        assert!((offset - 1.0).abs() < f64::EPSILON, "{offset}");
+    }
+
+    #[test]
+    fn peak_and_average_are_per_series() {
+        let mut dashboard = dashboard(10);
+        dashboard.samples.push_back(sample(Some(100), Some(1000)));
+        dashboard.samples.push_back(sample(Some(300), Some(0)));
+
+        assert_eq!(
+            dashboard.series_stats(Series::Consumption, Some(300)),
+            Some((300, 200))
+        );
+        assert_eq!(
+            dashboard.series_stats(Series::Solar, Some(1000)),
+            Some((1000, 500))
+        );
     }
 
     #[test]
@@ -1060,6 +1511,16 @@ mod tests {
     }
 
     #[test]
+    fn a_discovered_pv_unit_without_a_reading_waits_in_the_placeholder() {
+        let mut dashboard = dashboard(10);
+        dashboard.apply(device("192.168.100.26", 0x02, 0x79, 0x01));
+
+        let screen = screen(&mut dashboard, 100, 30);
+        assert!(screen.contains("0x027901 · no reading yet"), "{screen}");
+        assert!(screen.contains("waiting for the first poll"), "{screen}");
+    }
+
+    #[test]
     fn the_empty_dashboard_names_where_it_listens() {
         let mut dashboard = dashboard(10);
 
@@ -1068,7 +1529,8 @@ mod tests {
             screen.contains("waiting for discovery on 224.0.23.0:3610"),
             "the empty state is clipped: {screen}"
         );
-        assert!(screen.contains("no consumption meter"));
+        assert!(screen.contains("no metering object"), "{screen}");
+        assert!(!screen.contains("solar"), "{screen}");
     }
 
     #[test]
@@ -1090,10 +1552,34 @@ mod tests {
                 0xC6,
                 &[0, 0, 2, 0x44],
             ));
+            dashboard.apply(change(
+                now,
+                "192.168.100.26",
+                Eoj::new(0x02, 0x79, 0x01),
+                0xE0,
+                &[0x04, 0xD8],
+            ));
+            dashboard.apply(change(
+                now,
+                "192.168.100.26",
+                Eoj::new(0x02, 0x79, 0x02),
+                0xE0,
+                &[0x01, 0x2C],
+            ));
             dashboard.sample(now);
 
             let screen = screen(&mut dashboard, width, height);
-            for needle in ["Power", "580 W", "0x028701", "Devices", "Auto ON"] {
+            for needle in [
+                "Power",
+                "580 W",
+                "0x028701",
+                "Devices",
+                "Auto ON",
+                "consumption 580 W",
+                "solar 1540 W",
+                "0x027901",
+                "0x027902",
+            ] {
                 assert!(
                     screen.contains(needle),
                     "{width}x{height} screen is missing {needle:?}: {screen}"
