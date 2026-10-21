@@ -10,7 +10,8 @@ use chrono::{DateTime, Local, Utc};
 use echonet_lite::frame::Eoj;
 use echonet_lite_udp::{EchoNetSocket, MULTICAST_GROUP, MULTICAST_PORT};
 use echonet_radar_core::{
-    Command, RadarConfig, RadarEvent, format_value, instantaneous_watts, power_epc, run_service,
+    Command, RadarConfig, RadarEvent, format_cumulative_energy_kwh, format_value,
+    instantaneous_watts, power_epc, run_service,
 };
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -742,8 +743,8 @@ impl Dashboard {
             );
             return;
         }
-        let header =
-            Row::new(["EOJ", "ADDRESS", "KEY VALUES", "SEEN"]).style(Style::new().fg(LABEL));
+        let header = Row::new(["EOJ", "ADDRESS", "ENERGY", "KEY VALUES", "SEEN"])
+            .style(Style::new().fg(LABEL));
         let rows: Vec<Row<'_>> = self
             .objects
             .values()
@@ -755,6 +756,7 @@ impl Dashboard {
             rows,
             [
                 Constraint::Length(9),
+                Constraint::Length(15),
                 Constraint::Length(15),
                 Constraint::Min(0),
                 Constraint::Length(5),
@@ -808,9 +810,23 @@ fn device_row(
     Row::new(vec![
         Cell::from(format_eoj(row.eoj)),
         Cell::from(row.address.ip().to_string()),
+        energy_cell(row),
         Cell::from(key_values(row)),
         Cell::from(seen),
     ])
+}
+
+// The counter, unit, and coefficient arrive as separate properties, so decode
+// from the row's current values instead of caching at event time.
+fn energy_text(row: &ObjectRow) -> Option<String> {
+    format_cumulative_energy_kwh(row.eoj.class_code(), |epc| {
+        row.values.get(&epc).map(|value| value.raw.as_slice())
+    })
+}
+
+fn energy_cell(row: &ObjectRow) -> Cell<'static> {
+    let line = energy_text(row).map_or_else(|| Line::from("--").style(dim()), Line::from);
+    Cell::from(line.alignment(Alignment::Right))
 }
 
 fn key_items(class_code: u16) -> Vec<KeyItem> {
@@ -1176,6 +1192,113 @@ mod tests {
             "the smart meter's cumulative energy needs its coefficient, so it is not a key item"
         );
         assert!(key_items(0xFFFF).is_empty());
+    }
+
+    fn stored(raw: &[u8]) -> StoredValue {
+        StoredValue {
+            raw: raw.to_vec(),
+            text: String::new(),
+        }
+    }
+
+    fn object_row(
+        class_group: u8,
+        class: u8,
+    ) -> ObjectRow {
+        ObjectRow::new(
+            source("192.168.100.26"),
+            Eoj::new(class_group, class, 0x01),
+            SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    #[test]
+    fn energy_text_decodes_the_counter_with_its_unit() {
+        let mut board = object_row(0x02, 0x87);
+        board.values.insert(0xC0, stored(&[0x00, 0xDB, 0x1D, 0xAA]));
+        board.values.insert(0xC2, stored(&[0x03]));
+        assert_eq!(energy_text(&board).as_deref(), Some("14359.978 kWh"));
+
+        let mut meter = object_row(0x02, 0x88);
+        meter.values.insert(0xE0, stored(&[0x00, 0x00, 0x30, 0x39]));
+        meter.values.insert(0xE1, stored(&[0x01]));
+        meter.values.insert(0xD3, stored(&[0x00, 0x00, 0x00, 0x02]));
+        assert_eq!(energy_text(&meter).as_deref(), Some("2469 kWh"));
+
+        let mut malformed = object_row(0x02, 0x87);
+        malformed.values.insert(0xC0, stored(&[0xDB, 0x1D, 0xAA]));
+        malformed.values.insert(0xC2, stored(&[0x03]));
+        assert_eq!(energy_text(&malformed), None);
+
+        let heater = object_row(0x02, 0x6B);
+        assert_eq!(energy_text(&heater), None);
+    }
+
+    #[test]
+    fn the_devices_table_shows_each_energy_counter() {
+        for (width, height) in [(100, 30), (80, 24)] {
+            let mut dashboard = dashboard(10);
+            let now = SystemTime::now();
+            let board = Eoj::new(0x02, 0x87, 0x01);
+            let solar = Eoj::new(0x02, 0x79, 0x01);
+            let heater = Eoj::new(0x02, 0x6B, 0x01);
+
+            dashboard.apply(change(
+                now,
+                "192.168.100.26",
+                board,
+                0xC0,
+                &[0x00, 0xDB, 0x1D, 0xAA],
+            ));
+            dashboard.apply(change(now, "192.168.100.26", board, 0xC2, &[0x03]));
+            dashboard.apply(change(
+                now,
+                "192.168.100.26",
+                solar,
+                0xE1,
+                &[0x00, 0xE7, 0x6A, 0xCF],
+            ));
+            dashboard.apply(change(now, "192.168.100.26", heater, 0xC3, &[0x42]));
+            dashboard.apply(change(now, "192.168.100.26", heater, 0xD1, &[0x28]));
+            dashboard.apply(change(now, "192.168.100.26", heater, 0xD3, &[0x28]));
+            dashboard.apply(change(now, "192.168.100.26", heater, 0xB1, &[0x41]));
+
+            let screen = screen(&mut dashboard, width, height);
+            for needle in ["ENERGY", "14359.978 kWh", "15166.159 kWh"] {
+                assert!(
+                    screen.contains(needle),
+                    "{width}x{height} screen is missing {needle:?}: {screen}"
+                );
+            }
+            let heater_row = screen
+                .split("0x026B01")
+                .nth(1)
+                .and_then(|tail| tail.split("0x027901").next())
+                .expect("the heater row is rendered");
+            assert!(
+                heater_row.contains("--"),
+                "{width}x{height}: the heater's energy cell is missing: {screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_board_keeps_showing_its_energy() {
+        let mut dashboard = dashboard(10);
+        let old = SystemTime::now() - Duration::from_secs(60);
+        let board = Eoj::new(0x02, 0x87, 0x01);
+
+        dashboard.apply(change(
+            old,
+            "192.168.100.26",
+            board,
+            0xC0,
+            &[0x00, 0xDB, 0x1D, 0xAA],
+        ));
+        dashboard.apply(change(old, "192.168.100.26", board, 0xC2, &[0x03]));
+
+        let screen = screen(&mut dashboard, 100, 30);
+        assert!(screen.contains("14359.978 kWh"), "{screen}");
     }
 
     #[test]
@@ -1678,19 +1801,36 @@ mod tests {
         for (width, height) in [(100, 30), (80, 24)] {
             let mut dashboard = dashboard(10);
             let now = SystemTime::now();
-            dashboard.apply(change(
-                now,
-                "192.168.100.26",
-                Eoj::new(0x02, 0x6B, 0x01),
-                0xB1,
-                &[0x41],
-            ));
+            let heater = Eoj::new(0x02, 0x6B, 0x01);
+            let heater_changes: [(u8, &[u8]); 4] = [
+                (0xC3, &[0x42]),
+                (0xD1, &[0x28]),
+                (0xD3, &[0x28]),
+                (0xB1, &[0x41]),
+            ];
+            for (epc, raw) in heater_changes {
+                dashboard.apply(change(now, "192.168.100.26", heater, epc, raw));
+            }
             dashboard.apply(change(
                 now,
                 "192.168.100.26",
                 Eoj::new(0x02, 0x87, 0x01),
                 0xC6,
                 &[0, 0, 2, 0x44],
+            ));
+            dashboard.apply(change(
+                now,
+                "192.168.100.26",
+                Eoj::new(0x02, 0x87, 0x01),
+                0xC0,
+                &[0x00, 0xDB, 0x1D, 0xAA],
+            ));
+            dashboard.apply(change(
+                now,
+                "192.168.100.26",
+                Eoj::new(0x02, 0x87, 0x01),
+                0xC2,
+                &[0x03],
             ));
             dashboard.apply(change(
                 now,
@@ -1702,6 +1842,13 @@ mod tests {
             dashboard.apply(change(
                 now,
                 "192.168.100.26",
+                Eoj::new(0x02, 0x79, 0x01),
+                0xE1,
+                &[0x00, 0xE7, 0x6A, 0xCF],
+            ));
+            dashboard.apply(change(
+                now,
+                "192.168.100.26",
                 Eoj::new(0x02, 0x79, 0x02),
                 0xE0,
                 &[0x01, 0x2C],
@@ -1709,17 +1856,25 @@ mod tests {
             dashboard.sample(now);
 
             let screen = screen(&mut dashboard, width, height);
-            for needle in [
+            let mut needles = vec![
                 "Power",
                 "580 W",
                 "0x028701",
                 "Devices",
-                "Auto ON",
                 "consumption 580 W",
                 "solar 1540 W",
                 "0x027901",
                 "0x027902",
-            ] {
+                "ENERGY",
+                "14359.978 kWh",
+                "15166.159 kWh",
+            ];
+            if width == 100 {
+                // At 80 columns the 15-column ENERGY field takes the tail of
+                // KEY VALUES, where the heater's mode sits.
+                needles.push("Auto ON");
+            }
+            for needle in needles {
                 assert!(
                     screen.contains(needle),
                     "{width}x{height} screen is missing {needle:?}: {screen}"
