@@ -686,8 +686,14 @@ impl Dashboard {
             );
             return;
         }
-        let header =
-            Row::new(["EOJ", "ADDRESS", "KEY VALUES", "SEEN"]).style(Style::new().fg(LABEL));
+        let header = Row::new(vec![
+            Cell::from("EOJ"),
+            Cell::from("ADDRESS"),
+            Cell::from(Line::from("POWER").alignment(Alignment::Right)),
+            Cell::from("KEY VALUES"),
+            Cell::from("SEEN"),
+        ])
+        .style(Style::new().fg(LABEL));
         let rows: Vec<Row<'_>> = self
             .objects
             .values()
@@ -699,6 +705,7 @@ impl Dashboard {
             rows,
             [
                 Constraint::Length(9),
+                Constraint::Length(15),
                 Constraint::Length(15),
                 Constraint::Min(0),
                 Constraint::Length(5),
@@ -866,23 +873,31 @@ fn device_row(
     Row::new(vec![
         Cell::from(format_eoj(row.eoj)),
         Cell::from(row.address.ip().to_string()),
+        power_cell(row),
         Cell::from(key_values(row)),
         Cell::from(seen),
     ])
 }
 
-fn key_items(class_code: u16) -> Vec<KeyItem> {
-    let mut items = Vec::new();
-    if let Some(epc) = power_epc(class_code) {
-        items.push(KeyItem {
-            epc,
-            label: power_label(class_code),
-        });
-    }
-    if let Some((_, class_items)) = KEY_ITEMS.iter().find(|(class, _)| *class == class_code) {
-        items.extend_from_slice(class_items);
-    }
-    items
+// Do not render stored.text here: it prints the sentinel name, while this
+// column is a watt figure or `--`. Do not gate on liveness: SEEN already dates
+// the reading, so blanking the last value only loses it.
+fn power_text(row: &ObjectRow) -> Option<String> {
+    let class_code = row.eoj.class_code();
+    power_reading(row, class_code)
+        .map(|source| format!("{} {} W", power_label(class_code), source.watts))
+}
+
+fn power_cell(row: &ObjectRow) -> Cell<'static> {
+    let line = power_text(row).map_or_else(|| Line::from("--").style(dim()), Line::from);
+    Cell::from(line.alignment(Alignment::Right))
+}
+
+fn key_items(class_code: u16) -> &'static [KeyItem] {
+    KEY_ITEMS
+        .iter()
+        .find(|(class, _)| *class == class_code)
+        .map_or(&[], |(_, items)| *items)
 }
 
 fn power_reading(
@@ -917,10 +932,8 @@ fn cell_text(
 }
 
 fn key_values(row: &ObjectRow) -> Line<'_> {
-    let class_code = row.eoj.class_code();
-    let power = power_epc(class_code);
     let mut spans = Vec::new();
-    for item in key_items(class_code) {
+    for item in key_items(row.eoj.class_code()) {
         let Some(stored) = row.values.get(&item.epc) else {
             continue;
         };
@@ -929,12 +942,6 @@ fn key_values(row: &ObjectRow) -> Line<'_> {
         }
         spans.push(Span::styled(item.label, Style::new().fg(LABEL)));
         spans.push(Span::raw(" "));
-        if power == Some(item.epc)
-            && let Some(watts) = instantaneous_watts(class_code, &stored.raw)
-        {
-            spans.push(Span::styled(format!("{watts} W"), Style::new().fg(VALUE)));
-            continue;
-        }
         spans.push(Span::styled(stored.text.as_str(), Style::new().fg(VALUE)));
     }
     Line::from(spans)
@@ -1203,9 +1210,28 @@ mod tests {
             .backend()
             .buffer()
             .content
-            .iter()
-            .map(BufferCell::symbol)
-            .collect()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(BufferCell::symbol).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn stored(raw: &[u8]) -> StoredValue {
+        StoredValue {
+            raw: raw.to_vec(),
+            text: String::new(),
+        }
+    }
+
+    fn object_row(
+        class_group: u8,
+        class: u8,
+    ) -> ObjectRow {
+        ObjectRow::new(
+            source("192.168.100.26"),
+            Eoj::new(class_group, class, 0x01),
+            SystemTime::UNIX_EPOCH,
+        )
     }
 
     fn text(line: &Line<'_>) -> String {
@@ -1228,38 +1254,73 @@ mod tests {
     }
 
     #[test]
-    fn key_items_put_the_power_property_first() {
-        let heater = key_items(0x026B);
-        assert_eq!(heater.first().map(|item| item.label), Some("Hot water"));
-
-        let board = key_items(0x0287);
+    fn key_items_leave_power_to_the_power_column() {
         assert_eq!(
-            board.first().map(|item| (item.epc, item.label)),
-            Some((0xC6, "Power"))
+            key_items(0x026B).first().map(|item| item.label),
+            Some("Hot water")
         );
-        assert_eq!(board.len(), 1);
-
-        let solar = key_items(0x0279);
-        assert_eq!(
-            solar.first().map(|item| (item.epc, item.label)),
-            Some((0xE0, "Gen"))
-        );
-        assert_eq!(
-            solar.len(),
-            1,
-            "the PV on this LAN omits its cumulative total from the Get map"
-        );
-
+        assert!(key_items(0x0287).is_empty());
+        assert!(key_items(0x0279).is_empty());
         assert_eq!(
             key_items(0x027D).first().map(|item| item.label),
-            Some("Battery")
+            Some("Level")
         );
-        assert_eq!(
-            key_items(0x0288).len(),
-            1,
-            "the smart meter's cumulative energy needs its coefficient, so it is not a key item"
-        );
+        assert!(key_items(0x0288).is_empty());
         assert!(key_items(0xFFFF).is_empty());
+    }
+
+    #[test]
+    fn power_text_labels_the_reading() {
+        let mut board = object_row(0x02, 0x87);
+        board.values.insert(0xC6, stored(&[0, 0, 2, 0x44]));
+        assert_eq!(power_text(&board).as_deref(), Some("Power 580 W"));
+
+        let mut solar = object_row(0x02, 0x79);
+        solar.values.insert(0xE0, stored(&[0x04, 0xD8]));
+        assert_eq!(power_text(&solar).as_deref(), Some("Gen 1240 W"));
+
+        let mut battery = object_row(0x02, 0x7D);
+        battery
+            .values
+            .insert(0xD3, stored(&[0xFF, 0xFF, 0xFF, 0x38]));
+        assert_eq!(power_text(&battery).as_deref(), Some("Battery -200 W"));
+
+        let mut no_data = object_row(0x02, 0x87);
+        no_data
+            .values
+            .insert(0xC6, stored(&[0x7F, 0xFF, 0xFF, 0xFE]));
+        assert_eq!(power_text(&no_data), None);
+
+        assert_eq!(power_text(&object_row(0x02, 0x87)), None);
+
+        let heater = object_row(0x02, 0x6B);
+        assert_eq!(power_text(&heater), None);
+    }
+
+    #[test]
+    fn key_items_do_not_repeat_the_power_property() {
+        for (class, items) in KEY_ITEMS {
+            assert!(
+                items.iter().all(|item| Some(item.epc) != power_epc(*class)),
+                "class 0x{class:04X} repeats its power EPC"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_device_keeps_its_power_reading() {
+        let mut dashboard = dashboard(10);
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        dashboard.apply(change(
+            old,
+            "192.168.100.26",
+            Eoj::new(0x02, 0x87, 0x01),
+            0xC6,
+            &[0, 0, 2, 0x44],
+        ));
+
+        let screen = screen(&mut dashboard, 100, 30);
+        assert!(screen.contains("Power 580 W"), "{screen}");
     }
 
     #[test]
@@ -1878,13 +1939,16 @@ mod tests {
         for (width, height) in [(100, 30), (80, 24)] {
             let mut dashboard = dashboard(10);
             let now = SystemTime::now();
-            dashboard.apply(change(
-                now,
-                "192.168.100.26",
-                Eoj::new(0x02, 0x6B, 0x01),
-                0xB1,
-                &[0x41],
-            ));
+            let heater = Eoj::new(0x02, 0x6B, 0x01);
+            let heater_changes: [(u8, &[u8]); 4] = [
+                (0xC3, &[0x42]),
+                (0xD1, &[0x28]),
+                (0xD3, &[0x28]),
+                (0xB1, &[0x41]),
+            ];
+            for (epc, raw) in heater_changes {
+                dashboard.apply(change(now, "192.168.100.26", heater, epc, raw));
+            }
             dashboard.apply(change(
                 now,
                 "192.168.100.26",
@@ -1909,22 +1973,38 @@ mod tests {
             dashboard.sample(now);
 
             let screen = screen(&mut dashboard, width, height);
-            for needle in [
-                "Power",
-                "580 W",
+            let mut needles = vec![
                 "0x028701",
                 "Devices",
-                "Auto ON",
+                "POWER",
+                "Power 580 W",
+                "Gen 1240 W",
+                "Gen 300 W",
                 "grid buying 580 W",
                 "solar 1540 W",
                 "0x027901",
                 "0x027902",
-            ] {
+            ];
+            if width == 100 {
+                // At 80 columns the 15-column POWER field clips the tail of
+                // KEY VALUES, where the heater's mode sits.
+                needles.push("Auto ON");
+            }
+            for needle in needles {
                 assert!(
                     screen.contains(needle),
                     "{width}x{height} screen is missing {needle:?}: {screen}"
                 );
             }
+            let heater_row = screen
+                .split("0x026B01")
+                .nth(1)
+                .and_then(|tail| tail.split("0x027901").next())
+                .expect("the heater row is rendered");
+            assert!(
+                heater_row.contains("--"),
+                "{width}x{height}: the heater's power cell is missing: {screen}"
+            );
         }
     }
 }
