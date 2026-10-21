@@ -41,30 +41,30 @@ const KEY_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Series {
-    Consumption,
+    Grid,
     Solar,
 }
 
-const SERIES: [Series; 2] = [Series::Consumption, Series::Solar];
+const SERIES: [Series; 2] = [Series::Grid, Series::Solar];
 
 impl Series {
     const fn index(self) -> usize {
         match self {
-            Self::Consumption => 0,
+            Self::Grid => 0,
             Self::Solar => 1,
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Consumption => "consumption",
+            Self::Grid => "grid",
             Self::Solar => "solar",
         }
     }
 
     const fn color(self) -> Color {
         match self {
-            Self::Consumption => VALUE,
+            Self::Grid => VALUE,
             Self::Solar => SOLAR,
         }
     }
@@ -284,7 +284,7 @@ impl Dashboard {
         };
         for series in SERIES {
             sample.watts[series.index()] = match series {
-                Series::Consumption => self.consumption_watts(now),
+                Series::Grid => self.grid_watts(now),
                 Series::Solar => self.solar_watts(now),
             };
         }
@@ -368,7 +368,7 @@ impl Dashboard {
         })
     }
 
-    fn consumption_watts(
+    fn grid_watts(
         &self,
         now: SystemTime,
     ) -> Option<i64> {
@@ -388,7 +388,7 @@ impl Dashboard {
         Some(total_watts(&units))
     }
 
-    fn consumption_state(
+    fn grid_state(
         &self,
         now: SystemTime,
     ) -> SeriesState {
@@ -470,7 +470,7 @@ impl Dashboard {
         now: SystemTime,
     ) -> SeriesState {
         match series {
-            Series::Consumption => self.consumption_state(now),
+            Series::Grid => self.grid_state(now),
             Series::Solar => self.solar_state(now),
         }
     }
@@ -484,7 +484,9 @@ impl Dashboard {
         let mut total = 0i64;
         let mut count = 0i64;
         for watts in self.samples.iter().filter_map(|sample| sample.get(series)) {
-            peak = peak.max(watts);
+            if watts.saturating_abs() > peak.saturating_abs() {
+                peak = watts;
+            }
             total = total.saturating_add(watts);
             count = count.saturating_add(1);
         }
@@ -520,7 +522,7 @@ impl Dashboard {
             },
             SeriesState::Current { watts, age, detail } => {
                 spans.push(Span::styled(
-                    format!(" {watts} W"),
+                    format!(" {}", reading_text(series, watts)),
                     Style::new().fg(VALUE).add_modifier(Modifier::BOLD),
                 ));
                 if let Some(detail) = detail {
@@ -536,12 +538,20 @@ impl Dashboard {
                     spans.push(Span::styled(format!(" · {detail}"), dim()));
                 }
                 spans.push(Span::styled(
-                    format!(" · no reading for {} · last {last} W", format_age(age)),
+                    format!(
+                        " · no reading for {} · last {}",
+                        format_age(age),
+                        reading_text(series, last)
+                    ),
                     Style::new().fg(EXPIRED),
                 ));
             },
         }
         if show_stats && let Some((peak, average)) = self.series_stats(series, seed) {
+            let peak = match series {
+                Series::Grid => peak.saturating_abs(),
+                Series::Solar => peak,
+            };
             spans.push(Span::styled(
                 format!("   peak {peak} W   avg {average} W"),
                 dim(),
@@ -596,7 +606,7 @@ impl Dashboard {
         area: Rect,
     ) {
         let now = SystemTime::now();
-        let mut visible = vec![Series::Consumption];
+        let mut visible = vec![Series::Grid];
         if self.has_pv() {
             visible.push(Series::Solar);
         }
@@ -633,88 +643,22 @@ impl Dashboard {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let summary_height = u16::try_from(visible.len()).unwrap_or(1);
-        let [summary, chart_area] =
-            Layout::vertical([Constraint::Length(summary_height), Constraint::Min(0)]).areas(inner);
         let lines: Vec<Line<'static>> = visible
             .iter()
             .zip(states)
             .map(|(series, state)| self.series_line(*series, state))
             .collect();
+        let plot = PowerPlot::build(&self.samples);
+        if plot.runs.is_empty() {
+            frame.render_widget(Paragraph::new(lines), inner);
+            return;
+        }
+
+        let summary_height = u16::try_from(visible.len()).unwrap_or(1);
+        let [summary, chart_area] =
+            Layout::vertical([Constraint::Length(summary_height), Constraint::Min(0)]).areas(inner);
         frame.render_widget(Paragraph::new(lines), summary);
-        self.draw_chart(frame, chart_area, &visible);
-    }
-
-    fn draw_chart(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        visible: &[Series],
-    ) {
-        let runs = self.chart_runs(visible);
-        let datasets: Vec<Dataset<'_>> = runs
-            .iter()
-            .map(|(series, run)| {
-                Dataset::default()
-                    .marker(Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::new().fg(series.color()))
-                    .fill_to_y(0.0)
-                    .data(run.as_slice())
-            })
-            .collect();
-        let chart = Chart::new(datasets)
-            .x_axis(Axis::default().bounds([
-                0.0,
-                chart_coordinate(i64::try_from(SAMPLE_CAPACITY - 1).unwrap_or(i64::MAX)),
-            ]))
-            .y_axis(Axis::default().bounds(self.chart_bounds()))
-            .legend_position(None);
-        frame.render_widget(chart, area);
-    }
-
-    fn chart_runs(
-        &self,
-        visible: &[Series],
-    ) -> Vec<(Series, Vec<(f64, f64)>)> {
-        let mut runs = Vec::new();
-        let offset = SAMPLE_CAPACITY.saturating_sub(self.samples.len());
-        for series in visible {
-            let mut run = Vec::new();
-            for (index, sample) in self.samples.iter().enumerate() {
-                if let Some(watts) = sample.get(*series) {
-                    let x = chart_coordinate(i64::try_from(offset + index).unwrap_or(i64::MAX));
-                    run.push((x, chart_coordinate(watts)));
-                } else if !run.is_empty() {
-                    runs.push((*series, std::mem::take(&mut run)));
-                }
-            }
-            if !run.is_empty() {
-                runs.push((*series, run));
-            }
-        }
-        runs
-    }
-
-    fn chart_bounds(&self) -> [f64; 2] {
-        let mut min = 0i64;
-        let mut max = 0i64;
-        for sample in &self.samples {
-            for series in SERIES {
-                if let Some(watts) = sample.get(series) {
-                    min = min.min(watts);
-                    max = max.max(watts);
-                }
-            }
-        }
-        if min == 0 && max == 0 {
-            return [0.0, 1.0];
-        }
-        let padding = (chart_coordinate(max.saturating_sub(min)) * 0.05).max(1.0);
-        [
-            chart_coordinate(min) - padding,
-            chart_coordinate(max) + padding,
-        ]
+        plot.draw(frame, chart_area);
     }
 
     fn draw_devices(
@@ -782,6 +726,100 @@ impl Dashboard {
     }
 }
 
+/// Symmetric bounds keep the three evenly spaced labels truthful. Clamping the
+/// range to `[0, limit]` for a buy-only site would move the middle `0` label off
+/// the zero rule and leave a `sell` label for a range with no data.
+#[derive(Clone, Copy)]
+struct Scale {
+    limit: i64,
+}
+
+impl Scale {
+    const fn bounds(self) -> [f64; 2] {
+        [chart_coordinate(-self.limit), chart_coordinate(self.limit)]
+    }
+
+    /// Bottom to top, the order [`Axis::labels`] draws.
+    fn labels(self) -> [Line<'static>; 3] {
+        let magnitude = format_limit(self.limit);
+        [
+            Line::from(format!("sell {magnitude}")).style(dim()),
+            Line::from("0").style(dim()),
+            Line::from(format!("buy {magnitude}")).style(dim()),
+        ]
+    }
+}
+
+/// The grid runs and the scale fitted to them in one walk. Ratatui drops a
+/// point outside the bounds instead of clipping it, so the two must agree.
+struct PowerPlot {
+    runs: Vec<Vec<(f64, f64)>>,
+    scale: Scale,
+}
+
+impl PowerPlot {
+    fn build(samples: &VecDeque<Sample>) -> Self {
+        let mut runs = Vec::new();
+        let mut run = Vec::new();
+        let mut peak = 0i64;
+        let offset = SAMPLE_CAPACITY.saturating_sub(samples.len());
+        for (index, sample) in samples.iter().enumerate() {
+            if let Some(watts) = sample.get(Series::Grid) {
+                let x = chart_coordinate(i64::try_from(offset + index).unwrap_or(i64::MAX));
+                run.push((x, chart_coordinate(watts)));
+                peak = peak.max(watts.saturating_abs());
+            } else if !run.is_empty() {
+                runs.push(std::mem::take(&mut run));
+            }
+        }
+        if !run.is_empty() {
+            runs.push(run);
+        }
+        Self {
+            runs,
+            scale: Scale {
+                limit: nice_limit(peak),
+            },
+        }
+    }
+
+    fn draw(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+    ) {
+        let x_end = chart_coordinate(i64::try_from(SAMPLE_CAPACITY - 1).unwrap_or(i64::MAX));
+        let zero_rule = [(0.0, 0.0), (x_end, 0.0)];
+        let mut datasets: Vec<Dataset<'_>> = vec![
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::new().fg(LABEL))
+                .data(&zero_rule),
+        ];
+        // Painted after the rule: a braille cell keeps the last colour painted
+        // into it, so the data must win where the two meet.
+        datasets.extend(self.runs.iter().map(|run| {
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::new().fg(Series::Grid.color()))
+                .data(run.as_slice())
+        }));
+        let chart = Chart::new(datasets)
+            .x_axis(Axis::default().bounds([0.0, x_end]))
+            .y_axis(
+                Axis::default()
+                    .bounds(self.scale.bounds())
+                    .labels(self.scale.labels())
+                    .labels_alignment(Alignment::Right)
+                    .style(dim()),
+            )
+            .legend_position(None);
+        frame.render_widget(chart, area);
+    }
+}
+
 fn panel(title: Line<'static>) -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
@@ -795,6 +833,26 @@ const fn accent() -> Style {
 
 const fn dim() -> Style {
     Style::new().fg(LABEL)
+}
+
+const fn flow_word(watts: i64) -> &'static str {
+    if watts > 0 {
+        "buying"
+    } else if watts < 0 {
+        "selling"
+    } else {
+        "idle"
+    }
+}
+
+fn reading_text(
+    series: Series,
+    watts: i64,
+) -> String {
+    match series {
+        Series::Grid => format!("{} {} W", flow_word(watts), watts.saturating_abs()),
+        Series::Solar => format!("{watts} W"),
+    }
 }
 
 fn device_row(
@@ -927,6 +985,32 @@ fn format_uptime(elapsed: Duration) -> String {
 #[allow(clippy::cast_precision_loss)]
 const fn chart_coordinate(value: i64) -> f64 {
     value as f64
+}
+
+const AXIS_STEPS: [i64; 9] = [10, 15, 20, 25, 30, 40, 50, 60, 80];
+const MIN_SCALE_LIMIT: i64 = 100;
+
+fn nice_limit(peak: i64) -> i64 {
+    let target = peak.saturating_add(peak / 10).max(MIN_SCALE_LIMIT);
+    let mut decade = 1i64;
+    while decade <= target / 10 {
+        decade *= 10;
+    }
+    AXIS_STEPS
+        .iter()
+        .map(|step| decade / 10 * step)
+        .find(|candidate| *candidate >= target)
+        .unwrap_or_else(|| decade.saturating_mul(10))
+}
+
+fn format_limit(watts: i64) -> String {
+    if watts < 1000 {
+        format!("{watts} W")
+    } else if watts % 1000 == 0 {
+        format!("{} kW", watts / 1000)
+    } else {
+        format!("{}.{} kW", watts / 1000, watts % 1000 / 100)
+    }
 }
 
 /// Run the dashboard until the user quits, then return the service's result.
@@ -1132,13 +1216,13 @@ mod tests {
     }
 
     fn sample(
-        consumption: Option<i64>,
+        grid: Option<i64>,
         solar: Option<i64>,
     ) -> Sample {
         let mut sample = Sample {
             watts: [None; SERIES.len()],
         };
-        sample.watts[Series::Consumption.index()] = consumption;
+        sample.watts[Series::Grid.index()] = grid;
         sample.watts[Series::Solar.index()] = solar;
         sample
     }
@@ -1293,7 +1377,7 @@ mod tests {
             dashboard
                 .samples
                 .back()
-                .and_then(|sample| sample.get(Series::Consumption)),
+                .and_then(|sample| sample.get(Series::Grid)),
             Some(580)
         );
 
@@ -1302,7 +1386,7 @@ mod tests {
             dashboard
                 .samples
                 .back()
-                .and_then(|sample| sample.get(Series::Consumption)),
+                .and_then(|sample| sample.get(Series::Grid)),
             None
         );
     }
@@ -1317,11 +1401,11 @@ mod tests {
         dashboard.apply(seen(start, "192.168.100.26", eoj));
 
         let now = start + Duration::from_secs(31);
-        assert_eq!(dashboard.consumption_watts(now), None);
-        let state = dashboard.series_state(Series::Consumption, now);
-        let line = text(&dashboard.series_line(Series::Consumption, state));
+        assert_eq!(dashboard.grid_watts(now), None);
+        let state = dashboard.series_state(Series::Grid, now);
+        let line = text(&dashboard.series_line(Series::Grid, state));
         assert!(line.contains("no reading for 31s"), "{line}");
-        assert!(line.contains("last 580 W"), "{line}");
+        assert!(line.contains("last buying 580 W"), "{line}");
     }
 
     #[test]
@@ -1353,15 +1437,15 @@ mod tests {
 
         dashboard.sample(start);
         let sample = dashboard.samples.back().unwrap();
-        assert_eq!(sample.get(Series::Consumption), Some(580));
+        assert_eq!(sample.get(Series::Grid), Some(580));
         assert_eq!(sample.get(Series::Solar), Some(1540));
 
-        let state = dashboard.series_state(Series::Consumption, start + Duration::from_secs(5));
+        let state = dashboard.series_state(Series::Grid, start + Duration::from_secs(5));
         match state {
             SeriesState::Current { age, .. } => {
                 assert_eq!(age, Duration::from_secs(5));
             },
-            _ => panic!("expected a current consumption reading"),
+            _ => panic!("expected a current grid reading"),
         }
     }
 
@@ -1510,7 +1594,7 @@ mod tests {
 
         for (width, height) in [(100, 30), (80, 24)] {
             let screen = screen(&mut dashboard, width, height);
-            assert!(screen.contains("consumption 580 W"), "{screen}");
+            assert!(screen.contains("grid buying 580 W"), "{screen}");
             assert!(screen.contains("1 of 2 PV stale"), "{screen}");
             assert!(screen.contains("last 1540 W"), "{screen}");
         }
@@ -1547,12 +1631,12 @@ mod tests {
         ));
 
         let screen = screen(&mut dashboard, 100, 30);
-        assert!(screen.contains("consumption 580 W"), "{screen}");
+        assert!(screen.contains("grid buying 580 W"), "{screen}");
         assert!(!screen.contains("solar"), "{screen}");
     }
 
     #[test]
-    fn a_solar_only_site_draws_the_chart() {
+    fn a_solar_only_site_lists_solar_without_a_grid_chart() {
         let mut dashboard = dashboard(10);
         let now = SystemTime::now();
         dashboard.apply(change(
@@ -1562,14 +1646,16 @@ mod tests {
             0xE0,
             &[0x04, 0xD8],
         ));
+        dashboard.sample(now);
 
         let screen = screen(&mut dashboard, 100, 30);
         assert!(screen.contains("no consumption meter"), "{screen}");
         assert!(screen.contains("solar 1240 W"), "{screen}");
+        assert!(!screen.contains("sell "), "{screen}");
     }
 
     #[test]
-    fn each_series_keeps_its_own_gaps() {
+    fn the_grid_chart_keeps_its_gaps() {
         let mut dashboard = dashboard(10);
         for tick in [
             sample(Some(100), None),
@@ -1580,15 +1666,15 @@ mod tests {
             dashboard.samples.push_back(tick);
         }
 
-        let runs = dashboard.chart_runs(&SERIES);
-        assert_eq!(runs.len(), 2, "one run per series");
-        let first_x = |series: Series| {
-            let (_, run) = runs.iter().find(|(owner, _)| *owner == series).unwrap();
-            assert_eq!(run.len(), 2, "{series:?} run");
-            run[0].0
-        };
-        let offset = first_x(Series::Solar) - first_x(Series::Consumption);
-        assert!((offset - 1.0).abs() < f64::EPSILON, "{offset}");
+        let plot = PowerPlot::build(&dashboard.samples);
+        assert_eq!(plot.runs.len(), 1, "solar creates no run");
+        let run = &plot.runs[0];
+        assert_eq!(run.len(), 2);
+        assert!(
+            run.iter()
+                .all(|(_, watts)| (*watts - 100.0).abs() < f64::EPSILON),
+            "{run:?}"
+        );
     }
 
     #[test]
@@ -1598,7 +1684,7 @@ mod tests {
         dashboard.samples.push_back(sample(Some(300), Some(0)));
 
         assert_eq!(
-            dashboard.series_stats(Series::Consumption, Some(300)),
+            dashboard.series_stats(Series::Grid, Some(300)),
             Some((300, 200))
         );
         assert_eq!(
@@ -1608,13 +1694,127 @@ mod tests {
     }
 
     #[test]
-    fn chart_bounds_span_both_series() {
+    fn a_selling_window_peaks_at_its_largest_export() {
         let mut dashboard = dashboard(10);
-        dashboard.samples.push_back(sample(Some(100), Some(1000)));
+        dashboard.samples.push_back(sample(Some(-300), None));
+        dashboard.samples.push_back(sample(Some(-400), None));
 
-        let bounds = dashboard.chart_bounds();
-        assert!(bounds[0] < 0.0, "{bounds:?}");
-        assert!(bounds[1] > 1000.0, "{bounds:?}");
+        assert_eq!(
+            dashboard.series_stats(Series::Grid, Some(-300)),
+            Some((-400, -350))
+        );
+    }
+
+    #[test]
+    fn the_scale_is_symmetric_about_zero() {
+        let mut dashboard = dashboard(10);
+        dashboard.samples.push_back(sample(Some(-373), Some(1240)));
+
+        let bounds = PowerPlot::build(&dashboard.samples).scale.bounds();
+        assert!((bounds[0] + 500.0).abs() < f64::EPSILON, "{bounds:?}");
+        assert!((bounds[1] - 500.0).abs() < f64::EPSILON, "{bounds:?}");
+        assert!((bounds[0] + bounds[1]).abs() < f64::EPSILON, "{bounds:?}");
+    }
+
+    #[test]
+    fn nice_limit_rounds_to_readable_steps() {
+        for (peak, limit) in [
+            (0, 100),
+            (41, 100),
+            (100, 150),
+            (373, 500),
+            (580, 800),
+            (2168, 2500),
+            (2541, 3000),
+            (8000, 10_000),
+        ] {
+            assert_eq!(nice_limit(peak), limit, "peak {peak}");
+        }
+    }
+
+    #[test]
+    fn the_axis_labels_say_buy_above_and_sell_below() {
+        let scale = Scale { limit: 1500 };
+        let labels: Vec<String> = scale.labels().iter().map(|line| text(line)).collect();
+        assert_eq!(labels, ["sell 1.5 kW", "0", "buy 1.5 kW"]);
+
+        let scale = Scale { limit: 800 };
+        let labels: Vec<String> = scale.labels().iter().map(|line| text(line)).collect();
+        assert_eq!(labels, ["sell 800 W", "0", "buy 800 W"]);
+    }
+
+    #[test]
+    fn the_grid_reading_names_its_direction() {
+        assert_eq!(reading_text(Series::Grid, 373), "buying 373 W");
+        assert_eq!(reading_text(Series::Grid, -373), "selling 373 W");
+        assert_eq!(reading_text(Series::Grid, 0), "idle 0 W");
+        assert_eq!(reading_text(Series::Solar, 0), "0 W");
+    }
+
+    #[test]
+    fn the_scale_holds_every_plotted_point() {
+        for peak in [-5000, -373, -1, 0, 1, 373, 2168, 2541, 12_000] {
+            let mut dashboard = dashboard(10);
+            dashboard
+                .samples
+                .push_back(sample(Some(peak), Some(peak.saturating_abs())));
+            let plot = PowerPlot::build(&dashboard.samples);
+            let [low, high] = plot.scale.bounds();
+            assert!(
+                plot.runs
+                    .iter()
+                    .flatten()
+                    .all(|(_, watts)| *watts >= low && *watts <= high),
+                "peak {peak} escapes {low}..{high}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scale_ignores_solar() {
+        let mut dashboard = dashboard(10);
+        dashboard.samples.push_back(sample(Some(100), Some(5000)));
+
+        let plot = PowerPlot::build(&dashboard.samples);
+        assert_eq!(plot.scale.limit, 150);
+        assert_eq!(plot.runs.len(), 1);
+        assert!(
+            plot.runs
+                .iter()
+                .flatten()
+                .all(|(_, watts)| (*watts - 100.0).abs() < f64::EPSILON)
+        );
+    }
+
+    #[test]
+    fn a_missing_grid_reading_keeps_the_scale_at_its_floor() {
+        let mut dashboard = dashboard(10);
+        for _ in 0..3 {
+            dashboard.samples.push_back(sample(None, Some(1240)));
+        }
+
+        let plot = PowerPlot::build(&dashboard.samples);
+        assert_eq!(plot.scale.limit, MIN_SCALE_LIMIT);
+        assert!(plot.runs.is_empty());
+    }
+
+    #[test]
+    fn a_selling_reading_reads_as_selling() {
+        let mut dashboard = dashboard(10);
+        let now = SystemTime::now();
+        dashboard.apply(change(
+            now,
+            "192.168.100.26",
+            Eoj::new(0x02, 0x87, 0x01),
+            0xC6,
+            &[0xFF, 0xFF, 0xFE, 0x8B],
+        ));
+        dashboard.sample(now);
+
+        let screen = screen(&mut dashboard, 100, 30);
+        assert!(screen.contains("grid selling 373 W"), "{screen}");
+        assert!(screen.contains("sell 500 W"), "{screen}");
+        assert!(screen.contains("buy 500 W"), "{screen}");
     }
 
     #[test]
@@ -1715,7 +1915,7 @@ mod tests {
                 "0x028701",
                 "Devices",
                 "Auto ON",
-                "consumption 580 W",
+                "grid buying 580 W",
                 "solar 1540 W",
                 "0x027901",
                 "0x027902",
