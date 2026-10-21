@@ -69,9 +69,7 @@ impl Cli {
     /// Spawn the shipped binary with no mode flag.
     ///
     /// `--interface 127.0.0.1` keeps the multicast join on an interface that
-    /// always exists, the same reason the transport tests join on loopback; the
-    /// socket is still bound to the wildcard address, so frames addressed to
-    /// `127.0.0.1:3610` arrive.
+    /// always exists, the same reason the transport tests join on loopback.
     fn spawn() -> Result<Self, Box<dyn Error>> {
         Self::spawn_with(&[])
     }
