@@ -67,8 +67,9 @@ impl EchoNetSocket {
     /// standard port, and the kernel delivers those datagrams to a socket bound
     /// to the interface address in preference to the wildcard bind. Listeners
     /// that share the address through `SO_REUSEPORT` receive a share instead.
-    /// When no address can be bound, the socket still receives multicast on the
-    /// wildcard bind, and [`Self::interface_addr`] returns `None`.
+    /// When the interface address cannot be bound, the socket still receives
+    /// multicast on the wildcard bind, and [`Self::interface_addr`] returns
+    /// `None`.
     ///
     /// # Errors
     ///
