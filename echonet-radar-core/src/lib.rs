@@ -604,6 +604,148 @@ pub fn instantaneous_watts(
     }
 }
 
+/// Cumulative electric energy in kWh, formatted for display.
+///
+/// `value_at` returns the most recent raw EDT for an EPC on the object. The
+/// counter and coefficient EDTs must be 4 bytes and the unit EDT 1 byte. The
+/// result has up to four decimals and a trailing ` kWh`, for example
+/// `14359.978 kWh`.
+///
+/// Supports the PV (0x0279), distribution board (0x0287), and smart meter
+/// (0x0288) counters. Returns `None` for any other class, a missing counter,
+/// unit, or coefficient, a malformed value, the appendix's `NoData` or
+/// all-ones sentinel, or a zero coefficient. A smart meter that does not report
+/// its optional coefficient returns `None` rather than guessing a factor.
+///
+/// ```
+/// use std::collections::BTreeMap;
+///
+/// use echonet_radar_core::format_cumulative_energy_kwh;
+///
+/// let values = BTreeMap::from([
+///     (0xC0, vec![0x00, 0xDB, 0x1D, 0xAA]),
+///     (0xC2, vec![0x03]),
+/// ]);
+/// assert_eq!(
+///     format_cumulative_energy_kwh(0x0287, |epc| values.get(&epc).map(Vec::as_slice)),
+///     Some(String::from("14359.978 kWh"))
+/// );
+/// ```
+#[must_use]
+pub fn format_cumulative_energy_kwh<'a>(
+    class_code: u16,
+    value_at: impl Fn(u8) -> Option<&'a [u8]>,
+) -> Option<String> {
+    let counter = energy_counter(class_code)?;
+    let raw = u128::from(read_energy_counter(value_at(counter.epc)?)?);
+    let unit = match counter.unit {
+        EnergyUnit::Fixed(code) => code,
+        EnergyUnit::Epc(epc) => match value_at(epc)? {
+            [code] => *code,
+            _ => return None,
+        },
+    };
+    let factor = u128::from(energy_unit_factor(unit)?);
+    let coefficient = match counter.coefficient_epc {
+        Some(epc) => {
+            let coefficient = read_energy_counter(value_at(epc)?)?;
+            // The appendix's coefficient range is 1..=999_999.
+            if coefficient == 0 || coefficient > 999_999 {
+                return None;
+            }
+            u128::from(coefficient)
+        },
+        None => 1,
+    };
+    let total = raw.checked_mul(coefficient)?.checked_mul(factor)?;
+    Some(format_energy_kwh(total))
+}
+
+#[derive(Clone, Copy)]
+enum EnergyUnit {
+    Fixed(u8),
+    Epc(u8),
+}
+
+#[derive(Clone, Copy)]
+struct EnergyCounter {
+    epc: u8,
+    unit: EnergyUnit,
+    coefficient_epc: Option<u8>,
+}
+
+const fn energy_counter(class_code: u16) -> Option<EnergyCounter> {
+    match class_code {
+        0x0279 => Some(EnergyCounter {
+            epc: 0xE1,
+            unit: EnergyUnit::Fixed(0x03),
+            coefficient_epc: None,
+        }),
+        0x0287 => Some(EnergyCounter {
+            epc: 0xC0,
+            unit: EnergyUnit::Epc(0xC2),
+            coefficient_epc: None,
+        }),
+        0x0288 => Some(EnergyCounter {
+            epc: 0xE0,
+            unit: EnergyUnit::Epc(0xE1),
+            coefficient_epc: Some(0xD3),
+        }),
+        _ => None,
+    }
+}
+
+fn energy_epcs(class_code: u16) -> impl Iterator<Item = u8> {
+    let counter = energy_counter(class_code);
+    let unit = counter.and_then(|counter| match counter.unit {
+        EnergyUnit::Epc(epc) => Some(epc),
+        EnergyUnit::Fixed(_) => None,
+    });
+    let coefficient = counter.and_then(|counter| counter.coefficient_epc);
+    [counter.map(|counter| counter.epc), unit, coefficient]
+        .into_iter()
+        .flatten()
+}
+
+const fn read_energy_counter(edt: &[u8]) -> Option<u32> {
+    let [a, b, c, d] = edt else {
+        return None;
+    };
+    match u32::from_be_bytes([*a, *b, *c, *d]) {
+        0xFFFF_FFFE | 0xFFFF_FFFF => None,
+        raw => Some(raw),
+    }
+}
+
+/// Counter factors are multiples of 0.0001 kWh; the formatter divides by this.
+const ENERGY_SCALE: u32 = 10_000;
+
+const fn energy_unit_factor(code: u8) -> Option<u32> {
+    match code {
+        0x00 => Some(ENERGY_SCALE),
+        0x01 => Some(1_000),
+        0x02 => Some(100),
+        0x03 => Some(10),
+        0x04 => Some(1),
+        0x0A => Some(100_000),
+        0x0B => Some(1_000_000),
+        0x0C => Some(10_000_000),
+        0x0D => Some(100_000_000),
+        _ => None,
+    }
+}
+
+fn format_energy_kwh(total: u128) -> String {
+    let scale = u128::from(ENERGY_SCALE);
+    let whole = total / scale;
+    let fraction = total % scale;
+    if fraction == 0 {
+        return format!("{whole} kWh");
+    }
+    let digits = format!("{fraction:04}");
+    format!("{whole}.{} kWh", digits.trim_end_matches('0'))
+}
+
 fn union_value(
     class_code: u16,
     epc: u8,
@@ -1039,12 +1181,18 @@ impl ServiceState {
             .into_iter()
             .filter(|epc| can_get(class_code, *epc))
             .collect();
-        // The distribution board answers 0xC6 but omits it from its 0x9F map.
+        // Devices answer properties their 0x9F map omits: the distribution
+        // board's 0xC6 and the PV's 0xE1 cumulative counter.
         if let Some(power) = power_epc(class_code)
             && can_get(class_code, power)
             && !poll_epcs.contains(&power)
         {
             poll_epcs.push(power);
+        }
+        for epc in energy_epcs(class_code) {
+            if can_get(class_code, epc) && !poll_epcs.contains(&epc) {
+                poll_epcs.push(epc);
+            }
         }
         if !poll_epcs.is_empty() {
             self.poll_epcs.insert(key.id(), poll_epcs);
@@ -1160,10 +1308,16 @@ const fn is_pollable_object(eoj: Eoj) -> bool {
 fn fallback_poll_epcs(class_code: u16) -> Vec<u8> {
     let mut candidates = vec![0x80, 0xE0, 0xE1, 0xE7, 0xBB, 0xB0, 0xBE, 0xBA, 0xBF];
     candidates.extend(power_epc(class_code));
-    candidates
-        .into_iter()
-        .filter(|epc| can_get(class_code, *epc))
-        .collect()
+    candidates.extend(energy_epcs(class_code));
+    let mut epcs = Vec::new();
+    for epc in candidates {
+        // The generic list already carries 0xE0 and 0xE1, so a duplicate would
+        // be requested twice in the same batch.
+        if can_get(class_code, epc) && !epcs.contains(&epc) {
+            epcs.push(epc);
+        }
+    }
+    epcs
 }
 
 /// Whether a property can be read with a Get request per the appendix.
@@ -1476,6 +1630,146 @@ mod tests {
         );
     }
 
+    fn energy<'a>(values: &'a BTreeMap<u8, Vec<u8>>) -> impl Fn(u8) -> Option<&'a [u8]> + 'a {
+        move |epc| values.get(&epc).map(Vec::as_slice)
+    }
+
+    #[test]
+    fn cumulative_energy_reads_the_board_and_pv_counters() {
+        let board = BTreeMap::from([(0xC0, vec![0x00, 0xDB, 0x1D, 0xAA]), (0xC2, vec![0x03])]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0287, energy(&board)).as_deref(),
+            Some("14359.978 kWh")
+        );
+
+        let solar = BTreeMap::from([(0xE1, vec![0x00, 0xE7, 0x6A, 0xCF])]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0279, energy(&solar)).as_deref(),
+            Some("15166.159 kWh")
+        );
+    }
+
+    #[test]
+    fn cumulative_energy_scales_the_smart_meter_by_its_coefficient() {
+        let meter = BTreeMap::from([
+            (0xE0, vec![0x00, 0x00, 0x30, 0x39]),
+            (0xE1, vec![0x01]),
+            (0xD3, vec![0x00, 0x00, 0x00, 0x02]),
+        ]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0288, energy(&meter)).as_deref(),
+            Some("2469 kWh")
+        );
+    }
+
+    #[test]
+    fn every_energy_unit_code_scales_the_counter() {
+        let cases = [
+            (0x00, "1 kWh"),
+            (0x01, "0.1 kWh"),
+            (0x02, "0.01 kWh"),
+            (0x03, "0.001 kWh"),
+            (0x04, "0.0001 kWh"),
+            (0x0A, "10 kWh"),
+            (0x0B, "100 kWh"),
+            (0x0C, "1000 kWh"),
+            (0x0D, "10000 kWh"),
+        ];
+        for (unit, expected) in cases {
+            let values = BTreeMap::from([(0xC0, vec![0x00, 0x00, 0x00, 0x01]), (0xC2, vec![unit])]);
+            assert_eq!(
+                format_cumulative_energy_kwh(0x0287, energy(&values)).as_deref(),
+                Some(expected),
+                "unit 0x{unit:02X}"
+            );
+        }
+    }
+
+    #[test]
+    fn cumulative_energy_rejects_missing_or_malformed_properties() {
+        let no_counter = BTreeMap::from([(0xC2, vec![0x03])]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0287, energy(&no_counter)),
+            None
+        );
+
+        let no_unit = BTreeMap::from([(0xC0, vec![0x00, 0xDB, 0x1D, 0xAA])]);
+        assert_eq!(format_cumulative_energy_kwh(0x0287, energy(&no_unit)), None);
+
+        let no_coefficient =
+            BTreeMap::from([(0xE0, vec![0x00, 0x00, 0x30, 0x39]), (0xE1, vec![0x01])]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0288, energy(&no_coefficient)),
+            None
+        );
+
+        let zero_coefficient = BTreeMap::from([
+            (0xE0, vec![0x00, 0x00, 0x30, 0x39]),
+            (0xE1, vec![0x01]),
+            (0xD3, vec![0x00, 0x00, 0x00, 0x00]),
+        ]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0288, energy(&zero_coefficient)),
+            None
+        );
+
+        let large_coefficient = BTreeMap::from([
+            (0xE0, vec![0x00, 0x00, 0x30, 0x39]),
+            (0xE1, vec![0x01]),
+            (0xD3, vec![0x00, 0x10, 0x00, 0x00]),
+        ]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0288, energy(&large_coefficient)),
+            None
+        );
+
+        let short_counter = BTreeMap::from([(0xC0, vec![0xDB, 0x1D, 0xAA]), (0xC2, vec![0x03])]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0287, energy(&short_counter)),
+            None
+        );
+
+        let two_byte_unit = BTreeMap::from([
+            (0xC0, vec![0x00, 0xDB, 0x1D, 0xAA]),
+            (0xC2, vec![0x00, 0x03]),
+        ]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0287, energy(&two_byte_unit)),
+            None
+        );
+
+        let unknown_unit =
+            BTreeMap::from([(0xC0, vec![0x00, 0xDB, 0x1D, 0xAA]), (0xC2, vec![0x05])]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0287, energy(&unknown_unit)),
+            None
+        );
+
+        let no_data = BTreeMap::from([(0xC0, vec![0xFF, 0xFF, 0xFF, 0xFE]), (0xC2, vec![0x03])]);
+        assert_eq!(format_cumulative_energy_kwh(0x0287, energy(&no_data)), None);
+
+        let not_a_measurement =
+            BTreeMap::from([(0xC0, vec![0xFF, 0xFF, 0xFF, 0xFF]), (0xC2, vec![0x03])]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0287, energy(&not_a_measurement)),
+            None
+        );
+
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0130, energy(&BTreeMap::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn cumulative_energy_renders_a_zero_counter() {
+        let zero = BTreeMap::from([(0xC0, vec![0x00, 0x00, 0x00, 0x00]), (0xC2, vec![0x00])]);
+        assert_eq!(
+            format_cumulative_energy_kwh(0x0287, energy(&zero)).as_deref(),
+            Some("0 kWh")
+        );
+    }
+
     #[test]
     fn unknown_values_are_kept_as_hex() {
         assert_eq!(format_value(0xFFFF, 0x80, &[0x01, 0xAF]), "0x01 0xAF");
@@ -1772,6 +2066,43 @@ mod tests {
                 .get(&key.id())
                 .is_some_and(|epcs| epcs.contains(&0xC6))
         );
+    }
+
+    #[test]
+    fn unlisted_energy_epcs_are_polled() {
+        let (mut service, _receiver) = service();
+
+        let board = key("127.0.0.1", 0x02, 0x87, 0x01);
+        service.process_property_map(board, &[(0x9F, vec![2, 0xB0, 0xB1])]);
+        let epcs = service.poll_epcs.get(&board.id()).unwrap();
+        assert!(epcs.contains(&0xC0), "board counter missing from {epcs:?}");
+        assert!(epcs.contains(&0xC2), "board unit missing from {epcs:?}");
+
+        let solar = key("127.0.0.2", 0x02, 0x79, 0x01);
+        service.process_property_map(solar, &[(0x9F, vec![2, 0xB0, 0xB1])]);
+        let epcs = service.poll_epcs.get(&solar.id()).unwrap();
+        assert!(epcs.contains(&0xE1), "PV counter missing from {epcs:?}");
+
+        let meter = key("127.0.0.3", 0x02, 0x88, 0x01);
+        service.process_property_map(meter, &[(0x9F, vec![2, 0xB0, 0xB1])]);
+        let epcs = service.poll_epcs.get(&meter.id()).unwrap();
+        for epc in [0xE0, 0xE1, 0xD3] {
+            assert!(
+                epcs.contains(&epc),
+                "meter EPC 0x{epc:02X} missing from {epcs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_poll_requests_each_energy_epc_once() {
+        for class in [0x0279, 0x0287, 0x0288] {
+            let mut epcs = fallback_poll_epcs(class);
+            let unique = epcs.len();
+            epcs.sort_unstable();
+            epcs.dedup();
+            assert_eq!(epcs.len(), unique, "class 0x{class:04X} repeats an EPC");
+        }
     }
 
     #[tokio::test]
