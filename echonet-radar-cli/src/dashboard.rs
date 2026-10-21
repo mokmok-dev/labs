@@ -100,85 +100,6 @@ enum SeriesState {
     },
 }
 
-#[derive(Clone, Copy)]
-struct KeyItem {
-    epc: u8,
-    label: &'static str,
-}
-
-const KEY_ITEMS: &[(u16, &[KeyItem])] = &[
-    (
-        0x0011,
-        &[KeyItem {
-            epc: 0xE0,
-            label: "Temp",
-        }],
-    ),
-    (
-        0x0012,
-        &[KeyItem {
-            epc: 0xE0,
-            label: "Humidity",
-        }],
-    ),
-    (
-        0x0013,
-        &[KeyItem {
-            epc: 0xE0,
-            label: "Lux",
-        }],
-    ),
-    (
-        0x0130,
-        &[
-            KeyItem {
-                epc: 0x80,
-                label: "Status",
-            },
-            KeyItem {
-                epc: 0xB0,
-                label: "Mode",
-            },
-            KeyItem {
-                epc: 0xB3,
-                label: "Set",
-            },
-            KeyItem {
-                epc: 0xBB,
-                label: "Room",
-            },
-        ],
-    ),
-    (
-        0x026B,
-        &[
-            KeyItem {
-                epc: 0xC3,
-                label: "Hot water",
-            },
-            KeyItem {
-                epc: 0xD1,
-                label: "Supply",
-            },
-            KeyItem {
-                epc: 0xD3,
-                label: "Bath",
-            },
-            KeyItem {
-                epc: 0xB1,
-                label: "Auto",
-            },
-        ],
-    ),
-    (
-        0x027D,
-        &[KeyItem {
-            epc: 0xE4,
-            label: "Level",
-        }],
-    ),
-];
-
 struct ObjectRow {
     address: SocketAddr,
     eoj: Eoj,
@@ -212,13 +133,16 @@ struct PowerSource<'a> {
     watts: i64,
 }
 
+type ObjectKey = (IpAddr, u16, u8);
+
 struct Dashboard {
     config: RadarConfig,
     started: Instant,
     status: Option<(SystemTime, String)>,
-    objects: BTreeMap<(IpAddr, u16, u8), ObjectRow>,
+    objects: BTreeMap<ObjectKey, ObjectRow>,
     samples: VecDeque<Sample>,
-    scroll: usize,
+    selected: Option<ObjectKey>,
+    first: usize,
     visible_rows: usize,
 }
 
@@ -230,7 +154,8 @@ impl Dashboard {
             status: None,
             objects: BTreeMap::new(),
             samples: VecDeque::new(),
-            scroll: 0,
+            selected: None,
+            first: 0,
             visible_rows: 0,
         }
     }
@@ -294,12 +219,27 @@ impl Dashboard {
         self.samples.push_back(sample);
     }
 
-    fn scroll_by(
+    fn selected_key(&self) -> Option<ObjectKey> {
+        self.selected
+            .filter(|key| self.objects.contains_key(key))
+            .or_else(|| self.objects.keys().next().copied())
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        let key = self.selected_key()?;
+        self.objects.keys().position(|candidate| *candidate == key)
+    }
+
+    fn select_by(
         &mut self,
         delta: isize,
     ) {
-        let max = self.objects.len().saturating_sub(self.visible_rows);
-        self.scroll = self.scroll.saturating_add_signed(delta).min(max);
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        let last = self.objects.len().saturating_sub(1);
+        let next = index.saturating_add_signed(delta).min(last);
+        self.selected = self.objects.keys().nth(next).copied();
     }
 
     const fn stale_after(&self) -> Duration {
@@ -577,7 +517,7 @@ impl Dashboard {
         self.draw_devices(frame, devices);
         self.draw_status(frame, status);
         frame.render_widget(
-            Paragraph::new(Line::from(" q quit · p poll now · j/k scroll").style(dim())),
+            Paragraph::new(Line::from(" q quit · p poll now · j/k select").style(dim())),
             footer,
         );
     }
@@ -667,9 +607,6 @@ impl Dashboard {
         area: Rect,
     ) {
         self.visible_rows = usize::from(area.height.saturating_sub(3));
-        self.scroll = self
-            .scroll
-            .min(self.objects.len().saturating_sub(self.visible_rows));
         let title = format!(" Devices ({}) ", self.objects.len());
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -686,35 +623,121 @@ impl Dashboard {
             );
             return;
         }
+
+        let [list_area, properties_area] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(area);
+        let selected_index = self.selected_index().unwrap_or(0);
+        // The window top is sticky: moving up from the bottom row must move the
+        // highlight inside the window, not drag the whole list under a fixed one.
+        self.first = self
+            .first
+            .min(selected_index)
+            .max((selected_index + 1).saturating_sub(self.visible_rows))
+            .min(self.objects.len().saturating_sub(self.visible_rows));
         let header = Row::new(vec![
             Cell::from("EOJ"),
-            Cell::from("ADDRESS"),
             Cell::from(Line::from("POWER").alignment(Alignment::Right)),
-            Cell::from("KEY VALUES"),
             Cell::from("SEEN"),
         ])
         .style(Style::new().fg(LABEL));
         let rows: Vec<Row<'_>> = self
             .objects
-            .values()
-            .skip(self.scroll)
+            .iter()
+            .enumerate()
+            .skip(self.first)
             .take(self.visible_rows)
-            .map(|row| device_row(self.config.update_interval, row))
+            .map(|(index, (_, row))| {
+                let row = device_row(self.config.update_interval, row);
+                if index == selected_index {
+                    row.style(Style::new().add_modifier(Modifier::REVERSED))
+                } else {
+                    row
+                }
+            })
             .collect();
         let table = Table::new(
             rows,
             [
                 Constraint::Length(9),
                 Constraint::Length(15),
-                Constraint::Length(15),
-                Constraint::Min(0),
-                Constraint::Length(5),
+                Constraint::Length(6),
             ],
         )
         .header(header)
         .column_spacing(1)
         .block(block);
-        frame.render_widget(table, area);
+        frame.render_widget(table, list_area);
+        self.draw_properties(frame, properties_area);
+    }
+
+    fn draw_properties(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+    ) {
+        let selected = self.selected_key().and_then(|key| self.objects.get(&key));
+        let title = Line::from(Span::styled(" Properties ", accent()));
+        let mut block = panel(title);
+        if let Some(row) = selected {
+            block = block.title_top(
+                Line::from(format!(" {} {} ", format_eoj(row.eoj), row.address.ip()))
+                    .alignment(Alignment::Right)
+                    .style(dim()),
+            );
+        }
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let Some(row) = selected else {
+            return;
+        };
+        if row.values.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::from(" waiting for the first poll").style(dim())),
+                inner,
+            );
+            return;
+        }
+        let header = Row::new(vec![
+            Cell::from("EPC"),
+            Cell::from("PROPERTY"),
+            Cell::from("VALUE"),
+        ])
+        .style(Style::new().fg(LABEL));
+        let data_rows = usize::from(inner.height.saturating_sub(1));
+        let (shown, hidden) = if row.values.len() > data_rows {
+            (
+                data_rows.saturating_sub(1),
+                row.values.len() + 1 - data_rows,
+            )
+        } else {
+            (row.values.len(), 0)
+        };
+        let rows: Vec<Row<'_>> = row
+            .values
+            .iter()
+            .take(shown)
+            .map(|(epc, stored)| property_row(row.eoj.class_code(), *epc, stored))
+            .collect();
+        let [table_area, more_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(4),
+                Constraint::Fill(3),
+                Constraint::Fill(2),
+            ],
+        )
+        .header(header)
+        .column_spacing(1);
+        frame.render_widget(table, table_area);
+        if hidden > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(format!(" … {hidden} more")).style(dim())),
+                more_area,
+            );
+        }
     }
 
     fn draw_status(
@@ -872,10 +895,21 @@ fn device_row(
         .style(Style::new().fg(age_color(update_interval, age)));
     Row::new(vec![
         Cell::from(format_eoj(row.eoj)),
-        Cell::from(row.address.ip().to_string()),
         power_cell(row),
-        Cell::from(key_values(row)),
         Cell::from(seen),
+    ])
+}
+
+fn property_row(
+    class_code: u16,
+    epc: u8,
+    stored: &StoredValue,
+) -> Row<'_> {
+    let name = echonet_lite::ecodec::lookup(class_code, epc).map_or("(unknown)", |info| info.name);
+    Row::new(vec![
+        Cell::from(format!("0x{epc:02X}")),
+        Cell::from(name).style(dim()),
+        Cell::from(stored.text.as_str()).style(Style::new().fg(VALUE)),
     ])
 }
 
@@ -891,13 +925,6 @@ fn power_text(row: &ObjectRow) -> Option<String> {
 fn power_cell(row: &ObjectRow) -> Cell<'static> {
     let line = power_text(row).map_or_else(|| Line::from("--").style(dim()), Line::from);
     Cell::from(line.alignment(Alignment::Right))
-}
-
-fn key_items(class_code: u16) -> &'static [KeyItem] {
-    KEY_ITEMS
-        .iter()
-        .find(|(class, _)| *class == class_code)
-        .map_or(&[], |(_, items)| *items)
 }
 
 fn power_reading(
@@ -929,22 +956,6 @@ fn cell_text(
     raw: &[u8],
 ) -> String {
     format_value(class_code, epc, raw).replace(" Celsius", " C")
-}
-
-fn key_values(row: &ObjectRow) -> Line<'_> {
-    let mut spans = Vec::new();
-    for item in key_items(row.eoj.class_code()) {
-        let Some(stored) = row.values.get(&item.epc) else {
-            continue;
-        };
-        if !spans.is_empty() {
-            spans.push(Span::raw("  "));
-        }
-        spans.push(Span::styled(item.label, Style::new().fg(LABEL)));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(stored.text.as_str(), Style::new().fg(VALUE)));
-    }
-    Line::from(spans)
 }
 
 const fn power_label(class_code: u16) -> &'static str {
@@ -1125,8 +1136,8 @@ fn event_loop(
                     ));
                 }
             },
-            KeyCode::Char('j') | KeyCode::Down => dashboard.scroll_by(1),
-            KeyCode::Char('k') | KeyCode::Up => dashboard.scroll_by(-1),
+            KeyCode::Char('j') | KeyCode::Down => dashboard.select_by(1),
+            KeyCode::Char('k') | KeyCode::Up => dashboard.select_by(-1),
             _ => {},
         }
     }
@@ -1141,7 +1152,7 @@ mod tests {
     use echonet_radar_core::{ChangeEvent, DeviceEvent, SeenEvent};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::buffer::Cell as BufferCell;
+    use ratatui::buffer::{Buffer, Cell as BufferCell};
 
     const INTERFACE: Ipv4Addr = Ipv4Addr::new(192, 168, 100, 30);
 
@@ -1216,6 +1227,34 @@ mod tests {
             .join("\n")
     }
 
+    fn buffer(
+        dashboard: &mut Dashboard,
+        width: u16,
+        height: u16,
+    ) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| dashboard.draw(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn lists(
+        screen: &str,
+        eoj: &str,
+    ) -> bool {
+        screen.lines().any(|line| {
+            line.strip_prefix('│')
+                .is_some_and(|tail| tail.starts_with(eoj))
+        })
+    }
+
+    fn pane_title(screen: &str) -> &str {
+        screen
+            .lines()
+            .find(|line| line.contains("Properties"))
+            .expect("the properties pane is rendered")
+    }
+
     fn stored(raw: &[u8]) -> StoredValue {
         StoredValue {
             raw: raw.to_vec(),
@@ -1254,22 +1293,6 @@ mod tests {
     }
 
     #[test]
-    fn key_items_leave_power_to_the_power_column() {
-        assert_eq!(
-            key_items(0x026B).first().map(|item| item.label),
-            Some("Hot water")
-        );
-        assert!(key_items(0x0287).is_empty());
-        assert!(key_items(0x0279).is_empty());
-        assert_eq!(
-            key_items(0x027D).first().map(|item| item.label),
-            Some("Level")
-        );
-        assert!(key_items(0x0288).is_empty());
-        assert!(key_items(0xFFFF).is_empty());
-    }
-
-    #[test]
     fn power_text_labels_the_reading() {
         let mut board = object_row(0x02, 0x87);
         board.values.insert(0xC6, stored(&[0, 0, 2, 0x44]));
@@ -1295,16 +1318,6 @@ mod tests {
 
         let heater = object_row(0x02, 0x6B);
         assert_eq!(power_text(&heater), None);
-    }
-
-    #[test]
-    fn key_items_do_not_repeat_the_power_property() {
-        for (class, items) in KEY_ITEMS {
-            assert!(
-                items.iter().all(|item| Some(item.epc) != power_epc(*class)),
-                "class 0x{class:04X} repeats its power EPC"
-            );
-        }
     }
 
     #[test]
@@ -1898,17 +1911,227 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_stops_at_the_first_and_last_page() {
+    fn the_property_pane_lists_every_stored_value() {
+        let mut dashboard = dashboard(10);
+        let now = SystemTime::now();
+        let heater = Eoj::new(0x02, 0x6B, 0x01);
+        let heater_changes: [(u8, &[u8]); 4] = [
+            (0xC3, &[0x42]),
+            (0xD1, &[0x28]),
+            (0xD3, &[0x28]),
+            (0xB1, &[0x41]),
+        ];
+        for (epc, raw) in heater_changes {
+            dashboard.apply(change(now, "192.168.100.26", heater, epc, raw));
+        }
+
+        let screen = screen(&mut dashboard, 100, 30);
+        let title = pane_title(&screen);
+        assert!(title.contains("Properties"), "{screen}");
+        assert!(title.contains("0x026B01 192.168.100.26"), "{screen}");
+        for needle in [
+            "PROPERTY",
+            "VALUE",
+            "Hot water supply status",
+            "Temperature of supplied",
+            "Bath water temperature",
+            "Automatic water",
+            "OFF",
+            "40 C",
+            "ON",
+        ] {
+            assert!(
+                screen.contains(needle),
+                "the pane is missing {needle:?}: {screen}"
+            );
+        }
+        let order: Vec<usize> = ["0xB1", "0xC3", "0xD1", "0xD3"]
+            .iter()
+            .map(|epc| {
+                screen
+                    .find(epc)
+                    .unwrap_or_else(|| panic!("{epc} is missing: {screen}"))
+            })
+            .collect();
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "the rows are out of EPC order: {order:?}"
+        );
+    }
+
+    #[test]
+    fn selecting_the_next_device_swaps_the_pane() {
+        let mut dashboard = dashboard(10);
+        let now = SystemTime::now();
+        dashboard.apply(change(
+            now,
+            "192.168.100.26",
+            Eoj::new(0x02, 0x6B, 0x01),
+            0xB1,
+            &[0x41],
+        ));
+        dashboard.apply(change(
+            now,
+            "192.168.100.26",
+            Eoj::new(0x02, 0x88, 0x01),
+            0xE7,
+            &[0, 0, 0x02, 0xBC],
+        ));
+
+        let before = screen(&mut dashboard, 100, 30);
+        assert!(
+            pane_title(&before).contains("0x026B01 192.168.100.26"),
+            "{before}"
+        );
+        assert!(before.contains("Automatic water"), "{before}");
+
+        dashboard.select_by(1);
+        let after = screen(&mut dashboard, 100, 30);
+        assert!(
+            pane_title(&after).contains("0x028801 192.168.100.26"),
+            "{after}"
+        );
+        assert!(after.contains("0xE7"), "{after}");
+        assert!(
+            !after.contains("Automatic water"),
+            "the heater properties are still on screen: {after}"
+        );
+    }
+
+    #[test]
+    fn the_selection_clamps_and_scrolls_to_stay_visible() {
         let mut dashboard = dashboard(10);
         for instance in 1..=6 {
             dashboard.apply(device("192.168.100.26", 0x02, 0x87, instance));
         }
-        dashboard.visible_rows = 4;
 
-        dashboard.scroll_by(100);
-        assert_eq!(dashboard.scroll, 2);
-        dashboard.scroll_by(-100);
-        assert_eq!(dashboard.scroll, 0);
+        dashboard.select_by(-1);
+        let top = screen(&mut dashboard, 100, 20);
+        assert!(lists(&top, "0x028701"), "{top}");
+
+        dashboard.select_by(100);
+        let bottom = screen(&mut dashboard, 100, 20);
+        assert!(
+            lists(&bottom, "0x028706"),
+            "the last device is not on screen: {bottom}"
+        );
+        assert!(
+            !lists(&bottom, "0x028701"),
+            "the list did not scroll: {bottom}"
+        );
+
+        dashboard.select_by(-1);
+        let one_up = screen(&mut dashboard, 100, 20);
+        assert!(
+            !lists(&one_up, "0x028701"),
+            "moving up dragged the window instead of the highlight: {one_up}"
+        );
+
+        dashboard.select_by(-100);
+        let again = screen(&mut dashboard, 100, 20);
+        assert!(lists(&again, "0x028701"), "{again}");
+    }
+
+    #[test]
+    fn a_pane_too_short_for_every_value_says_how_many_more() {
+        let mut dashboard = dashboard(10);
+        let now = SystemTime::now();
+        for (epc, raw) in [
+            (0xB1, &[0x41][..]),
+            (0xC3, &[0x42]),
+            (0xD1, &[0x28]),
+            (0xD3, &[0x28]),
+        ] {
+            dashboard.apply(change(
+                now,
+                "192.168.100.26",
+                Eoj::new(0x02, 0x6B, 0x01),
+                epc,
+                raw,
+            ));
+        }
+
+        let screen = screen(&mut dashboard, 100, 18);
+        assert!(screen.contains("… 2 more"), "{screen}");
+        assert!(screen.contains("0xC3"), "{screen}");
+        assert!(!screen.contains("0xD3"), "{screen}");
+    }
+
+    #[test]
+    fn a_device_discovered_later_does_not_move_the_selection() {
+        let mut dashboard = dashboard(10);
+        dashboard.apply(device("192.168.100.30", 0x02, 0x87, 0x01));
+        dashboard.select_by(1);
+        dashboard.apply(device("192.168.100.26", 0x02, 0x87, 0x01));
+
+        let screen = screen(&mut dashboard, 100, 30);
+        let title = pane_title(&screen);
+        assert!(
+            title.contains("0x028701 192.168.100.30"),
+            "the selection moved to the smaller IP: {screen}"
+        );
+    }
+
+    #[test]
+    fn an_epc_outside_the_mra_table_reads_as_unknown() {
+        let mut dashboard = dashboard(10);
+        dashboard.apply(change(
+            SystemTime::now(),
+            "192.168.100.26",
+            Eoj::new(0x02, 0x6B, 0x01),
+            0xC5,
+            &[0xFF],
+        ));
+
+        let screen = screen(&mut dashboard, 100, 30);
+        assert!(screen.contains("0xC5"), "{screen}");
+        assert!(screen.contains("(unknown)"), "{screen}");
+    }
+
+    #[test]
+    fn the_selected_row_is_reversed() {
+        for (width, height) in [(100, 30), (80, 24)] {
+            let mut dashboard = dashboard(10);
+            dashboard.apply(device("192.168.100.26", 0x02, 0x87, 0x01));
+            dashboard.apply(device("192.168.100.26", 0x02, 0x87, 0x02));
+
+            let buffer = buffer(&mut dashboard, width, height);
+            let row = |eoj: &str| {
+                buffer
+                    .content
+                    .chunks(usize::from(width))
+                    .find(|cells| {
+                        cells
+                            .iter()
+                            .map(BufferCell::symbol)
+                            .collect::<String>()
+                            .starts_with(&format!("│{eoj}"))
+                    })
+                    .unwrap_or_else(|| panic!("{width}x{height}: {eoj} is not rendered"))
+            };
+            let selected = row("0x028701");
+            let text: String = selected.iter().map(BufferCell::symbol).collect();
+            let border = text
+                .chars()
+                .skip(1)
+                .position(|symbol| symbol == '│')
+                .map_or_else(
+                    || panic!("{width}x{height}: no pane border in {text}"),
+                    |offset| offset + 1,
+                );
+            assert!(
+                selected[1..border]
+                    .iter()
+                    .all(|cell| cell.modifier.contains(Modifier::REVERSED)),
+                "{width}x{height}: the selected row is not reversed: {text}"
+            );
+            assert!(
+                row("0x028702")[1..border]
+                    .iter()
+                    .all(|cell| !cell.modifier.contains(Modifier::REVERSED)),
+                "{width}x{height}: an unselected row is reversed"
+            );
+        }
     }
 
     #[test]
@@ -1973,7 +2196,7 @@ mod tests {
             dashboard.sample(now);
 
             let screen = screen(&mut dashboard, width, height);
-            let mut needles = vec![
+            let needles = vec![
                 "0x028701",
                 "Devices",
                 "POWER",
@@ -1985,25 +2208,27 @@ mod tests {
                 "0x027901",
                 "0x027902",
             ];
-            if width == 100 {
-                // At 80 columns the 15-column POWER field clips the tail of
-                // KEY VALUES, where the heater's mode sits.
-                needles.push("Auto ON");
-            }
             for needle in needles {
                 assert!(
                     screen.contains(needle),
                     "{width}x{height} screen is missing {needle:?}: {screen}"
                 );
             }
-            let heater_row = screen
-                .split("0x026B01")
-                .nth(1)
-                .and_then(|tail| tail.split("0x027901").next())
-                .expect("the heater row is rendered");
             assert!(
-                heater_row.contains("--"),
+                screen
+                    .lines()
+                    .any(|line| line.contains("0x026B01") && line.contains("--")),
                 "{width}x{height}: the heater's power cell is missing: {screen}"
+            );
+            let b1 = screen
+                .lines()
+                // At 80 columns the 19-cell name column clips this 43-character
+                // name, so only its prefix is on screen.
+                .find(|line| line.contains("0xB1") && line.contains("Automatic water"))
+                .unwrap_or_else(|| panic!("{width}x{height}: the B1 row is missing: {screen}"));
+            assert!(
+                b1.contains("ON"),
+                "{width}x{height}: the B1 value is missing: {screen}"
             );
         }
     }
