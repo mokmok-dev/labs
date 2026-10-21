@@ -83,7 +83,7 @@ const SHARED_PORT_HINT: &str = "another process bound to port 3610 may have rece
     version
 )]
 struct Arguments {
-    /// IPv4 interface used for multicast membership.
+    /// IPv4 interface used for multicast membership and for unicast answers.
     #[arg(long, default_value = "0.0.0.0", value_name = "IP")]
     interface: Ipv4Addr,
     /// Poll device properties. A terminal shows the dashboard; piped output
@@ -219,6 +219,9 @@ async fn run(arguments: Arguments) -> io::Result<()> {
         socket.multicast_addr(),
         arguments.interface
     );
+    if let Some(address) = socket.interface_addr() {
+        eprintln!("echonet-radar-cli: unicast answers on {address}");
+    }
 
     if output == Output::ActiveLog {
         eprintln!(

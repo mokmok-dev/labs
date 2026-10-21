@@ -26,11 +26,14 @@
 //! # }
 //! ```
 
+use std::future::poll_fn;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::task::{Context, Poll};
 
 use echonet_lite::frame::{Frame, FrameError, FrameHeader, Property, parse, write};
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
 /// Standard ECHONET Lite multicast group address.
@@ -47,6 +50,7 @@ pub const MAX_FRAME_LEN: usize = 256;
 #[derive(Debug)]
 pub struct EchoNetSocket {
     socket: UdpSocket,
+    interface: Option<UdpSocket>,
     multicast: SocketAddr,
 }
 
@@ -55,33 +59,46 @@ impl EchoNetSocket {
     ///
     /// `interface` is the local IPv4 address of the network interface to join
     /// the multicast group on. Pass [`Ipv4Addr::UNSPECIFIED`] to let the OS
-    /// choose.
+    /// choose, which also picks the address for the second bind from the route
+    /// to `group`.
+    ///
+    /// A second socket is bound to the interface address and the group's port
+    /// when the OS allows it, and [`Self::recv`] reads both. Devices answer the
+    /// standard port, and the kernel delivers those datagrams to a socket bound
+    /// to the interface address in preference to the wildcard bind. Listeners
+    /// that share the address through `SO_REUSEPORT` receive a share instead.
+    /// When the interface address cannot be bound, the socket still receives
+    /// multicast on the wildcard bind, and [`Self::interface_addr`] returns
+    /// `None`.
     ///
     /// # Errors
     ///
-    /// Returns an [`io::Error`] if the socket cannot be created, bound, or
-    /// joined to the multicast group.
+    /// Returns an [`io::Error`] if the wildcard socket cannot be created,
+    /// bound, or joined to the multicast group.
     pub async fn bind_multicast(
         group: SocketAddr,
         interface: Ipv4Addr,
     ) -> io::Result<Self> {
         let port = group.port();
         let group_v4 = ipv4_addr(&group)?;
-        let std_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        // SO_REUSEADDR allows the socket to share the multicast port with other
-        // ECHONET Lite applications. SO_REUSEPORT additionally guarantees that
-        // unicast datagrams to the bound port are delivered to this socket on
-        // platforms where the two behaviours are distinct (macOS/BSD).
-        std_socket.set_reuse_address(true)?;
-        std_socket.set_reuse_port(true)?;
-        std_socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
-        std_socket.join_multicast_v4(&group_v4, &interface)?;
-        std_socket.set_multicast_if_v4(&interface)?;
-        std_socket.set_nonblocking(true)?;
-        let std_socket: std::net::UdpSocket = std_socket.into();
-        let socket = UdpSocket::from_std(std_socket)?;
+        let socket = bind_shared(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))?;
+        socket.join_multicast_v4(&group_v4, &interface)?;
+        socket.set_multicast_if_v4(&interface)?;
+        let socket = UdpSocket::from_std(socket.into())?;
+
+        let address = if interface.is_unspecified() {
+            source_address(group)
+        } else {
+            Some(interface)
+        };
+        let interface_socket = address.and_then(|address| {
+            bind_shared(SocketAddr::from((address, port)))
+                .and_then(|socket| UdpSocket::from_std(socket.into()))
+                .ok()
+        });
         Ok(Self {
             socket,
+            interface: interface_socket,
             multicast: group,
         })
     }
@@ -119,6 +136,16 @@ impl EchoNetSocket {
         self.socket.local_addr()
     }
 
+    /// The address of the socket bound for unicast answers, when one could be
+    /// bound.
+    ///
+    /// This is the address the interface resolves to, which
+    /// [`Self::bind_multicast`] tries to bind on the group's port.
+    #[must_use]
+    pub fn interface_addr(&self) -> Option<SocketAddr> {
+        self.interface.as_ref()?.local_addr().ok()
+    }
+
     /// Send raw bytes to the multicast group.
     ///
     /// # Errors
@@ -153,7 +180,19 @@ impl EchoNetSocket {
         &self,
         buf: &mut [u8],
     ) -> io::Result<(usize, SocketAddr)> {
-        self.socket.recv_from(buf).await
+        let interface = self.interface.as_ref();
+        poll_fn(|context| match interface {
+            // Poll the interface socket first: a burst of multicast on the
+            // wildcard socket would otherwise keep unicast answers waiting.
+            Some(socket) => {
+                if let Poll::Ready(result) = poll_datagram(socket, context, &mut *buf) {
+                    return Poll::Ready(result);
+                }
+                poll_datagram(&self.socket, context, &mut *buf)
+            },
+            None => poll_datagram(&self.socket, context, &mut *buf),
+        })
+        .await
     }
 
     /// Encode a frame and send it to the multicast group.
@@ -202,6 +241,43 @@ impl EchoNetSocket {
         let (n, src) = self.recv(buf).await?;
         let frame = parse(&buf[..n]).map_err(to_io)?;
         Ok((frame, src))
+    }
+}
+
+fn poll_datagram(
+    socket: &UdpSocket,
+    context: &mut Context<'_>,
+    buf: &mut [u8],
+) -> Poll<io::Result<(usize, SocketAddr)>> {
+    let mut read_buf = ReadBuf::new(buf);
+    socket
+        .poll_recv_from(context, &mut read_buf)
+        .map(|result| result.map(|source| (read_buf.filled().len(), source)))
+}
+
+/// Bind a UDP socket that shares its port with other ECHONET Lite processes.
+///
+/// Both socket options are needed: `SO_REUSEADDR` lets a listener share the
+/// port, and `SO_REUSEPORT` lets several listeners bind the same address.
+fn bind_shared(address: SocketAddr) -> io::Result<Socket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.bind(&address.into())?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+/// The local address the OS routes `group` from, or `None` when it has no route.
+///
+/// Connecting a UDP socket sends nothing; it only asks the routing table which
+/// source address a datagram to `group` would carry.
+fn source_address(group: SocketAddr) -> Option<Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect(group).ok()?;
+    match socket.local_addr().ok()? {
+        SocketAddr::V4(address) if !address.ip().is_unspecified() => Some(*address.ip()),
+        _ => None,
     }
 }
 
@@ -258,6 +334,31 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn receives_unicast_on_the_interface_socket() {
+        let wildcard = bind_shared(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).unwrap();
+        let interface = bind_shared(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let port = interface.local_addr().unwrap().as_socket().unwrap().port();
+        let interface_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let radar = EchoNetSocket {
+            socket: UdpSocket::from_std(wildcard.into()).unwrap(),
+            interface: Some(UdpSocket::from_std(interface.into()).unwrap()),
+            multicast: SocketAddr::from((MULTICAST_GROUP, 0)),
+        };
+
+        let peer = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        peer.send_to(&sample_frame(1), interface_addr).unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, source) = tokio::time::timeout(Duration::from_secs(2), radar.recv(&mut buf))
+            .await
+            .expect("timed out waiting for unicast on the interface socket")
+            .unwrap();
+        assert_eq!(source.ip(), Ipv4Addr::LOCALHOST);
+        assert_eq!(&buf[..len], sample_frame(1).as_slice());
     }
 
     #[tokio::test]
