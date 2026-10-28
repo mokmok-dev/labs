@@ -1869,7 +1869,7 @@ mod tests {
 
         let plot = PowerPlot::build(&dashboard.samples);
         assert_eq!(plot.scale.limit, MIN_SCALE_LIMIT);
-        assert!(plot.runs.is_empty());
+        assert_eq!(plot.runs.len(), 0, "a missing reading draws no run");
     }
 
     #[test]
