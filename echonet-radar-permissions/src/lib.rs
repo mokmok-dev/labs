@@ -233,6 +233,30 @@ pub fn plan(request: &Request) -> Plan {
     )
 }
 
+/// Builds the remove plan for this host without running it.
+///
+/// A caller that must show the exact action before it runs uses this and then
+/// [`apply`], because [`remove`] builds and runs the plan in one step.
+#[must_use]
+pub fn plan_remove(request: &Request) -> Plan {
+    platform::plan(
+        HostOs::current(),
+        request,
+        &StdCommandRunner,
+        &HostFacts::system(),
+        Mode::Remove,
+    )
+}
+
+/// Whether a helper path passes the trusted-prefix and ownership checks.
+///
+/// The helper repeats this check before acting. A shell that only decides
+/// whether to offer an elevate button may call it without running anything.
+#[must_use]
+pub fn helper_trusted(path: &std::path::Path) -> bool {
+    platform::helper_trusted(path)
+}
+
 /// Runs the plan.
 ///
 /// # Errors
@@ -256,9 +280,6 @@ pub fn apply(plan: &Plan) -> Result<ApplyOutcome, ApplyError> {
 ///
 /// Same as [`apply`].
 pub fn remove(request: &Request) -> Result<ApplyOutcome, ApplyError> {
-    let os = HostOs::current();
-    let runner = StdCommandRunner;
-    let facts = HostFacts::system();
-    let plan = platform::plan(os, request, &runner, &facts, Mode::Remove);
-    platform::apply(os, &plan, &runner, platform::helper_trusted)
+    let plan = plan_remove(request);
+    apply(&plan)
 }
