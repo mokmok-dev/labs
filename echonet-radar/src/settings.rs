@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Write as _;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -172,7 +173,9 @@ pub fn save_to(
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    fs::write(&temporary, json)?;
+    let mut file = fs::File::create(&temporary)?;
+    file.write_all(&json)?;
+    file.sync_all()?;
     fs::rename(&temporary, path)
 }
 
