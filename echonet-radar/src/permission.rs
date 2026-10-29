@@ -66,6 +66,12 @@ trait System: Send + Sync {
         &self,
         request: &Request,
     ) -> Plan;
+    fn plan_remove(
+        &self,
+        request: &Request,
+    ) -> Plan {
+        self.plan(request)
+    }
     fn helper_trusted(
         &self,
         plan: &Plan,
@@ -95,6 +101,13 @@ impl System for HostSystem {
         request: &Request,
     ) -> Plan {
         echonet_radar_permissions::plan(request)
+    }
+
+    fn plan_remove(
+        &self,
+        request: &Request,
+    ) -> Plan {
+        echonet_radar_permissions::plan_remove(request)
     }
 
     fn helper_trusted(
@@ -127,6 +140,7 @@ impl System for HostSystem {
 enum Command {
     Check,
     Add,
+    PlanRemove,
     Remove,
     OpenSettings(&'static str),
 }
@@ -134,6 +148,7 @@ enum Command {
 enum Update {
     Report(Report),
     Plan(Plan, bool),
+    RemovePlan(Plan, bool),
     Outcome(Result<ApplyOutcome, ApplyError>),
 }
 
@@ -142,9 +157,11 @@ pub struct PermissionController {
     updates: Option<Receiver<Update>>,
     report: Option<Report>,
     plan: Option<Plan>,
+    remove_plan: Option<Plan>,
     outcome: Option<ApplyOutcome>,
     error: Option<ApplyError>,
     trusted: bool,
+    remove_trusted: bool,
 }
 
 impl PermissionController {
@@ -161,10 +178,14 @@ impl PermissionController {
             .name(String::from("permission"))
             .spawn(move || work(&*system, &request, &command_rx, &update_tx));
         match worker {
-            Ok(_detached) => Self {
-                commands: Some(commands),
-                updates: Some(updates),
-                ..Self::empty()
+            Ok(_detached) => {
+                let controller = Self {
+                    commands: Some(commands),
+                    updates: Some(updates),
+                    ..Self::empty()
+                };
+                controller.check_again();
+                controller
             },
             Err(error) => {
                 tracing::warn!(%error, "the permission worker did not start");
@@ -179,9 +200,11 @@ impl PermissionController {
             updates: None,
             report: None,
             plan: None,
+            remove_plan: None,
             outcome: None,
             error: None,
             trusted: false,
+            remove_trusted: false,
         }
     }
 
@@ -203,6 +226,10 @@ impl PermissionController {
                 Update::Plan(plan, trusted) => {
                     self.plan = Some(plan);
                     self.trusted = trusted;
+                },
+                Update::RemovePlan(plan, trusted) => {
+                    self.remove_plan = Some(plan);
+                    self.remove_trusted = trusted;
                 },
                 Update::Outcome(Ok(outcome)) => {
                     self.outcome = Some(outcome);
@@ -253,12 +280,20 @@ impl PermissionController {
         self.send(Command::Remove);
     }
 
-    /// The remove plan, built now so the confirmation can name the exact
-    /// action. Building a plan shells out to detect the backend but never
-    /// authenticates, so it is safe on the frame thread.
+    /// Ask the worker for the remove plan, so the confirmation can name the
+    /// exact action without spawning a process on the frame thread.
+    pub fn request_remove_plan(&self) {
+        self.send(Command::PlanRemove);
+    }
+
     #[must_use]
-    pub fn remove_plan() -> Plan {
-        echonet_radar_permissions::plan_remove(&request())
+    pub fn last_remove_plan(&self) -> Option<Plan> {
+        self.remove_plan.clone()
+    }
+
+    #[must_use]
+    pub const fn remove_trusted(&self) -> bool {
+        self.remove_trusted
     }
 
     pub fn open_firewall_settings(&self) {
@@ -317,6 +352,13 @@ fn work(
                     next = Some(Instant::now() + RECHECK_INTERVAL);
                 }
                 let _ = updates.send(Update::Outcome(result));
+            },
+            Command::PlanRemove => {
+                let plan = system.plan_remove(request);
+                let _ = updates.send(Update::RemovePlan(
+                    plan.clone(),
+                    system.helper_trusted(&plan),
+                ));
             },
             Command::Remove => {
                 let _ = updates.send(Update::Outcome(system.remove(request)));

@@ -33,6 +33,8 @@ pub struct Card<'a> {
     pub capability: Capability,
     pub report: Option<&'a Report>,
     pub plan: Option<&'a Plan>,
+    /// The plan the pending confirmation names; falls back to [`Self::plan`].
+    pub confirm_plan: Option<&'a Plan>,
     pub outcome: Option<ApplyOutcome>,
     pub error: Option<&'a ApplyError>,
     pub trusted: bool,
@@ -239,7 +241,8 @@ fn add_offered(
     card: &Card<'_>,
     verdict: Option<Verdict>,
 ) -> bool {
-    card.capability.can_add_rule
+    card.trusted
+        && card.capability.can_add_rule
         && matches!(
             verdict,
             Some(Verdict::RuleAbsent | Verdict::NotObservable { .. })
@@ -318,12 +321,18 @@ fn confirmation(
         Confirm::RemoveRule => ("Remove the firewall rule?", CardAction::RemoveRule),
     };
     ui.strong(question);
-    if let Some(plan) = card.plan {
+    if let Some(plan) = card.confirm_plan.or(card.plan) {
         ui.label(format!("Scope: {}", scope_text(plan.scope)));
         ui.label(format!("Runs: {}", describe_action(plan)));
     }
     ui.horizontal(|ui| {
-        if ui.button("Confirm").clicked() {
+        if ui
+            .add_enabled(
+                card.confirm_plan.or(card.plan).is_some(),
+                egui::Button::new("Confirm"),
+            )
+            .clicked()
+        {
             state.confirming = None;
             *action = accepted;
         }
@@ -435,6 +444,7 @@ mod tests {
                 capability: self.capability,
                 report: Some(&self.report),
                 plan: Some(&self.plan),
+                confirm_plan: Some(&self.plan),
                 outcome: self.outcome,
                 error: self.error.as_ref(),
                 trusted: self.trusted,

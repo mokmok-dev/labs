@@ -7,7 +7,7 @@ use echonet_radar_core::{
     CommandError, Fault, ObjectKey, Pulse, RadarHandle, RadarSession, RadarSnapshot, SessionConfig,
     SessionStatus,
 };
-use echonet_radar_permissions::{ApplyError, ApplyOutcome, Plan, Report, Verdict};
+use echonet_radar_permissions::{ApplyError, ApplyOutcome, Plan, PlanAction, Report, Verdict};
 
 use crate::chart;
 use crate::net::{self, Interface};
@@ -92,6 +92,7 @@ pub struct RadarApp {
     trusted_helper: bool,
     card_state: CardState,
     permission_open: bool,
+    pending: Option<Confirm>,
     ctx: egui::Context,
 }
 
@@ -142,6 +143,7 @@ impl RadarApp {
             trusted_helper: false,
             card_state: CardState::default(),
             permission_open: false,
+            pending: None,
             ctx,
         }
     }
@@ -213,7 +215,8 @@ impl RadarApp {
             host: Host::current(),
             capability: echonet_radar_permissions::capability(),
             report: self.report.as_ref(),
-            plan: confirmed_plan,
+            plan: self.plan.as_ref(),
+            confirm_plan: confirmed_plan,
             outcome: self.outcome,
             error: self.permission_error.as_ref(),
             trusted: self.trusted_helper,
@@ -258,13 +261,17 @@ impl RadarApp {
 
         self.act_on_card(card_action);
         if settings_actions.add_rule {
-            self.permission_open = true;
-            self.card_state.confirming = Some(Confirm::AddRule);
+            if self.plan.is_some() && self.trusted_helper {
+                self.permission_open = true;
+                self.card_state.confirming = Some(Confirm::AddRule);
+            } else {
+                self.pending = Some(Confirm::AddRule);
+                self.permissions.check_again();
+            }
         }
         if settings_actions.remove_rule {
-            self.remove_plan = Some(PermissionController::remove_plan());
-            self.permission_open = true;
-            self.card_state.confirming = Some(Confirm::RemoveRule);
+            self.pending = Some(Confirm::RemoveRule);
+            self.permissions.request_remove_plan();
         }
     }
 
@@ -285,6 +292,30 @@ impl RadarApp {
         self.outcome = self.permissions.last_outcome();
         self.permission_error = self.permissions.last_error();
         self.trusted_helper = self.permissions.helper_trusted();
+
+        match self.pending {
+            Some(Confirm::RemoveRule) => {
+                if let Some(plan) = self.permissions.last_remove_plan() {
+                    self.pending = None;
+                    if matches!(plan.action, PlanAction::RunHelper { .. })
+                        && self.permissions.remove_trusted()
+                    {
+                        self.remove_plan = Some(plan);
+                        self.permission_open = true;
+                        self.card_state.confirming = Some(Confirm::RemoveRule);
+                    } else {
+                        self.notice = Some(format!("Remove the rule by hand: {}", plan.manual));
+                        self.remove_plan = None;
+                    }
+                }
+            },
+            Some(Confirm::AddRule) if self.plan.is_some() && self.trusted_helper => {
+                self.pending = None;
+                self.permission_open = true;
+                self.card_state.confirming = Some(Confirm::AddRule);
+            },
+            Some(Confirm::AddRule) | None => {},
+        }
         if self.card_state.confirming != Some(Confirm::RemoveRule) {
             self.remove_plan = None;
         }

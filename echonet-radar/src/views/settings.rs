@@ -84,7 +84,8 @@ fn firewall(
         ui.label(format!("Plan: {}", scope_text(plan.scope)));
         ui.label(format!("Command: {}", describe_action(plan)));
     }
-    let addable = card.capability.can_add_rule
+    let addable = card.trusted
+        && card.capability.can_add_rule
         && card
             .plan
             .is_some_and(|plan| !matches!(plan.action, PlanAction::Manual));
@@ -160,6 +161,7 @@ mod tests {
                 },
                 report: Some(&self.report),
                 plan: Some(&self.plan),
+                confirm_plan: None,
                 outcome: None,
                 error: None,
                 trusted: true,
