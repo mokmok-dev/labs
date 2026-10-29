@@ -1,6 +1,13 @@
 fn main() {
     #[cfg(windows)]
     {
-        embed_resource::compile("helper.manifest", embed_resource::NONE);
+        let embedded =
+            embed_resource::compile("helper.manifest", embed_resource::NONE).manifest_required();
+        // Without the manifest the helper would start unelevated and fail on
+        // every firewall call, so a missing resource must fail the build.
+        if let Err(error) = embedded {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
     }
 }
