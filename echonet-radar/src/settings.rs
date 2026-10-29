@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use directories::ProjectDirs;
-use echonet_radar_core::{DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, ObjectKey};
+use echonet_radar_core::{DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, Eoj, ObjectKey};
 use serde::{Deserialize, Serialize};
 
 /// The schema this build reads and writes.
@@ -258,12 +258,7 @@ impl DiskSettings {
 
 fn selected_from_disk(disk: &DiskSelected) -> Option<ObjectKey> {
     let ip = disk.ip.parse::<Ipv4Addr>().ok()?;
-    // Core exposes the frame EOJ type only through its instance-list parser,
-    // which expects a count byte; the app may not depend on `echonet-lite`.
-    let eoj = echonet_radar_core::parse_instance_list(&[1, disk.eoj[0], disk.eoj[1], disk.eoj[2]])
-        .ok()?
-        .into_iter()
-        .next()?;
+    let eoj = Eoj::new(disk.eoj[0], disk.eoj[1], disk.eoj[2]);
     Some(ObjectKey { ip, eoj })
 }
 
@@ -302,12 +297,10 @@ mod tests {
 
     fn selected() -> ObjectKey {
         let ip = Ipv4Addr::new(192, 168, 1, 20);
-        let eoj = echonet_radar_core::parse_instance_list(&[1, 0x02, 0x87, 0x01])
-            .expect("valid EOJ")
-            .into_iter()
-            .next()
-            .expect("one EOJ");
-        ObjectKey { ip, eoj }
+        ObjectKey {
+            ip,
+            eoj: Eoj::new(0x02, 0x87, 0x01),
+        }
     }
 
     #[test]
