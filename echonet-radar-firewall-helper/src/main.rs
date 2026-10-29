@@ -1,3 +1,4 @@
+#[cfg(any(target_os = "linux", windows))]
 mod exit;
 
 #[cfg(any(target_os = "linux", windows))]
@@ -34,5 +35,6 @@ fn run(args: &[OsString]) -> u8 {
 #[cfg(not(any(target_os = "linux", windows)))]
 fn run(_args: &[OsString]) -> u8 {
     eprintln!("error: the firewall helper runs on Linux and Windows only");
-    exit::Exit::Failed.code()
+    // `Exit::Failed` maps to 1; the exit module is Linux/Windows-only.
+    1
 }
