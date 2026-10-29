@@ -26,7 +26,7 @@ mod tests {
         let helper = Path::new("/nix/store/0123-echonet-radar/bin/echonet-radar-firewall-helper");
         assert_eq!(
             sibling_target(helper).unwrap(),
-            Path::new("/nix/store/0123-echonet-radar/bin/echonet-radar")
+            Path::new("/nix/store/0123-echonet-radar/bin").join(TARGET_NAME)
         );
     }
 
@@ -35,8 +35,16 @@ mod tests {
         let helper = Path::new("/nix/store/x y'z/bin/echonet-radar-firewall-helper");
         assert_eq!(
             sibling_target(helper).unwrap(),
-            Path::new("/nix/store/x y'z/bin/echonet-radar")
+            Path::new("/nix/store/x y'z/bin").join(TARGET_NAME)
         );
+    }
+
+    #[test]
+    fn names_the_target_the_host_links() {
+        #[cfg(windows)]
+        assert_eq!(TARGET_NAME, "echonet-radar.exe");
+        #[cfg(not(windows))]
+        assert_eq!(TARGET_NAME, "echonet-radar");
     }
 
     #[test]
