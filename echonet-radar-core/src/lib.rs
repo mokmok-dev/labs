@@ -16,10 +16,16 @@
 //! round.
 
 mod format;
+mod model;
 mod protocol;
 mod service;
 
 pub use format::{format_edt, format_value, instantaneous_watts, power_epc};
+pub use model::{
+    ChangeEvent, ChangeRecord, ConfigError, DeviceEvent, Fault, Notice, ObjectKey, ObjectSnapshot,
+    Observation, Projection, PropertySnapshot, RadarEvent, RadarModel, RadarSnapshot, SeenEvent,
+    SessionStatus,
+};
 pub use protocol::{
     CONTROLLER_CLASS_CODE, CONTROLLER_EOJ, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL,
     DISCOVERY_EPC, DISCOVERY_NODE_PROFILE_EOJ, GET_ESV_CODE, GET_PROPERTY_MAP_EPC,
@@ -27,7 +33,4 @@ pub use protocol::{
     NODE_PROFILE_CLASS_CODE, ProtocolError, discovery_header, get_header, parse_instance_list,
     parse_property_map,
 };
-pub use service::{
-    ChangeEvent, Command, ConfigError, DeviceEvent, DeviceKey, RadarConfig, RadarEvent, SeenEvent,
-    run_service,
-};
+pub use service::{Command, RadarConfig, run_service};
