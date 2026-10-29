@@ -16,6 +16,6 @@ pub mod ecodec;
 pub mod frame;
 
 pub use ecodec::{
-    Access, DataKind, DecodeError, Decoded, EdtValue, Eoj, PropertyInfo, StateVariant, decode,
-    decode_eoj, decode_with, lookup,
+    Access, DataKind, DecodeError, Decoded, EdtValue, Eoj, PropertyInfo, StateVariant, class_name,
+    decode, decode_eoj, decode_with, lookup,
 };
