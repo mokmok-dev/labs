@@ -50,10 +50,25 @@ pub struct Capability {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Request {
-    /// The app path, used for the Windows read-back only.
+    /// The app path. The helper is its sibling on Linux and Windows, and the
+    /// Windows read-back compares this path against the rule's program filter.
     pub target: PathBuf,
     pub port: u16,
     pub profiles: Profiles,
+}
+
+impl Request {
+    #[must_use]
+    pub fn new(
+        target: PathBuf,
+        port: u16,
+    ) -> Self {
+        Self {
+            target,
+            port,
+            profiles: Profiles::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -101,7 +116,11 @@ pub enum Method {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BackendState {
-    Running { permanent: Option<bool> },
+    Running {
+        /// `Some(true)` when the rule is also in the permanent configuration;
+        /// `None` when the backend does not expose that.
+        permanent: Option<bool>,
+    },
     Inactive,
     Absent,
     NotObservable,
@@ -241,6 +260,9 @@ pub fn helper_trusted(path: &std::path::Path) -> bool {
     platform::helper_trusted(path)
 }
 
+/// Runs the plan. Blocks for as long as the OS prompt stays open, so call it
+/// off the UI thread.
+///
 /// # Errors
 ///
 /// [`ApplyError::UntrustedHelper`] when a Linux helper fails the trusted-prefix,
@@ -256,6 +278,8 @@ pub fn apply(plan: &Plan) -> Result<ApplyOutcome, ApplyError> {
     )
 }
 
+/// Builds the remove plan for this host and runs it. Blocks like [`apply`].
+///
 /// # Errors
 ///
 /// [`ApplyError::UntrustedHelper`] when a Linux helper fails the trusted-prefix,

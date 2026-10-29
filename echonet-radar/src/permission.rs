@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use echonet_radar_permissions::{
     ApplyError, ApplyOutcome, ECHONET_PORT, MACOS_FIREWALL_SETTINGS_URL,
-    MACOS_LOCAL_NETWORK_SETTINGS_URL, Plan, PlanAction, Profiles, Report, Request, Scope,
+    MACOS_LOCAL_NETWORK_SETTINGS_URL, Plan, PlanAction, Report, Request, Scope,
 };
 
 const RECHECK_COUNT: u32 = 5;
@@ -40,11 +40,7 @@ impl Host {
 
 #[must_use]
 pub fn request() -> Request {
-    Request {
-        target: current_exe(),
-        port: ECHONET_PORT,
-        profiles: Profiles::default(),
-    }
+    Request::new(current_exe(), ECHONET_PORT)
 }
 
 fn current_exe() -> PathBuf {
@@ -395,7 +391,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::SystemTime;
 
-    use echonet_radar_permissions::{Method, Verdict};
+    use echonet_radar_permissions::{Method, Profiles, Verdict};
 
     use super::*;
 
