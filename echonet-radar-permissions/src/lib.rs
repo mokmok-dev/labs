@@ -256,6 +256,12 @@ pub fn apply(plan: &Plan) -> Result<ApplyOutcome, ApplyError> {
     )
 }
 
+/// # Errors
+///
+/// [`ApplyError::UntrustedHelper`] when a Linux helper fails the trusted-prefix,
+/// owner or write-permission checks, [`ApplyError::NotFound`] when the helper or
+/// the elevation tool is missing, [`ApplyError::NotAuthorized`] when polkit
+/// refuses, and [`ApplyError::Failed`] for every other nonzero exit.
 pub fn remove(request: &Request) -> Result<ApplyOutcome, ApplyError> {
     let plan = plan_remove(request);
     apply(&plan)

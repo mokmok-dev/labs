@@ -91,6 +91,12 @@ pub const fn get_header(
     }
 }
 
+/// # Errors
+///
+/// [`ProtocolError::MissingCount`] when the count byte is absent,
+/// [`ProtocolError::TooManyInstances`] above the MRA limit, and
+/// [`ProtocolError::InvalidInstanceListLength`] when the length disagrees with
+/// the count.
 pub fn parse_instance_list(edt: &[u8]) -> Result<Vec<Eoj>, ProtocolError> {
     let count = edt.first().copied().ok_or(ProtocolError::MissingCount)?;
     let count = usize::from(count);
@@ -111,6 +117,12 @@ pub fn parse_instance_list(edt: &[u8]) -> Result<Vec<Eoj>, ProtocolError> {
 
 /// A count of 15 or less uses the compact EPC-list representation; larger
 /// counts use the 16-byte bitmap covering EPC `0x80..=0xFF`.
+///
+/// # Errors
+///
+/// [`ProtocolError::MissingCount`] when the count byte is absent, and
+/// [`ProtocolError::InvalidPropertyMapLength`] or
+/// [`ProtocolError::InvalidPropertyMapCount`] when the body disagrees with it.
 pub fn parse_property_map(edt: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     let count = edt.first().copied().ok_or(ProtocolError::MissingCount)?;
     let count = usize::from(count);
