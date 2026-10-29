@@ -269,8 +269,6 @@ async fn run_active(
     // service treats it as a stop request and exits immediately.
     let (_commands, command_receiver) = tokio::sync::mpsc::channel(8);
     let (_shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
-    // The line modes render the event projection, so nothing reads this channel;
-    // the seed only fixes the session id the service publishes under.
     let (snapshots, _snapshots) =
         tokio::sync::watch::channel(Arc::new(RadarModel::new(0).snapshot()));
     let io = ServiceIo {

@@ -1,5 +1,3 @@
-//! The discovery, polling and INF-watching state behind the service loop.
-
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -21,12 +19,9 @@ use crate::session::SessionConfig;
 
 const VALUE_BATCH_SIZE: usize = 8;
 
-/// A command sent from a shell to the radar service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    /// Send value GETs to all known device objects immediately.
     PollNow,
-    /// Send a discovery request without moving the scheduled round.
     Rediscover,
 }
 
@@ -104,7 +99,6 @@ impl ServiceState {
         }
     }
 
-    /// Count a datagram the service accepted, before parsing it.
     pub const fn record_frame(
         &mut self,
         at: SystemTime,
@@ -113,12 +107,10 @@ impl ServiceState {
         self.dirty = true;
     }
 
-    /// Whether anything changed since the last call.
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
     }
 
-    /// Expire unanswered requests, then send one discovery GET.
     pub async fn discover(
         &mut self,
         socket: &EchoNetSocket,
@@ -334,8 +326,6 @@ impl ServiceState {
             && properties.iter().any(|(epc, _)| *epc == DISCOVERY_EPC)
     }
 
-    /// Track a device object for polling if it is not known yet, announcing it
-    /// as [`RadarEvent::Device`]. Returns whether the object was new.
     fn register_device(
         &mut self,
         source: SocketAddr,
@@ -450,7 +440,6 @@ impl ServiceState {
         let Ok(parsed) = parse_property_map(edt) else {
             return;
         };
-        // Poll only the properties that can actually be read with a Get.
         let class_code = key.eoj.class_code();
         let mut poll_epcs: Vec<u8> = parsed
             .into_iter()
@@ -513,7 +502,6 @@ impl ServiceState {
         }
         let class_code = header.seoj.class_code();
         for (epc, edt) in properties {
-            // Draw a state change only for values the class may announce via INF.
             if can_inf(class_code, epc) && !edt.is_empty() {
                 self.record_value(key, epc, &edt, source);
             }
@@ -521,8 +509,6 @@ impl ServiceState {
         self.send_seen(key, source);
     }
 
-    /// Record a property EDT, emitting a [`RadarEvent::Change`] when it differs
-    /// from the last known value for the device object.
     fn record_value(
         &mut self,
         key: ObjectKey,
@@ -589,7 +575,6 @@ fn fallback_poll_epcs(class_code: u16) -> Vec<u8> {
         .collect()
 }
 
-/// Whether a property can be read with a Get request per the appendix.
 fn can_get(
     class_code: u16,
     epc: u8,
@@ -598,7 +583,6 @@ fn can_get(
         .is_some_and(|info| matches!(info.get, Access::Required | Access::Optional))
 }
 
-/// Whether a device may push an INF telegram for a property per the appendix.
 fn can_inf(
     class_code: u16,
     epc: u8,
@@ -673,7 +657,6 @@ mod tests {
         let (mut service, receiver) = service();
         let key = air_conditioner("127.0.0.1:3610".parse().unwrap());
 
-        // First observation is a change.
         service.record_value(key, 0x80, &[0x30], key.listen_address());
         let RadarEvent::Change(first) = receiver.recv().unwrap() else {
             panic!("expected a change event");
@@ -681,11 +664,9 @@ mod tests {
         assert_eq!(first.epc, 0x80);
         assert_eq!(first.text, "Operation status ON");
 
-        // An identical value is not reported again.
         service.record_value(key, 0x80, &[0x30], key.listen_address());
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
 
-        // A different value is reported.
         service.record_value(key, 0x80, &[0x31], key.listen_address());
         let RadarEvent::Change(second) = receiver.recv().unwrap() else {
             panic!("expected a change event");
@@ -703,7 +684,6 @@ mod tests {
         assert!(is_change(&receiver.recv().unwrap()));
         assert!(is_change(&receiver.recv().unwrap()));
 
-        // Changing one EPC does not re-report the other.
         service.record_value(key, 0x80, &[0x31], key.listen_address());
         let RadarEvent::Change(changed) = receiver.recv().unwrap() else {
             panic!("expected a change event");
@@ -770,7 +750,6 @@ mod tests {
         assert_eq!(change.eoj, Eoj::new(0x01, 0x30, 0x01));
         assert_eq!(change.epc, 0x80);
         assert_eq!(change.text, "Operation status ON");
-        // INF-sourced devices become polling targets.
         assert!(service.poll_epcs.contains_key(&air_conditioner(source)));
     }
 
@@ -781,7 +760,6 @@ mod tests {
         let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
         let key = air_conditioner(source);
 
-        // Discover the device object.
         service
             .process_frame(
                 &socket,
@@ -795,7 +773,6 @@ mod tests {
                 source,
             )
             .await;
-        // Answer the pending property-map request.
         let map_tid = service
             .pending
             .iter()
@@ -817,7 +794,6 @@ mod tests {
                 source,
             )
             .await;
-        // The first discovery triggers an immediate value poll; answer it.
         let value_tid = service
             .pending
             .iter()
@@ -898,8 +874,6 @@ mod tests {
             )
             .await;
 
-        // Otherwise polling keeps the fallback list rather than the device's
-        // Get-able set.
         assert!(
             service
                 .pending
@@ -912,7 +886,6 @@ mod tests {
     fn property_map_is_filtered_to_get_able_values() {
         let (mut service, _receiver) = service();
         let key = air_conditioner("127.0.0.1:3610".parse().unwrap());
-        // 0x80 is Get-able; 0xD0 (Buzzer) is Set-only and not readable.
         service.process_property_map(key, &[(0x9F, vec![2, 0x80, 0xD0])]);
         assert_eq!(
             service.poll_epcs.get(&key).map(Vec::as_slice),
@@ -939,7 +912,6 @@ mod tests {
         let socket = test_socket().await;
         let (mut service, receiver) = service();
         let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
-        // 0xD0 (Buzzer) is not announced via INF on an air conditioner.
         service
             .process_frame(
                 &socket,
@@ -960,8 +932,6 @@ mod tests {
 
     #[test]
     fn requests_go_to_the_standard_port_not_the_sender_port() {
-        // The air conditioner on this LAN answers from an ephemeral port; it
-        // listens on the standard one, where requests must go.
         let key = object(
             "192.0.2.1:49153".parse().unwrap(),
             Eoj::new(0x01, 0x30, 0x01),
@@ -981,8 +951,6 @@ mod tests {
         let (mut service, receiver) = service();
         let source: SocketAddr = "192.0.2.13:3610".parse().unwrap();
 
-        // The Remo E and the controller under development both announce a
-        // single controller instance and no appliance.
         service
             .process_frame(
                 &socket,
@@ -1018,9 +986,6 @@ mod tests {
         let (mut service, receiver) = service();
         let source: SocketAddr = "192.0.2.9:3610".parse().unwrap();
 
-        // A reply shaped like an instance list but with a TID this service
-        // never allocated (a slow reply to a long-forgotten round, or another
-        // controller's discovery) must still register the device.
         service
             .process_frame(
                 &socket,
@@ -1040,7 +1005,6 @@ mod tests {
         };
         assert_eq!(device.source.ip(), source.ip());
         assert_eq!(device.eoj, Eoj::new(0x01, 0x30, 0x01));
-        // Exactly one device announcement; the rest are status updates.
         let extra_devices = std::iter::from_fn(|| receiver.try_recv().ok())
             .filter(|event| matches!(event, RadarEvent::Device(_)))
             .count();
@@ -1050,9 +1014,6 @@ mod tests {
 
     #[tokio::test]
     async fn controller_and_node_profile_instances_are_not_devices() {
-        // A controller node announces its node profile and its controller
-        // instance beside the appliances it drives; only the appliances hold
-        // state this radar polls.
         let socket = test_socket().await;
         let (mut service, receiver) = service();
         let source: SocketAddr = "192.0.2.11:3610".parse().unwrap();

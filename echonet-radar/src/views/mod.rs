@@ -1,5 +1,3 @@
-//! The screens and the formatting shared between them.
-
 pub mod devices;
 pub mod permission;
 pub mod properties;
@@ -15,7 +13,6 @@ use crate::net::Interface;
 use crate::readiness::Freshness;
 use crate::settings::InterfaceChoice;
 
-/// The picker the start card and the settings view both show.
 pub fn interface_picker(
     ui: &mut egui::Ui,
     choice: &mut InterfaceChoice,
@@ -41,7 +38,6 @@ pub fn interface_picker(
         .response
 }
 
-/// An EOJ as the device list and the property pane print it.
 #[must_use]
 pub fn format_eoj(key: ObjectKey) -> String {
     format!(
@@ -50,7 +46,6 @@ pub fn format_eoj(key: ObjectKey) -> String {
     )
 }
 
-/// A coarse age a person can read at a glance.
 #[must_use]
 pub fn format_age(
     now: SystemTime,
@@ -66,7 +61,6 @@ pub fn format_age(
     }
 }
 
-/// Text that mutes as a device ages.
 #[must_use]
 pub fn aged_text(
     ui: &egui::Ui,

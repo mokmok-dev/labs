@@ -1,5 +1,3 @@
-//! The Linux path: firewalld or ufw, run as root by pkexec.
-
 use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;

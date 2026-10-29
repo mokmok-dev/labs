@@ -1,5 +1,3 @@
-//! Adds and removes the inbound firewall rule for the ECHONET Lite port.
-
 mod exit;
 
 #[cfg(any(target_os = "linux", windows))]

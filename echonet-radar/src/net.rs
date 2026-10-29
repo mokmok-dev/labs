@@ -1,22 +1,15 @@
-//! Interface enumeration and the name-to-address step at session start.
-
 use std::net::Ipv4Addr;
 
 use if_addrs::{IfAddr, Interface as IfAddrsInterface};
 
 use crate::settings::InterfaceChoice;
 
-/// One IPv4 interface the host offers.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Interface {
-    /// Operating-system name, such as `en0` or `br0`.
     pub name: String,
-    /// The interface's IPv4 address.
     pub addr: Ipv4Addr,
 }
 
-/// Every non-loopback IPv4 interface, sorted by name.
-///
 /// An enumeration failure yields an empty list: the picker then offers
 /// `Automatic` only, and a session can still start.
 #[must_use]
@@ -39,21 +32,10 @@ fn collect(interfaces: Vec<IfAddrsInterface>) -> Vec<Interface> {
     listed
 }
 
-/// Turn a stored choice into the address a session binds on.
-///
-/// # Errors
-///
-/// Returns the missing interface name when a `Named` choice no longer exists on
-/// the host.
 pub fn resolve(choice: &InterfaceChoice) -> Result<Ipv4Addr, String> {
     resolve_in(choice, &enumerate())
 }
 
-/// [`resolve`] against a list the caller already enumerated.
-///
-/// # Errors
-///
-/// Returns the missing interface name.
 pub fn resolve_in(
     choice: &InterfaceChoice,
     interfaces: &[Interface],

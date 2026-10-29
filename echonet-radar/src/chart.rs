@@ -1,5 +1,3 @@
-//! The power chart: one sample per second, symmetric about zero.
-//!
 //! `egui_plot` pairs with egui 0.36 or 0.38, never with the egui 0.37 of
 //! `eframe` 0.37, so the chart is drawn with egui primitives.
 
@@ -10,14 +8,11 @@ use echonet_radar_core::{RadarSnapshot, instantaneous_watts, power_epc};
 
 use crate::readiness::{Freshness, freshness};
 
-/// Samples the chart keeps, one per second.
 pub const CHART_CAPACITY: usize = 120;
 
 const METER_CLASS: u16 = 0x0288;
 const BOARD_CLASS: u16 = 0x0287;
 
-/// Append one sample and drop the oldest past [`CHART_CAPACITY`].
-///
 /// A meter that has missed three polls contributes a gap instead of a flat line
 /// at its last value, so a dead device cannot look like a steady reading.
 pub fn push_sample(
@@ -32,7 +27,6 @@ pub fn push_sample(
     }
 }
 
-/// Draw the series with buy above and sell below the zero line.
 pub fn draw(
     ui: &mut egui::Ui,
     series: &VecDeque<Option<i64>>,

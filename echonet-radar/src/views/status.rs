@@ -1,5 +1,3 @@
-//! The status bar: what the session is doing and the three commands.
-
 use std::time::SystemTime;
 
 use echonet_radar_core::RadarSnapshot;
@@ -8,7 +6,6 @@ use crate::app::AppActions;
 use crate::readiness::Readiness;
 use crate::views::format_age;
 
-/// Draw the session summary and record button clicks in `actions`.
 pub fn status_bar(
     ui: &mut egui::Ui,
     readiness: &Readiness,

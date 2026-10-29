@@ -1,15 +1,9 @@
-//! The four outcomes the helper reports to its caller.
-
 /// A run result, mapped to the process exit code the app reads back.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Exit {
-    /// The rule is in the requested state.
     Ok,
-    /// The tool refused or failed, or the install path is not trusted.
     Failed,
-    /// The command line matched no accepted shape.
     Usage,
-    /// The user dismissed the elevation prompt, or polkit denied it.
     Cancelled,
 }
 
@@ -24,7 +18,6 @@ impl Exit {
     }
 }
 
-/// A failed run and the single line the helper prints for it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Failure {
     pub exit: Exit,

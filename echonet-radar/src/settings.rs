@@ -1,5 +1,3 @@
-//! The settings file: interface choice, intervals and the selected device.
-//!
 //! eframe persists window geometry in its own store. This file owns everything
 //! else and is written before the window opens, because the interface choice is
 //! needed to build the session.
@@ -14,33 +12,22 @@ use directories::ProjectDirs;
 use echonet_radar_core::{DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, Eoj, ObjectKey};
 use serde::{Deserialize, Serialize};
 
-/// The schema this build reads and writes.
 pub const SETTINGS_SCHEMA: u32 = 1;
 
-/// Shortest discovery interval a hand-edited file may request.
 pub const MIN_DISCOVERY: Duration = Duration::from_secs(10);
 
-/// Longest discovery interval a hand-edited file may request.
 pub const MAX_DISCOVERY: Duration = Duration::from_secs(3600);
 
-/// Shortest value-poll interval a hand-edited file may request.
 pub const MIN_UPDATE: Duration = Duration::from_secs(5);
 
-/// Longest value-poll interval a hand-edited file may request.
 pub const MAX_UPDATE: Duration = Duration::from_secs(600);
 
-/// Everything the app persists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
-    /// File schema version.
     pub schema: u32,
-    /// Which interface the next session joins the multicast group on.
     pub interface: InterfaceChoice,
-    /// Interval between discovery requests.
     pub discovery_interval: Duration,
-    /// Interval between value-polling rounds.
     pub update_interval: Duration,
-    /// The device selected when the app last closed.
     pub selected: Option<ObjectKey>,
 }
 
@@ -48,14 +35,11 @@ pub struct Settings {
 /// a stale lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterfaceChoice {
-    /// Join the multicast group on every interface the host offers.
     Auto,
-    /// Join on the named interface.
     Named(String),
 }
 
 impl InterfaceChoice {
-    /// The text a picker shows for this choice.
     #[must_use]
     pub fn label(&self) -> String {
         match self {
@@ -77,8 +61,6 @@ impl Default for Settings {
     }
 }
 
-/// The settings file next to the app's data directory.
-///
 /// `None` when the host has no home directory; the app then keeps settings in
 /// memory for the run.
 #[must_use]
@@ -87,8 +69,6 @@ pub fn default_path() -> Option<PathBuf> {
         .map(|dirs| dirs.data_local_dir().join("settings.json"))
 }
 
-/// Load the settings from the default path.
-///
 /// Never fails: a missing, unreadable, corrupt or newer file yields defaults and
 /// a notice the app shows.
 #[must_use]
@@ -106,9 +86,6 @@ pub fn load() -> (Settings, Option<String>) {
     )
 }
 
-/// Load the settings from `path`.
-///
-/// Never fails, for the same reasons as [`load`].
 #[must_use]
 pub fn load_from(path: &Path) -> (Settings, Option<String>) {
     let text = match fs::read_to_string(path) {
@@ -178,12 +155,8 @@ pub fn load_from(path: &Path) -> (Settings, Option<String>) {
     (settings, notice)
 }
 
-/// Write the settings through a temporary file in the same directory.
-///
-/// # Errors
-///
-/// Returns the directory, write or rename error. A rename inside one directory
-/// is atomic, so a crash leaves either the old file or the new one.
+/// A rename inside one directory is atomic, so a crash leaves either the old
+/// file or the new one.
 pub fn save_to(
     path: &Path,
     settings: &Settings,

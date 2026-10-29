@@ -1,5 +1,3 @@
-//! Fake runner tests. No test here executes a system tool.
-
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -734,7 +732,6 @@ fn windows_one_rule_is_absent() {
 
 #[test]
 fn windows_single_object_shape_parses() {
-    // ConvertTo-Json renders a one-element array as a bare object.
     let stdout = json!({
         "rules": rule("EchonetRadarUdp3610Private", "Private", windows_program()),
         "profiles": { "name": "Private", "firewall_enabled": true },

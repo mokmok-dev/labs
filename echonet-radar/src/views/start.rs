@@ -1,12 +1,9 @@
-//! The first-run card: one interface choice and one button.
-
 use crate::app::{StartAction, StartFailure};
 use crate::net::Interface;
 use crate::readiness::describe_fault;
 use crate::settings::InterfaceChoice;
 use crate::views::interface_picker;
 
-/// Draw the card, recording a click in `action`.
 pub fn start_card(
     ui: &mut egui::Ui,
     interface: &mut InterfaceChoice,

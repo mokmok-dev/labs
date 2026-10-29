@@ -1,5 +1,3 @@
-//! Property value rendering: MRA decoding, the union table and power helpers.
-
 use std::fmt::Write as _;
 
 use echonet_lite::ecodec::{EdtValue, decode, lookup};
@@ -147,9 +145,6 @@ fn format_bytes(bytes: &[u8]) -> String {
 /// Numbers the generated MRA tables cannot express: the appendix defines these
 /// properties as `oneOf [number, sentinel state]`, and the codegen maps every
 /// union to `DataKind::Raw`.
-///
-/// A key item for a union property needs a row here, or a codegen change that
-/// emits the number arm with its range and sentinel.
 struct UnionNumber {
     class: u16,
     epc: u8,
@@ -216,7 +211,6 @@ enum UnionValue {
     Sentinel(&'static UnionNumber),
 }
 
-/// The EPC that reports instantaneous electric power for a class.
 #[must_use]
 pub const fn power_epc(class_code: u16) -> Option<u8> {
     match class_code {
@@ -355,7 +349,6 @@ mod tests {
 
     #[test]
     fn format_edt_prepends_the_property_name() {
-        // 0x80 on an air conditioner is "Operation status" with state ON/OFF.
         assert_eq!(format_edt(0x0130, 0x80, &[0x30]), "Operation status ON");
         assert_eq!(
             format_edt(0x0130, 0xBB, &[0x01, 0x1E]),

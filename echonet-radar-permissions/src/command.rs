@@ -4,7 +4,6 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::process::Command;
 
-/// One finished command, with both streams captured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
     /// `None` when a signal terminated the process.
@@ -28,7 +27,6 @@ pub trait CommandRunner {
     ) -> io::Result<CommandOutput>;
 }
 
-/// The runner the app uses.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StdCommandRunner;
 

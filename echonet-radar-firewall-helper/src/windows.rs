@@ -1,8 +1,3 @@
-//! The Windows path: two Defender rules, added behind UAC.
-//!
-//! This module is compiled only on Windows and has not been run on a Windows
-//! host. The argv and status mapping mirror the Linux module's shape.
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 

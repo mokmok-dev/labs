@@ -1,12 +1,9 @@
-//! The read-only property pane for the selected device.
-
 use std::time::SystemTime;
 
 use echonet_radar_core::{ObjectKey, RadarSnapshot};
 
 use crate::views::{format_age, format_eoj};
 
-/// Draw one row per known property of `key`, or nothing when the device is gone.
 pub fn property_pane(
     ui: &mut egui::Ui,
     snapshot: &RadarSnapshot,

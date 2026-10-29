@@ -1,5 +1,3 @@
-//! ECHONET Lite wire format: frame headers, discovery parsing and property maps.
-
 use std::time::Duration;
 
 use echonet_lite::frame::{Eoj, Esv, FrameHeader};
@@ -43,18 +41,12 @@ pub const fn is_get_response_code(code: u8) -> bool {
     code == GET_RESPONSE_ESV_CODE || code == GET_RESPONSE_WITH_STATUS_ESV_CODE
 }
 
-/// Errors found in variable-length ECHONET Lite property data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolError {
-    /// The EDT did not contain its leading count byte.
     MissingCount,
-    /// The number of EOJs exceeded the MRA limit.
     TooManyInstances,
-    /// The EDT length did not match its leading count.
     InvalidInstanceListLength,
-    /// The property-map EDT length was not valid for its encoding.
     InvalidPropertyMapLength,
-    /// The property-map count did not match its bitmap contents.
     InvalidPropertyMapCount,
 }
 
@@ -76,20 +68,16 @@ impl std::fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// Build the standard D6 discovery GET request header.
 #[must_use]
 pub const fn discovery_header(tid: u16) -> FrameHeader {
     FrameHeader {
         tid,
         seoj: CONTROLLER_EOJ,
         deoj: DISCOVERY_NODE_PROFILE_EOJ,
-        // The existing low-level enum predates the standard ESV names. Keep
-        // the application wire-compatible without changing that public API.
         esv: Esv::Unknown(GET_ESV_CODE),
     }
 }
 
-/// Build a standard GET request header for a device object.
 #[must_use]
 pub const fn get_header(
     tid: u16,
@@ -103,11 +91,6 @@ pub const fn get_header(
     }
 }
 
-/// Decode a D6 self-node instance-list EDT into device EOJs.
-///
-/// # Errors
-///
-/// Returns a [`ProtocolError`] when the count or byte length is inconsistent.
 pub fn parse_instance_list(edt: &[u8]) -> Result<Vec<Eoj>, ProtocolError> {
     let count = edt.first().copied().ok_or(ProtocolError::MissingCount)?;
     let count = usize::from(count);
@@ -126,14 +109,8 @@ pub fn parse_instance_list(edt: &[u8]) -> Result<Vec<Eoj>, ProtocolError> {
         .collect())
 }
 
-/// Decode an ECHONET Lite property map into EPC bytes.
-///
 /// A count of 15 or less uses the compact EPC-list representation; larger
 /// counts use the 16-byte bitmap covering EPC `0x80..=0xFF`.
-///
-/// # Errors
-///
-/// Returns a [`ProtocolError`] when the representation is malformed.
 pub fn parse_property_map(edt: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     let count = edt.first().copied().ok_or(ProtocolError::MissingCount)?;
     let count = usize::from(count);

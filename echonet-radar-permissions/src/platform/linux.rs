@@ -21,7 +21,6 @@ const UFW_INACTIVE_STEPS: &str = "ufw is installed but inactive. Enable it and a
 const NO_BACKEND_STEPS: &str = "No firewalld or ufw was found. Open UDP 3610 for inbound traffic \
                                 in whatever firewall this machine runs (nftables, iptables, ...).";
 
-/// What the host is, in the order the app probes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detection {
     Flatpak,

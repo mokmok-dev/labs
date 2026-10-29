@@ -1,5 +1,3 @@
-//! The radar session: one thread, one socket and the snapshots it publishes.
-
 use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,30 +16,20 @@ use crate::model::{
 use crate::protocol::{DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL};
 use crate::service::{Command, ServiceState};
 
-/// Commands a handle may queue before the channel reports `Busy`.
 const COMMAND_CAPACITY: usize = 8;
 
-/// The longest a publish timer idles before it is rearmed.
 const IDLE_PUBLISH: Duration = Duration::from_hours(24);
 
-/// Runtime configuration for one radar session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionConfig {
-    /// IPv4 interface used to join the ECHONET Lite multicast group.
     pub interface: Ipv4Addr,
-    /// Interval between D6 discovery requests.
     pub discovery_interval: Duration,
-    /// Interval between value polling rounds.
     pub update_interval: Duration,
-    /// Time an unanswered request keeps its transaction id.
     pub request_timeout: Duration,
-    /// Fastest cadence at which a changed model is published.
     pub snapshot_interval: Duration,
 }
 
 impl SessionConfig {
-    /// Desktop defaults: discovery every minute, values every 15 s, and a 10 Hz
-    /// snapshot cadence.
     #[must_use]
     pub const fn desktop() -> Self {
         Self {
@@ -78,11 +66,9 @@ impl SessionConfig {
 /// The trait keeps egui out of the core: the app implements it over a repaint
 /// request and the terminal uses [`NoopPulse`].
 pub trait Pulse: Send + Sync {
-    /// Ask the shell to render the newest snapshot.
     fn pulse(&self);
 }
 
-/// A pulse for callers with nothing to wake.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopPulse;
 
@@ -90,23 +76,17 @@ impl Pulse for NoopPulse {
     fn pulse(&self) {}
 }
 
-/// The channels and wake-up a running service writes to.
 pub struct ServiceIo {
-    /// Event projection for renderers that keep no state.
     pub events: Option<Sender<RadarEvent>>,
     /// Published snapshots. `send_replace` makes a receiver-less channel
     /// harmless.
     pub snapshots: watch::Sender<Arc<RadarSnapshot>>,
-    /// Signalled after every publish.
     pub pulse: Arc<dyn Pulse>,
 }
 
-/// Why a command did not reach the service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandError {
-    /// The service is no longer running.
     ServiceStopped,
-    /// The command queue is full.
     Busy,
 }
 
@@ -161,7 +141,6 @@ impl RadarSession {
         Self::spawn(config, Some(events), pulse)
     }
 
-    /// Whether the service thread is still running.
     #[must_use]
     pub fn alive(&self) -> bool {
         self.thread
@@ -242,7 +221,6 @@ impl Drop for RadarSession {
     }
 }
 
-/// The caller's side of a running session.
 pub struct RadarHandle {
     snapshots: watch::Receiver<Arc<RadarSnapshot>>,
     commands: mpsc::Sender<Command>,
@@ -261,7 +239,6 @@ impl RadarHandle {
         self.snapshots.borrow().revision != self.seen.get()
     }
 
-    /// The newest snapshot, marked as read.
     #[must_use]
     pub fn snapshot(&mut self) -> Arc<RadarSnapshot> {
         let snapshot = self.snapshots.borrow_and_update().clone();

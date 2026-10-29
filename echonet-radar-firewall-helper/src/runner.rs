@@ -1,5 +1,3 @@
-//! Runs one external command without a shell.
-
 use std::ffi::OsString;
 use std::io;
 use std::process::Command;
@@ -44,7 +42,6 @@ pub struct Output {
 }
 
 impl Output {
-    /// The tool's own words, for the diagnostics line.
     pub fn detail(&self) -> &str {
         let stderr = self.stderr.trim();
         if stderr.is_empty() {

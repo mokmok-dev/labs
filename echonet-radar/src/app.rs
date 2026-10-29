@@ -1,5 +1,3 @@
-//! The window: one session at a time, one immutable snapshot per frame.
-
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,55 +17,38 @@ use crate::settings::{self, InterfaceChoice, Settings};
 use crate::views;
 use crate::views::permission::{CardAction, CardState, Confirm};
 
-/// How long a settings change waits before it is written and acted on.
 const SETTINGS_DEBOUNCE: Duration = Duration::from_secs(1);
 
-/// What the app was given at launch.
 pub struct Startup {
-    /// The settings this run starts from.
     pub settings: Settings,
-    /// A notice from loading the settings, shown beside the session notices.
     pub notice: Option<String>,
-    /// Where settings are written; `None` keeps them in memory.
     pub path: Option<PathBuf>,
     /// The interface choice the file held, so a command-line override is not
     /// written back.
     pub stored_interface: InterfaceChoice,
-    /// The `--interface` name, when the run was given one.
     pub interface_override: Option<String>,
 }
 
-/// A click the start card reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartAction {
-    /// Nothing was clicked.
     #[default]
     None,
-    /// The user asked to bind and listen.
     Start,
 }
 
-/// Why a start attempt did not produce a running session.
 #[derive(Debug, Clone)]
 pub enum StartFailure {
-    /// A stored interface name is no longer present.
     InterfaceMissing(String),
-    /// The session rejected the configuration or could not bind.
     Fault(Fault),
 }
 
-/// Buttons the status bar reports.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppActions {
-    /// Ask the service for a value poll now.
     pub poll: bool,
-    /// Ask the service for a discovery request now.
     pub rediscover: bool,
-    /// Stop the session and start a new one.
     pub restart: bool,
 }
 
-/// The app-side [`Pulse`] over egui's repaint request.
 pub struct EguiPulse(egui::Context);
 
 impl Pulse for EguiPulse {
@@ -81,7 +62,6 @@ struct Running {
     handle: RadarHandle,
 }
 
-/// The window state.
 pub struct RadarApp {
     settings: Settings,
     settled: Settings,
@@ -386,8 +366,6 @@ impl RadarApp {
         }
     }
 
-    /// Clear a restored selection once discovery has shown the device is gone.
-    ///
     /// An empty snapshot says nothing yet: on a restart the first frames arrive
     /// before any device answers, and clearing there would make the stored
     /// selection useless.

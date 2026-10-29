@@ -1,5 +1,3 @@
-//! The accepted command lines, parsed into a typed request.
-
 use std::ffi::{OsStr, OsString};
 
 /// The helper carries no backend flag on Windows, where the Defender rules are
@@ -47,7 +45,6 @@ pub struct Request {
     pub backend: Backend,
 }
 
-/// A rejected command line, already carrying the usage line for its host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UsageError {
     pub detail: String,
@@ -64,7 +61,6 @@ impl UsageError {
     }
 }
 
-/// The fixed port, as the helper spells it on every command line.
 pub const PORT: &str = "3610";
 
 pub fn parse(

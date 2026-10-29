@@ -1,16 +1,3 @@
-//! ECHONET Radar: a read-only window over the ECHONET Lite LAN.
-//!
-//! The window opens on a start card. Clicking **Start listening** binds UDP
-//! 3610, sends one discovery request and shows the appliances that answer. The
-//! service owns the socket; the window reads immutable snapshots and sends
-//! commands only.
-//!
-//! ```text
-//! echonet-radar                      # open the window and pick an interface
-//! echonet-radar --interface br0      # use br0 for this run only
-//! echonet-radar --permission-inspect # print the firewall report as JSON
-//! ```
-
 mod app;
 mod chart;
 mod net;
@@ -33,7 +20,6 @@ use app::{RadarApp, Startup};
 use permission::PermissionController;
 use settings::InterfaceChoice;
 
-/// Command-line arguments.
 #[derive(Debug, Parser)]
 #[command(about = "Observe ECHONET Lite appliances in a window")]
 struct Args {
@@ -45,16 +31,10 @@ struct Args {
     permission_inspect: bool,
 }
 
-/// Where a run goes once the arguments are read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Launch {
-    /// Print the report and exit, before tracing, settings or the window.
     Inspect,
-    /// Open the window with this interface override.
-    Window {
-        /// The `--interface` name, for this run only.
-        interface: Option<String>,
-    },
+    Window { interface: Option<String> },
 }
 
 fn dispatch(args: Args) -> Launch {
@@ -104,7 +84,6 @@ fn main() -> eframe::Result {
     )
 }
 
-/// The `--permission-inspect` path: one report, JSON, no window.
 fn print_inspection() {
     let report = echonet_radar_permissions::inspect(&permission::request());
     match serde_json::to_string_pretty(&report) {

@@ -1,5 +1,3 @@
-//! Session readiness and per-device freshness.
-//!
 //! Readiness answers one question, whether the LAN path carries datagrams. The
 //! permission report is deliberately not an input: a firewall rule never proves
 //! that a frame arrived.
@@ -8,46 +6,30 @@ use std::time::{Duration, SystemTime};
 
 use echonet_radar_core::{Fault, RadarSnapshot, SessionStatus};
 
-/// Polls missed before a device's row is muted.
 pub const STALE_AFTER_POLLS: u32 = 3;
 
-/// Polls missed before a device is marked lost.
 pub const LOST_AFTER_POLLS: u32 = 5;
 
-/// What the session has proven so far.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Readiness {
-    /// The user has not started a session yet.
     NotStarted,
-    /// The service is binding its socket.
     Binding,
-    /// The socket is bound but no datagram has arrived.
     Unverified {
-        /// When the service started running.
         since: SystemTime,
     },
-    /// A datagram arrived, so the LAN path works.
     Listening {
-        /// When the service started running.
         since: SystemTime,
-        /// When the last datagram arrived.
         last: SystemTime,
-        /// Every datagram this session accepted.
         frames: u64,
     },
-    /// The service stopped after a fault.
     Degraded {
-        /// What stopped it.
         fault: Fault,
-        /// When the last datagram arrived, if any did.
         last_frame: Option<SystemTime>,
     },
-    /// The service stopped on request.
     Stopped,
 }
 
 impl Readiness {
-    /// A short status-bar sentence.
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
@@ -60,7 +42,6 @@ impl Readiness {
         }
     }
 
-    /// The last datagram time this state knows about.
     #[must_use]
     pub const fn last_frame(&self) -> Option<SystemTime> {
         match self {
@@ -71,22 +52,13 @@ impl Readiness {
     }
 }
 
-/// How a device's last answer relates to the configured poll interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freshness {
-    /// Answering within the poll cadence.
     Fresh,
-    /// Muted, three or more polls missed.
     Stale,
-    /// Five or more polls missed.
     Lost,
 }
 
-/// Derive readiness from the snapshot alone.
-///
-/// The previous state is accepted for call-site symmetry; the snapshot decides
-/// every field, which is what makes a second call with the same snapshot a
-/// no-op. `NotStarted` is the app's state before the first start.
 #[must_use]
 pub fn step(
     _state: &Readiness,
@@ -113,8 +85,6 @@ pub fn step(
     }
 }
 
-/// How stale a device observed at `last_seen` is at `now`.
-///
 /// A zero interval cannot happen through settings, which clamp at five seconds;
 /// it is treated as lost at any positive age so the function stays total.
 #[must_use]
@@ -141,7 +111,6 @@ pub fn freshness(
     }
 }
 
-/// What stopped a session, in one sentence.
 #[must_use]
 pub fn describe_fault(fault: &Fault) -> String {
     match fault {

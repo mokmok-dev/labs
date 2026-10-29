@@ -52,7 +52,6 @@ try {
 }
 ";
 
-/// The rule state the app can read.
 pub fn inspect(
     runner: &dyn CommandRunner,
     request: &Request,

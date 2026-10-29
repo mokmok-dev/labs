@@ -1,5 +1,3 @@
-//! The network-access card: one verdict, one action, and the proof traffic gives.
-
 use echonet_radar_permissions::{
     ApplyError, ApplyOutcome, BackendState, Capability, ECHONET_PORT, Plan, PlanAction, Report,
     Scope, Verdict,
@@ -7,41 +5,29 @@ use echonet_radar_permissions::{
 
 use crate::permission::Host;
 
-/// The apply the confirmation is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confirm {
     AddRule,
     RemoveRule,
 }
 
-/// A click the card reports.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CardAction {
-    /// Nothing was clicked.
     #[default]
     None,
-    /// Inspect the host again.
     CheckAgain,
-    /// The confirmation was accepted, so the rule may be added.
     AddRule,
-    /// The confirmation was accepted, so the rule may be removed.
     RemoveRule,
-    /// Open the macOS Firewall pane.
     OpenFirewallSettings,
-    /// Open the macOS Local Network pane.
     OpenLocalNetworkSettings,
-    /// Hide a card the status bar opened.
     Close,
 }
 
-/// The card's own click state, owned by the app.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CardState {
-    /// The apply waiting for its second click.
     pub confirming: Option<Confirm>,
 }
 
-/// Everything the card draws.
 pub struct Card<'a> {
     pub host: Host,
     pub capability: Capability,
@@ -49,13 +35,10 @@ pub struct Card<'a> {
     pub plan: Option<&'a Plan>,
     pub outcome: Option<ApplyOutcome>,
     pub error: Option<&'a ApplyError>,
-    /// Whether the last plan names a helper the app is willing to elevate.
     pub trusted: bool,
-    /// Whether the card was opened by hand and may be closed.
     pub closable: bool,
 }
 
-/// Draw the card and report the one click it received.
 pub fn permission_card(
     ui: &mut egui::Ui,
     card: &Card<'_>,
@@ -77,7 +60,6 @@ pub fn permission_card(
     action
 }
 
-/// The scope in the words the confirmation and the settings panel use.
 #[must_use]
 pub fn scope_text(scope: Scope) -> String {
     match scope {
@@ -87,7 +69,6 @@ pub fn scope_text(scope: Scope) -> String {
     }
 }
 
-/// The exact argv an action would run.
 #[must_use]
 pub fn describe_action(plan: &Plan) -> String {
     match &plan.action {
@@ -101,7 +82,6 @@ pub fn describe_action(plan: &Plan) -> String {
     }
 }
 
-/// A verdict in the one sentence the settings panel shows.
 #[must_use]
 pub const fn verdict_label(verdict: Verdict) -> &'static str {
     match verdict {
@@ -115,7 +95,6 @@ pub const fn verdict_label(verdict: Verdict) -> &'static str {
     }
 }
 
-/// What an apply or remove achieved, in one sentence.
 #[must_use]
 pub const fn outcome_text(outcome: ApplyOutcome) -> &'static str {
     match outcome {

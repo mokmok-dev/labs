@@ -23,18 +23,14 @@ pub use command::{CommandOutput, CommandRunner, StdCommandRunner};
 
 use platform::{HostFacts, HostOs, Mode};
 
-/// The one inbound UDP port this app opens.
 pub const ECHONET_PORT: u16 = 3610;
 
-/// The macOS Firewall pane.
 pub const MACOS_FIREWALL_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Firewall";
 
-/// The macOS Local Network pane, the second entry point on macOS 15 or later.
 pub const MACOS_LOCAL_NETWORK_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork";
 
-/// What a rule covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Scope {
     Application,
@@ -52,7 +48,6 @@ pub struct Capability {
     pub notes: &'static str,
 }
 
-/// The inbound access the app wants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Request {
     /// The app path, used for the Windows read-back only.
@@ -61,7 +56,6 @@ pub struct Request {
     pub profiles: Profiles,
 }
 
-/// Which Windows profiles the caller requires. The app keeps both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Profiles {
     pub private: bool,
@@ -77,7 +71,6 @@ impl Default for Profiles {
     }
 }
 
-/// What the host says about the rule, as one value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Verdict {
     NotInspected,
@@ -106,7 +99,6 @@ pub enum Method {
     WindowsDefender,
 }
 
-/// What the host is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BackendState {
     Running { permanent: Option<bool> },
@@ -115,7 +107,6 @@ pub enum BackendState {
     NotObservable,
 }
 
-/// Why the user has to act outside the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ManualCase {
     NixOs,
@@ -126,14 +117,12 @@ pub enum ManualCase {
     UntrustedHelper,
 }
 
-/// One inspection result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Report {
     pub verdict: Verdict,
     pub checked_at: SystemTime,
 }
 
-/// What an apply or remove call achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ApplyOutcome {
     Applied,
@@ -141,7 +130,6 @@ pub enum ApplyOutcome {
     ManualSteps,
 }
 
-/// Why an apply or remove call did not change anything.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ApplyError {
     UntrustedHelper,
@@ -166,7 +154,6 @@ impl fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
-/// The plain argv an action would run, or the reason there is none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum PlanAction {
     RunHelper {
@@ -192,16 +179,13 @@ where
     serializer.collect_seq(args.iter().map(|arg| arg.to_string_lossy()))
 }
 
-/// What the app would do to change the rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Plan {
     pub action: PlanAction,
     pub scope: Scope,
-    /// The steps to show when the action cannot run or is cancelled.
     pub manual: String,
 }
 
-/// What this host can do at all.
 #[must_use]
 pub const fn capability() -> Capability {
     platform::capability(HostOs::current())
@@ -257,8 +241,6 @@ pub fn helper_trusted(path: &std::path::Path) -> bool {
     platform::helper_trusted(path)
 }
 
-/// Runs the plan.
-///
 /// # Errors
 ///
 /// [`ApplyError::UntrustedHelper`] when a Linux helper fails the trusted-prefix,
@@ -274,11 +256,6 @@ pub fn apply(plan: &Plan) -> Result<ApplyOutcome, ApplyError> {
     )
 }
 
-/// Builds the remove plan for this host and runs it.
-///
-/// # Errors
-///
-/// Same as [`apply`].
 pub fn remove(request: &Request) -> Result<ApplyOutcome, ApplyError> {
     let plan = plan_remove(request);
     apply(&plan)

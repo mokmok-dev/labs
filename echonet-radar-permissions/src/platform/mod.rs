@@ -1,5 +1,3 @@
-//! Host facts, backend detection dispatch, and the elevation seam.
-
 pub mod linux;
 pub mod macos;
 pub mod windows;
@@ -52,7 +50,6 @@ impl HostFacts {
     }
 }
 
-/// Whether a plan adds the rule or takes it away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Add,

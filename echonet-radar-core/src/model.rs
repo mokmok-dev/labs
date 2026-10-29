@@ -1,5 +1,3 @@
-//! Radar state: one fold from wire observations to the snapshot the shells read.
-
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +11,6 @@ const NOTICE_RING_CAPACITY: usize = 20;
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
-/// Allocate the process-wide session id that a service run publishes.
 pub fn next_session_id() -> u64 {
     NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
 }
@@ -22,9 +19,7 @@ pub fn next_session_id() -> u64 {
 /// ephemeral port stays one object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectKey {
-    /// Address of the device object.
     pub ip: Ipv4Addr,
-    /// Device object EOJ.
     pub eoj: Eoj,
 }
 
@@ -41,121 +36,76 @@ impl ObjectKey {
     }
 }
 
-/// One immutable view of the LAN. The service builds it. The UI only reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RadarSnapshot {
-    /// Increases on every publish.
     pub revision: u64,
-    /// The session that produced the snapshot.
     pub session: u64,
-    /// Lifecycle state of the service.
     pub status: SessionStatus,
-    /// Every object this session has seen.
     pub objects: BTreeMap<ObjectKey, ObjectSnapshot>,
-    /// The most recent state changes, oldest first.
     pub recent: Vec<ChangeRecord>,
-    /// The most recent status messages, oldest first.
     pub notices: Vec<Notice>,
     /// Every datagram this session accepted. Readiness and the status bar
     /// read these fields; the capped change ring cannot stand in for them.
     pub frames_seen: u64,
-    /// Wall-clock time of the last accepted datagram.
     pub last_frame: Option<SystemTime>,
 }
 
-/// One device object as last observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSnapshot {
-    /// Identity of the object.
     pub key: ObjectKey,
-    /// Address the object last answered from.
     pub source: SocketAddr,
-    /// Two-byte class code of the object.
     pub class_code: u16,
-    /// The appendix's English name for the class.
     pub class_name: &'static str,
-    /// Wall-clock time of the last answer.
     pub last_seen: SystemTime,
-    /// Last known value of each property, by EPC.
     pub properties: BTreeMap<u8, PropertySnapshot>,
 }
 
-/// One property value as last observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertySnapshot {
-    /// The property bytes as they arrived on the wire.
     pub raw_edt: Vec<u8>,
     /// The value rendered by [`crate::format_edt`], derived from `raw_edt`.
     pub text: String,
-    /// Wall-clock time of the observation that set this value.
     pub at: SystemTime,
 }
 
-/// A property value that changed on a device object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeRecord {
-    /// Wall-clock time at which the change was observed.
     pub at: SystemTime,
-    /// The device object that changed.
     pub key: ObjectKey,
-    /// The EPC whose EDT changed.
     pub epc: u8,
     /// The value rendered by [`crate::format_edt`], derived from `raw_edt`.
     pub text: String,
-    /// The property bytes as they arrived on the wire.
     pub raw_edt: Vec<u8>,
 }
 
-/// A status message about discovery, errors and poll rounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
-    /// Wall-clock time at which the message was raised.
     pub at: SystemTime,
-    /// The message.
     pub text: String,
 }
 
-/// Lifecycle state of the service behind a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
-    /// The multicast socket is not bound yet.
     Binding,
-    /// The service is running; holds the time it started.
     Running {
-        /// Wall-clock time at which the service started.
         since: SystemTime,
     },
-    /// The service stopped after a fault.
     Degraded {
-        /// What stopped it.
         fault: Fault,
-        /// Wall-clock time of the last accepted datagram.
         last_frame: Option<SystemTime>,
     },
-    /// The service stopped on request.
     Stopped,
 }
 
-/// A failure the shells can name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
-    /// The multicast socket could not be bound on the interface.
-    Bind {
-        /// Interface the bind used.
-        interface: Ipv4Addr,
-        /// The transport's message.
-        detail: String,
-    },
-    /// The session configuration was rejected.
+    Bind { interface: Ipv4Addr, detail: String },
     Config(ConfigError),
-    /// The service stopped after a transport error.
     Service(String),
 }
 
-/// Configuration validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
-    /// A required interval was zero.
     ZeroInterval(&'static str),
 }
 
@@ -172,29 +122,20 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// A single observed state change on a device object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeEvent {
-    /// Wall-clock time at which the change was observed.
     pub at: SystemTime,
-    /// Address the change was observed from.
     pub source: SocketAddr,
-    /// The device object that changed.
     pub eoj: Eoj,
-    /// The EPC whose EDT changed.
     pub epc: u8,
     /// The property value rendered by [`crate::format_edt`], derived from `raw_edt`.
     pub text: String,
-    /// The property bytes as they arrived on the wire.
     pub raw_edt: Vec<u8>,
 }
 
-/// A device object that the radar just learned about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceEvent {
-    /// Address from which the device was discovered.
     pub source: SocketAddr,
-    /// The newly tracked device object.
     pub eoj: Eoj,
 }
 
@@ -205,79 +146,49 @@ pub struct DeviceEvent {
 /// telegrams emits several.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeenEvent {
-    /// Wall-clock time at which the object answered.
     pub at: SystemTime,
-    /// Address from which the answer arrived.
     pub source: SocketAddr,
-    /// The device object that answered.
     pub eoj: Eoj,
 }
 
-/// An event emitted by the radar service for a renderer that keeps no state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RadarEvent {
-    /// A property value changed on a device object.
     Change(ChangeEvent),
-    /// A device object became tracked, before any value was observed for it.
     Device(DeviceEvent),
-    /// A tracked object answered a poll or sent an INF notification, with or
-    /// without a value change.
     Seen(SeenEvent),
-    /// A status message about discovery, errors, and poll rounds.
     Status(String),
 }
 
-/// One parsed observation from the wire, before it becomes snapshot state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Observation {
-    /// A device object announced itself.
     Device {
-        /// The announced object.
         key: ObjectKey,
-        /// Two-byte class code of the object.
         class_code: u16,
-        /// Address the announcement came from.
         source: SocketAddr,
     },
-    /// A property answered with a value.
     Value {
-        /// The object that answered.
         key: ObjectKey,
-        /// The EPC that answered.
         epc: u8,
-        /// The property bytes as they arrived on the wire.
         raw_edt: Vec<u8>,
         /// The value rendered by [`crate::format_edt`], derived from `raw_edt`.
         text: String,
-        /// Wall-clock time at which the value was observed.
         at: SystemTime,
-        /// Address the answer came from.
         source: SocketAddr,
     },
-    /// A tracked object answered without a value this fold records.
     Seen {
-        /// The object that answered.
         key: ObjectKey,
-        /// Wall-clock time at which the object answered.
         at: SystemTime,
-        /// Address the answer came from.
         source: SocketAddr,
     },
-    /// The service raised a status message.
     Status(String),
 }
 
-/// What one observation produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Projection {
-    /// The event to hand to a stateless renderer, when the observation produced
-    /// one.
     pub event: Option<RadarEvent>,
-    /// Whether the snapshot changed.
     pub dirty: bool,
 }
 
-/// The radar's state, folded from one observation at a time.
 #[derive(Debug, Clone)]
 pub struct RadarModel {
     session: u64,
@@ -291,7 +202,6 @@ pub struct RadarModel {
 }
 
 impl RadarModel {
-    /// A model for one session, waiting for its socket to bind.
     #[must_use]
     pub const fn new(session: u64) -> Self {
         Self {
@@ -306,7 +216,6 @@ impl RadarModel {
         }
     }
 
-    /// Set the lifecycle state the next snapshot publishes.
     pub fn set_status(
         &mut self,
         status: SessionStatus,
@@ -314,7 +223,6 @@ impl RadarModel {
         self.status = status;
     }
 
-    /// Mark the session stopped after a fault, keeping the last frame time.
     pub fn degrade(
         &mut self,
         fault: Fault,
@@ -325,7 +233,6 @@ impl RadarModel {
         };
     }
 
-    /// Count a datagram the service accepted, before parsing it.
     pub const fn record_frame(
         &mut self,
         at: SystemTime,
@@ -334,8 +241,6 @@ impl RadarModel {
         self.last_frame = Some(at);
     }
 
-    /// Fold one observation.
-    ///
     /// The event is `None` when a renderer would draw nothing new, as with a
     /// repeated value; the snapshot still carries the observation's timestamp.
     pub fn observe(
@@ -439,13 +344,11 @@ impl RadarModel {
         }
     }
 
-    /// Build the snapshot for the next publish, advancing its revision.
     pub fn snapshot(&mut self) -> RadarSnapshot {
         self.revision += 1;
         self.snapshot_at(self.revision)
     }
 
-    /// The snapshot a session publishes before its first service frame.
     /// Revision zero never collides with a publish, so a reader can tell a
     /// first publish from the seed.
     #[must_use]

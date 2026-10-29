@@ -1,5 +1,3 @@
-//! The device table: one row per object, sorted by class name then address.
-
 use std::time::{Duration, SystemTime};
 
 use echonet_radar_core::{ObjectKey, ObjectSnapshot, PropertySnapshot, RadarSnapshot, power_epc};
@@ -8,7 +6,6 @@ use egui_extras::{Column, TableBuilder};
 use crate::readiness::freshness;
 use crate::views::{aged_text, format_age, format_eoj};
 
-/// Height the device table may take before it scrolls, so the pane below stays visible.
 const TABLE_MAX_HEIGHT: f32 = 240.0;
 
 /// Row order shared by the table and the arrow keys.
@@ -32,7 +29,6 @@ pub fn ordered_keys(snapshot: &RadarSnapshot) -> Vec<ObjectKey> {
     keys
 }
 
-/// Draw the table and write a clicked row into `selection`.
 pub fn device_list(
     ui: &mut egui::Ui,
     snapshot: &RadarSnapshot,

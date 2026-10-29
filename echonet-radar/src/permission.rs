@@ -15,11 +15,9 @@ use echonet_radar_permissions::{
     MACOS_LOCAL_NETWORK_SETTINGS_URL, Plan, PlanAction, Profiles, Report, Request, Scope,
 };
 
-/// Re-reads after an apply: once per second, five times.
 const RECHECK_COUNT: u32 = 5;
 const RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The host whose card copy this build shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host {
     MacOs,
@@ -40,7 +38,6 @@ impl Host {
     }
 }
 
-/// The request every inspection and plan is built from.
 #[must_use]
 pub fn request() -> Request {
     Request {
@@ -127,7 +124,6 @@ impl System for HostSystem {
     }
 }
 
-/// What the UI asks the worker to do.
 enum Command {
     Check,
     Add,
@@ -135,14 +131,12 @@ enum Command {
     OpenSettings(&'static str),
 }
 
-/// What the worker finished since the last frame.
 enum Update {
     Report(Report),
     Plan(Plan, bool),
     Outcome(Result<ApplyOutcome, ApplyError>),
 }
 
-/// The window's handle on the permission worker.
 pub struct PermissionController {
     commands: Option<Sender<Command>>,
     updates: Option<Receiver<Update>>,
@@ -154,7 +148,6 @@ pub struct PermissionController {
 }
 
 impl PermissionController {
-    /// Start the worker for this host.
     #[must_use]
     pub fn start() -> Self {
         Self::with_system(Arc::new(HostSystem))
@@ -192,7 +185,6 @@ impl PermissionController {
         }
     }
 
-    /// A controller with no worker, for tests that render a stated verdict.
     #[cfg(test)]
     pub fn stub(report: Report) -> Self {
         Self {
@@ -201,7 +193,6 @@ impl PermissionController {
         }
     }
 
-    /// Fold every result the worker finished since the last frame.
     pub fn poll(&mut self) {
         let Some(updates) = &self.updates else {
             return;
@@ -225,47 +216,39 @@ impl PermissionController {
         }
     }
 
-    /// The last inspection result.
     #[must_use]
     pub fn report(&self) -> Option<Report> {
         self.report.clone()
     }
 
-    /// The plan the card's confirmation names.
     #[must_use]
     pub fn last_plan(&self) -> Option<Plan> {
         self.plan.clone()
     }
 
-    /// What the last apply or remove achieved.
     #[must_use]
     pub const fn last_outcome(&self) -> Option<ApplyOutcome> {
         self.outcome
     }
 
-    /// Why the last apply or remove changed nothing.
     #[must_use]
     pub fn last_error(&self) -> Option<ApplyError> {
         self.error.clone()
     }
 
-    /// Whether the last plan names a helper the app is willing to elevate.
     #[must_use]
     pub const fn helper_trusted(&self) -> bool {
         self.trusted
     }
 
-    /// Inspect again, now.
     pub fn check_again(&self) {
         self.send(Command::Check);
     }
 
-    /// Add the rule, re-reading it once per second for five seconds.
     pub fn add_rule(&self) {
         self.send(Command::Add);
     }
 
-    /// Take the rule away.
     pub fn remove_rule(&self) {
         self.send(Command::Remove);
     }
@@ -278,12 +261,10 @@ impl PermissionController {
         echonet_radar_permissions::plan_remove(&request())
     }
 
-    /// Open System Settings at the macOS Firewall pane.
     pub fn open_firewall_settings(&self) {
         self.send(Command::OpenSettings(MACOS_FIREWALL_SETTINGS_URL));
     }
 
-    /// Open System Settings at the macOS Local Network pane.
     pub fn open_local_network_settings(&self) {
         self.send(Command::OpenSettings(MACOS_LOCAL_NETWORK_SETTINGS_URL));
     }

@@ -1,5 +1,3 @@
-//! Settings and diagnostics.
-
 use std::time::Duration;
 
 use echonet_radar_core::{MULTICAST_GROUP, MULTICAST_PORT};
@@ -11,17 +9,12 @@ use crate::settings::{MAX_DISCOVERY, MAX_UPDATE, MIN_DISCOVERY, MIN_UPDATE, Sett
 use crate::views::interface_picker;
 use crate::views::permission::{Card, describe_action, outcome_text, scope_text, verdict_label};
 
-/// Clicks the firewall section reports.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SettingsActions {
-    /// The user asked for the rule; the card opens its confirmation.
     pub add_rule: bool,
-    /// The user asked to take the rule away.
     pub remove_rule: bool,
 }
 
-/// Draw the interface picker, the two intervals, the bind diagnostics and the
-/// firewall report.
 pub fn settings(
     ui: &mut egui::Ui,
     settings: &mut Settings,

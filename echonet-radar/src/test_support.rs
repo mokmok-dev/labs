@@ -1,5 +1,3 @@
-//! Fixtures shared by the app's tests.
-
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::SystemTime;
@@ -8,7 +6,6 @@ use echonet_radar_core::{
     ObjectKey, ObjectSnapshot, PropertySnapshot, RadarSnapshot, SessionStatus,
 };
 
-/// Every text shape a frame drew, in paint order, with the colour it used.
 pub fn texts(output: &mut egui::FullOutput) -> Vec<(String, egui::Color32)> {
     // A frame the test does not render leaves glyph deltas behind, and
     // dropping them panics while a failing assertion unwinds.
@@ -20,7 +17,6 @@ pub fn texts(output: &mut egui::FullOutput) -> Vec<(String, egui::Color32)> {
     collected
 }
 
-/// Every text shape a frame drew, ignoring colour.
 pub fn drawn_text(output: &mut egui::FullOutput) -> Vec<String> {
     texts(output)
         .into_iter()
@@ -88,7 +84,6 @@ pub fn property(
     }
 }
 
-/// A snapshot from a running session that has seen one datagram.
 pub fn snapshot(now: SystemTime) -> RadarSnapshot {
     RadarSnapshot {
         revision: 1,
