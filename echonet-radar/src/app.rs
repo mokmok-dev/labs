@@ -106,6 +106,7 @@ pub struct RadarApp {
     permissions: PermissionController,
     report: Option<Report>,
     plan: Option<Plan>,
+    remove_plan: Option<Plan>,
     outcome: Option<ApplyOutcome>,
     permission_error: Option<ApplyError>,
     trusted_helper: bool,
@@ -155,6 +156,7 @@ impl RadarApp {
             permissions,
             report: None,
             plan: None,
+            remove_plan: None,
             outcome: None,
             permission_error: None,
             trusted_helper: false,
@@ -221,11 +223,17 @@ impl RadarApp {
         });
 
         let forced = self.card_forced();
+        let confirming_remove = self.card_state.confirming == Some(Confirm::RemoveRule);
+        let confirmed_plan = if confirming_remove {
+            self.remove_plan.as_ref()
+        } else {
+            self.plan.as_ref()
+        };
         let card = views::permission::Card {
             host: Host::current(),
             capability: echonet_radar_permissions::capability(),
             report: self.report.as_ref(),
-            plan: self.plan.as_ref(),
+            plan: confirmed_plan,
             outcome: self.outcome,
             error: self.permission_error.as_ref(),
             trusted: self.trusted_helper,
@@ -274,7 +282,9 @@ impl RadarApp {
             self.card_state.confirming = Some(Confirm::AddRule);
         }
         if settings_actions.remove_rule {
-            self.permissions.remove_rule();
+            self.remove_plan = Some(PermissionController::remove_plan());
+            self.permission_open = true;
+            self.card_state.confirming = Some(Confirm::RemoveRule);
         }
     }
 
@@ -295,6 +305,9 @@ impl RadarApp {
         self.outcome = self.permissions.last_outcome();
         self.permission_error = self.permissions.last_error();
         self.trusted_helper = self.permissions.helper_trusted();
+        if self.card_state.confirming != Some(Confirm::RemoveRule) {
+            self.remove_plan = None;
+        }
     }
 
     fn act_on_card(
@@ -305,6 +318,10 @@ impl RadarApp {
             CardAction::None => {},
             CardAction::CheckAgain => self.permissions.check_again(),
             CardAction::AddRule => self.permissions.add_rule(),
+            CardAction::RemoveRule => {
+                self.permissions.remove_rule();
+                self.remove_plan = None;
+            },
             CardAction::OpenFirewallSettings => self.permissions.open_firewall_settings(),
             CardAction::OpenLocalNetworkSettings => self.permissions.open_local_network_settings(),
             CardAction::Close => self.permission_open = false,

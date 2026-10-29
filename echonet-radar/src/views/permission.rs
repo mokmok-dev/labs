@@ -11,6 +11,7 @@ use crate::permission::Host;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confirm {
     AddRule,
+    RemoveRule,
 }
 
 /// A click the card reports.
@@ -23,6 +24,8 @@ pub enum CardAction {
     CheckAgain,
     /// The confirmation was accepted, so the rule may be added.
     AddRule,
+    /// The confirmation was accepted, so the rule may be removed.
+    RemoveRule,
     /// Open the macOS Firewall pane.
     OpenFirewallSettings,
     /// Open the macOS Local Network pane.
@@ -67,8 +70,8 @@ pub fn permission_card(
         ui.horizontal_wrapped(|ui| {
             row(ui, card, verdict, state, &mut action);
         });
-        if state.confirming.is_some() {
-            confirmation(ui, card, state, &mut action);
+        if let Some(kind) = state.confirming {
+            confirmation(ui, card, kind, state, &mut action);
         }
     });
     action
@@ -326,11 +329,16 @@ fn row(
 fn confirmation(
     ui: &mut egui::Ui,
     card: &Card<'_>,
+    kind: Confirm,
     state: &mut CardState,
     action: &mut CardAction,
 ) {
     ui.separator();
-    ui.strong("Add the firewall rule?");
+    let (question, accepted) = match kind {
+        Confirm::AddRule => ("Add the firewall rule?", CardAction::AddRule),
+        Confirm::RemoveRule => ("Remove the firewall rule?", CardAction::RemoveRule),
+    };
+    ui.strong(question);
     if let Some(plan) = card.plan {
         ui.label(format!("Scope: {}", scope_text(plan.scope)));
         ui.label(format!("Runs: {}", describe_action(plan)));
@@ -338,7 +346,7 @@ fn confirmation(
     ui.horizontal(|ui| {
         if ui.button("Confirm").clicked() {
             state.confirming = None;
-            *action = CardAction::AddRule;
+            *action = accepted;
         }
         if ui.button("Cancel").clicked() {
             state.confirming = None;
@@ -700,6 +708,35 @@ mod tests {
             &texts,
             &format!("Runs: {HELPER} --backend ufw --add --port 3610")
         ));
+    }
+
+    #[test]
+    fn the_remove_confirmation_names_the_remove_command_and_applies() {
+        let mut plan = helper_plan(Scope::Port);
+        if let PlanAction::RunHelper { args, .. } = &mut plan.action {
+            args[2] = OsString::from("--remove");
+        }
+        let mut fixture = Fixture::new(
+            Host::Linux,
+            Verdict::NotObservable {
+                backend: BackendState::Running { permanent: None },
+            },
+            plan,
+        );
+        fixture.state.confirming = Some(Confirm::RemoveRule);
+        let texts = draw(&mut fixture);
+        assert!(shows(&texts, "Remove the firewall rule?"));
+        assert!(shows(
+            &texts,
+            &format!("Runs: {HELPER} --backend ufw --remove --port 3610")
+        ));
+
+        let mut harness =
+            Harness::new_ui_state(|ui, fixture: &mut Fixture| fixture.draw(ui), fixture);
+        harness.get_by_label("Confirm").click();
+        harness.step();
+        assert_eq!(harness.state().action, CardAction::RemoveRule);
+        assert_eq!(harness.state().state.confirming, None);
     }
 
     #[test]

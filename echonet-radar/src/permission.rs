@@ -4,7 +4,7 @@
 //! and inspection shells out, so the egui thread only sends commands and folds
 //! the results back each frame.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -59,8 +59,6 @@ const EXE_NAME: &str = "echonet-radar.exe";
 #[cfg(not(windows))]
 const EXE_NAME: &str = "echonet-radar";
 
-const TRUSTED_PREFIXES: [&str; 4] = ["/nix/store", "/usr", "/opt", "/run/current-system/sw"];
-
 /// The host calls the worker makes. Tests state the answers instead.
 trait System: Send + Sync {
     fn inspect(
@@ -107,7 +105,9 @@ impl System for HostSystem {
         plan: &Plan,
     ) -> bool {
         match &plan.action {
-            PlanAction::RunHelper { helper, .. } => trusted_helper(helper),
+            PlanAction::RunHelper { helper, .. } => {
+                echonet_radar_permissions::helper_trusted(helper)
+            },
             PlanAction::OpenSettings { .. } | PlanAction::Manual => false,
         }
     }
@@ -124,33 +124,6 @@ impl System for HostSystem {
         request: &Request,
     ) -> Result<ApplyOutcome, ApplyError> {
         echonet_radar_permissions::remove(request)
-    }
-}
-
-/// The permissions crate keeps its own copy of this check private, and the
-/// helper repeats it before acting, so this one only decides whether the card
-/// offers the button.
-fn trusted_helper(path: &Path) -> bool {
-    if !TRUSTED_PREFIXES
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
-    {
-        return false;
-    }
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        metadata.uid() == 0 && metadata.mode() & 0o022 == 0
-    }
-    #[cfg(not(unix))]
-    {
-        false
     }
 }
 
@@ -295,6 +268,14 @@ impl PermissionController {
     /// Take the rule away.
     pub fn remove_rule(&self) {
         self.send(Command::Remove);
+    }
+
+    /// The remove plan, built now so the confirmation can name the exact
+    /// action. Building a plan shells out to detect the backend but never
+    /// authenticates, so it is safe on the frame thread.
+    #[must_use]
+    pub fn remove_plan() -> Plan {
+        echonet_radar_permissions::plan_remove(&request())
     }
 
     /// Open System Settings at the macOS Firewall pane.
