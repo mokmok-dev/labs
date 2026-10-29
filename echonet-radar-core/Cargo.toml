@@ -10,7 +10,6 @@ version.workspace = true
 echonet-lite.workspace = true
 echonet-lite-udp.workspace = true
 tokio.workspace = true
-workspace-hack.workspace = true
 
 [lints]
 workspace = true

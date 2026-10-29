@@ -14,7 +14,6 @@ echonet-lite-udp.workspace = true
 echonet-radar-core.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
-workspace-hack.workspace = true
 
 [lints]
 workspace = true

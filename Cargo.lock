@@ -320,9 +320,6 @@ dependencies = [
 [[package]]
 name = "echonet-lite"
 version = "0.0.0"
-dependencies = [
- "workspace-hack",
-]
 
 [[package]]
 name = "echonet-lite-codegen"
@@ -331,7 +328,6 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
- "workspace-hack",
 ]
 
 [[package]]
@@ -341,7 +337,6 @@ dependencies = [
  "echonet-lite",
  "socket2",
  "tokio",
- "workspace-hack",
 ]
 
 [[package]]
@@ -355,7 +350,6 @@ dependencies = [
  "echonet-radar-core",
  "ratatui",
  "tokio",
- "workspace-hack",
 ]
 
 [[package]]
@@ -365,7 +359,6 @@ dependencies = [
  "echonet-lite",
  "echonet-lite-udp",
  "tokio",
- "workspace-hack",
 ]
 
 [[package]]
@@ -1260,15 +1253,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "workspace-hack"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.4",
 ]
 
 [[package]]
