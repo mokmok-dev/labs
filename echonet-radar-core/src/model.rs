@@ -442,8 +442,23 @@ impl RadarModel {
     /// Build the snapshot for the next publish, advancing its revision.
     pub fn snapshot(&mut self) -> RadarSnapshot {
         self.revision += 1;
+        self.snapshot_at(self.revision)
+    }
+
+    /// The snapshot a session publishes before its first service frame.
+    /// Revision zero never collides with a publish, so a reader can tell a
+    /// first publish from the seed.
+    #[must_use]
+    pub fn initial_snapshot(&self) -> RadarSnapshot {
+        self.snapshot_at(self.revision)
+    }
+
+    fn snapshot_at(
+        &self,
+        revision: u64,
+    ) -> RadarSnapshot {
         RadarSnapshot {
-            revision: self.revision,
+            revision,
             session: self.session,
             status: self.status.clone(),
             objects: self.objects.clone(),

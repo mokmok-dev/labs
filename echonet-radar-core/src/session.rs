@@ -230,6 +230,7 @@ impl RadarSession {
             RadarHandle {
                 snapshots: snapshot_rx,
                 commands,
+                seen: std::cell::Cell::new(0),
             },
         ))
     }
@@ -245,19 +246,27 @@ impl Drop for RadarSession {
 pub struct RadarHandle {
     snapshots: watch::Receiver<Arc<RadarSnapshot>>,
     commands: mpsc::Sender<Command>,
+    seen: std::cell::Cell<u64>,
 }
 
 impl RadarHandle {
     /// Whether a snapshot was published since the last [`Self::snapshot`].
+    ///
+    /// Compares revisions instead of the watch channel's own change flag,
+    /// because the channel reports an error as soon as the service drops its
+    /// sender. A final publish, such as the `Degraded` or `Stopped` status,
+    /// would otherwise be invisible.
     #[must_use]
     pub fn has_changed(&self) -> bool {
-        self.snapshots.has_changed().unwrap_or(false)
+        self.snapshots.borrow().revision != self.seen.get()
     }
 
     /// The newest snapshot, marked as read.
     #[must_use]
     pub fn snapshot(&mut self) -> Arc<RadarSnapshot> {
-        self.snapshots.borrow_and_update().clone()
+        let snapshot = self.snapshots.borrow_and_update().clone();
+        self.seen.set(snapshot.revision);
+        snapshot
     }
 
     /// Ask the service to poll values without moving the scheduled round.
@@ -429,7 +438,7 @@ fn snapshot_channel(
     watch::Sender<Arc<RadarSnapshot>>,
     watch::Receiver<Arc<RadarSnapshot>>,
 ) {
-    watch::channel(Arc::new(RadarModel::new(session).snapshot()))
+    watch::channel(Arc::new(RadarModel::new(session).initial_snapshot()))
 }
 
 fn run_session(
@@ -622,6 +631,25 @@ mod tests {
 
         assert_eq!(snapshot.status, SessionStatus::Binding);
         assert_eq!(snapshot.session, 3);
+        assert_eq!(snapshot.revision, 0);
+    }
+
+    #[test]
+    fn a_publish_just_before_the_sender_drops_is_visible() {
+        let (snapshots, receiver) = snapshot_channel(1);
+        let (commands, _command_rx) = mpsc::channel(1);
+        let mut handle = RadarHandle {
+            snapshots: receiver,
+            commands,
+            seen: std::cell::Cell::new(0),
+        };
+
+        snapshots.send_replace(Arc::new(RadarModel::new(1).snapshot()));
+        drop(snapshots);
+
+        assert!(handle.has_changed());
+        assert_eq!(handle.snapshot().revision, 1);
+        assert!(!handle.has_changed());
     }
 
     #[test]

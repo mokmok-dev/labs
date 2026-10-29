@@ -1041,11 +1041,8 @@ fn event_loop(
 ) -> io::Result<()> {
     let mut last_sample = Instant::now();
     loop {
-        // `has_changed` reads false once the service drops its sender, even after
-        // publishing its final Degraded or Stopped state, so the published Arc is
-        // what marks a new snapshot.
-        let published = handle.snapshot();
-        if !Arc::ptr_eq(&published, &dashboard.snapshot) {
+        if handle.has_changed() {
+            let published = handle.snapshot();
             dashboard.apply(published);
         }
         if last_sample.elapsed() >= SAMPLE_PERIOD {
