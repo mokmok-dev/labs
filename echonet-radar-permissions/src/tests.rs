@@ -13,7 +13,12 @@ use crate::{
     Method, Plan, PlanAction, Profiles, Report, Request, Scope, Verdict,
 };
 
-const HOST_HELPER: &str = "/usr/bin/echonet-radar-firewall-helper";
+/// The install root as the host spells it. Only the host's spelling is
+/// absolute, which is what the trust checks require.
+#[cfg(windows)]
+const PROGRAM_FILES: &str = r"C:\Program Files";
+#[cfg(not(windows))]
+const PROGRAM_FILES: &str = "/Program Files";
 
 #[derive(Default)]
 struct FakeRunner {
@@ -144,16 +149,22 @@ fn linux_request() -> Request {
     request("/usr/bin/echonet-radar")
 }
 
+fn linux_helper() -> PathBuf {
+    platform::sibling(&linux_request().target, platform::LINUX_HELPER)
+}
+
 fn windows_request() -> Request {
     Request {
-        target: PathBuf::from("/Program Files/ECHONET Radar/echonet-radar.exe"),
+        target: Path::new(PROGRAM_FILES)
+            .join("ECHONET Radar")
+            .join("echonet-radar.exe"),
         ..linux_request()
     }
 }
 
 fn program_files() -> HostFacts {
     HostFacts {
-        program_files: Some(PathBuf::from("/Program Files")),
+        program_files: Some(PathBuf::from(PROGRAM_FILES)),
         ..HostFacts::default()
     }
 }
@@ -186,10 +197,12 @@ fn linux_verdict(
 fn firewalld_apply(exit: i32) -> Result<ApplyOutcome, ApplyError> {
     let request = linux_request();
     let plan = linux_plan(&firewalld_runner(), &request, Mode::Add);
+    let helper = linux_helper();
+    let helper = helper.to_string_lossy();
     let runner = FakeRunner::new().reply(
         "pkexec",
         &[
-            HOST_HELPER,
+            helper.as_ref(),
             "--backend",
             "firewalld",
             "--add",
@@ -351,7 +364,7 @@ fn firewalld_add_plan_runs_the_sibling_helper() {
     assert_eq!(
         plan.action,
         PlanAction::RunHelper {
-            helper: PathBuf::from(HOST_HELPER),
+            helper: linux_helper(),
             args: args(&["--backend", "firewalld", "--add", "--port", "3610"]),
         }
     );
@@ -366,7 +379,7 @@ fn firewalld_remove_plan_differs_only_in_the_action() {
     assert_eq!(
         remove.action,
         PlanAction::RunHelper {
-            helper: PathBuf::from(HOST_HELPER),
+            helper: linux_helper(),
             args: args(&["--backend", "firewalld", "--remove", "--port", "3610"]),
         }
     );
@@ -380,7 +393,7 @@ fn ufw_plan_names_the_ufw_backend() {
     assert_eq!(
         plan.action,
         PlanAction::RunHelper {
-            helper: PathBuf::from(HOST_HELPER),
+            helper: linux_helper(),
             args: args(&["--backend", "ufw", "--add", "--port", "3610"]),
         }
     );
@@ -432,7 +445,7 @@ fn helper_path_with_a_space_and_a_quote_stays_one_argv_element() {
     assert_eq!(
         plan.action,
         PlanAction::RunHelper {
-            helper: PathBuf::from("/opt/it's ECHONET Radar/echonet-radar-firewall-helper"),
+            helper: platform::sibling(&request.target, platform::LINUX_HELPER),
             args: args(&["--backend", "firewalld", "--add", "--port", "3610"]),
         }
     );
@@ -452,35 +465,26 @@ fn the_helper_is_the_targets_sibling() {
 
 #[test]
 fn program_files_membership_is_component_wise() {
-    let root = Path::new("/Program Files");
-    assert!(platform::is_under(
-        Path::new("/program files/ECHONET Radar/echonet-radar.exe"),
-        root
-    ));
+    let root = Path::new(PROGRAM_FILES);
+    let lower_root = PROGRAM_FILES.to_lowercase();
+    let lowercase = Path::new(&lower_root)
+        .join("ECHONET Radar")
+        .join("echonet-radar.exe");
+    assert!(platform::is_under(&lowercase, root));
+    let sibling_root = format!("{PROGRAM_FILES}evil");
     assert!(!platform::is_under(
-        Path::new("/Program Filesevil/echonet-radar.exe"),
+        &Path::new(&sibling_root).join("echonet-radar.exe"),
         root
     ));
-    assert!(
-        platform::is_under(Path::new("/Program Files"), root),
-        "the root is under itself"
-    );
+    assert!(platform::is_under(root, root), "the root is under itself");
 }
 
 #[test]
 fn an_empty_program_files_trusts_nothing() {
-    assert!(!platform::is_under(
-        Path::new("/Program Files/ECHONET Radar/echonet-radar.exe"),
-        Path::new("")
-    ));
-    assert!(!platform::is_under(
-        Path::new("/Program Files/ECHONET Radar/echonet-radar.exe"),
-        Path::new("/")
-    ));
-    assert!(!platform::is_under(
-        Path::new("/Program Files/ECHONET Radar/echonet-radar.exe"),
-        Path::new("Program Files")
-    ));
+    let target = windows_request().target;
+    assert!(!platform::is_under(&target, Path::new("")));
+    assert!(!platform::is_under(&target, Path::new("/")));
+    assert!(!platform::is_under(&target, Path::new("Program Files")));
 }
 
 #[test]
@@ -495,7 +499,7 @@ fn windows_plan_under_program_files_runs_the_helper() {
     assert_eq!(
         add.action,
         PlanAction::RunHelper {
-            helper: PathBuf::from("/Program Files/ECHONET Radar/echonet-radar-firewall-helper.exe"),
+            helper: platform::sibling(&windows_request().target, platform::WINDOWS_HELPER),
             args: args(&["--add", "--port", "3610"]),
         }
     );
@@ -511,7 +515,7 @@ fn windows_plan_under_program_files_runs_the_helper() {
     assert_eq!(
         remove.action,
         PlanAction::RunHelper {
-            helper: PathBuf::from("/Program Files/ECHONET Radar/echonet-radar-firewall-helper.exe"),
+            helper: platform::sibling(&windows_request().target, platform::WINDOWS_HELPER),
             args: args(&["--remove", "--port", "3610"]),
         }
     );
@@ -638,14 +642,14 @@ fn readback(
     json!({ "rules": rules, "profiles": profiles }).to_string()
 }
 
-fn windows_program() -> &'static str {
-    "/Program Files/ECHONET Radar/echonet-radar.exe"
+fn windows_program() -> String {
+    windows_request().target.to_string_lossy().into_owned()
 }
 
 fn matching_rules() -> Vec<serde_json::Value> {
     vec![
-        rule("EchonetRadarUdp3610Private", "Private", windows_program()),
-        rule("EchonetRadarUdp3610Domain", "Domain", windows_program()),
+        rule("EchonetRadarUdp3610Private", "Private", &windows_program()),
+        rule("EchonetRadarUdp3610Domain", "Domain", &windows_program()),
     ]
 }
 
@@ -745,7 +749,7 @@ fn windows_one_rule_is_absent() {
     let rules = vec![rule(
         "EchonetRadarUdp3610Private",
         "Private",
-        windows_program(),
+        &windows_program(),
     )];
     assert_eq!(
         windows_verdict(1, &readback(&rules, &[true])),
@@ -756,7 +760,7 @@ fn windows_one_rule_is_absent() {
 #[test]
 fn windows_single_object_shape_parses() {
     let stdout = json!({
-        "rules": rule("EchonetRadarUdp3610Private", "Private", windows_program()),
+        "rules": rule("EchonetRadarUdp3610Private", "Private", &windows_program()),
         "profiles": { "name": "Private", "firewall_enabled": true },
     })
     .to_string();
@@ -888,15 +892,9 @@ fn windows_apply_raises_uac_through_powershell() {
         !script.contains("Program Files"),
         "the helper path must not be interpolated into the script"
     );
-    assert_eq!(
-        &parts[7..],
-        &[
-            "/Program Files/ECHONET Radar/echonet-radar-firewall-helper.exe",
-            "--add",
-            "--port",
-            "3610",
-        ]
-    );
+    let helper = platform::sibling(&windows_request().target, platform::WINDOWS_HELPER);
+    let helper = helper.to_string_lossy();
+    assert_eq!(&parts[7..], &[helper.as_ref(), "--add", "--port", "3610"]);
 }
 
 #[test]
