@@ -123,6 +123,23 @@ pub fn plan(
     }
 }
 
+/// Windows does not honor a `requireAdministrator` manifest through
+/// `CreateProcess`; only a `runas` shell launch raises the consent dialog. The
+/// script stays a literal, and the helper and its argv arrive as separate
+/// arguments in `$args`, so no path is interpolated into it.
+const WINDOWS_ELEVATION: &str = "$ErrorActionPreference = 'Stop'\n\
+try {\n\
+  $helper = $args[0]\n\
+  $rest = @()\n\
+  if ($args.Length -gt 1) { $rest = $args[1..($args.Length - 1)] }\n\
+  $process = Start-Process -FilePath $helper -ArgumentList $rest -Verb RunAs -Wait -PassThru\n\
+  exit $process.ExitCode\n\
+} catch {\n\
+  $code = $_.Exception.NativeErrorCode\n\
+  if (-not $code) { $code = 1 }\n\
+  exit $code\n\
+}";
+
 pub fn apply(
     os: HostOs,
     plan: &Plan,
@@ -132,7 +149,7 @@ pub fn apply(
     match &plan.action {
         PlanAction::Manual => Ok(ApplyOutcome::ManualSteps),
         PlanAction::OpenSettings { url } => {
-            run(runner, OsStr::new("open"), &[OsString::from(url)], os, &[])
+            run(runner, OsStr::new("open"), &[OsString::from(url)], os)
         },
         PlanAction::RunHelper { helper, args } => match os {
             HostOs::MacOs => Ok(ApplyOutcome::ManualSteps),
@@ -143,9 +160,21 @@ pub fn apply(
                 let mut elevated = Vec::with_capacity(args.len() + 1);
                 elevated.push(helper.as_os_str().to_owned());
                 elevated.extend(args.iter().cloned());
-                run(runner, OsStr::new("pkexec"), &elevated, os, args)
+                run(runner, OsStr::new("pkexec"), &elevated, os)
             },
-            HostOs::Windows => run(runner, helper.as_os_str(), args, os, args),
+            HostOs::Windows => {
+                let mut elevated = vec![
+                    OsString::from("-NoProfile"),
+                    OsString::from("-NonInteractive"),
+                    OsString::from("-ExecutionPolicy"),
+                    OsString::from("Bypass"),
+                    OsString::from("-Command"),
+                    OsString::from(WINDOWS_ELEVATION),
+                    helper.as_os_str().to_owned(),
+                ];
+                elevated.extend(args.iter().cloned());
+                run(runner, OsStr::new("powershell"), &elevated, os)
+            },
         },
     }
 }
@@ -155,31 +184,31 @@ fn run(
     program: &OsStr,
     args: &[OsString],
     os: HostOs,
-    helper_args: &[OsString],
 ) -> Result<ApplyOutcome, ApplyError> {
-    let output = runner
-        .run(program, args)
-        .map_err(|error| spawn_error(&error))?;
-    outcome(os, helper_args, &output)
+    let output = match runner.run(program, args) {
+        Ok(output) => output,
+        Err(error) if os == HostOs::Windows && error.raw_os_error() == Some(1223) => {
+            return Ok(ApplyOutcome::Cancelled);
+        },
+        Err(error) if os == HostOs::Windows && error.raw_os_error() == Some(740) => {
+            return Err(ApplyError::NotAuthorized);
+        },
+        Err(error) => return Err(spawn_error(&error)),
+    };
+    outcome(os, &output)
 }
 
 fn outcome(
     os: HostOs,
-    helper_args: &[OsString],
     output: &CommandOutput,
 ) -> Result<ApplyOutcome, ApplyError> {
     let code = output.code;
-    let firewalld = backend(helper_args) == Some("firewalld");
     match (os, code) {
         // A cancelled UAC prompt is Windows 1223. pkexec reports its own 126
         // for a dismissed dialog and 127 for a refusal, so the helper never
         // emits those two.
         (HostOs::Windows, Some(1223)) | (HostOs::Linux, Some(126)) => Ok(ApplyOutcome::Cancelled),
-        (HostOs::Linux, Some(127)) => Err(ApplyError::NotAuthorized),
-        // firewalld NOT_ENABLED: nothing was added or removed, so a rule the
-        // user asked to remove is already absent.
-        (HostOs::Linux, Some(12)) if firewalld => Ok(ApplyOutcome::Applied),
-        (HostOs::Linux, Some(253)) if firewalld => Ok(ApplyOutcome::Cancelled),
+        (HostOs::Windows, Some(740)) | (HostOs::Linux, Some(127)) => Err(ApplyError::NotAuthorized),
         (_, Some(0)) => Ok(ApplyOutcome::Applied),
         _ => Err(ApplyError::Failed(output.stderr.clone())),
     }
@@ -190,13 +219,6 @@ fn spawn_error(error: &io::Error) -> ApplyError {
         ApplyError::NotFound
     } else {
         ApplyError::Failed(error.to_string())
-    }
-}
-
-fn backend(args: &[OsString]) -> Option<&str> {
-    match args {
-        [flag, backend, ..] if flag.as_os_str() == OsStr::new("--backend") => backend.to_str(),
-        _ => None,
     }
 }
 
@@ -237,13 +259,16 @@ pub fn is_under(
 
 /// The Linux helper check that `pkexec` does not do for us.
 pub fn helper_trusted(helper: &Path) -> bool {
+    let Ok(canonical) = std::fs::canonicalize(helper) else {
+        return false;
+    };
     if !TRUSTED_PREFIXES
         .iter()
-        .any(|prefix| helper.starts_with(prefix))
+        .any(|prefix| canonical.starts_with(prefix))
     {
         return false;
     }
-    let Ok(metadata) = std::fs::metadata(helper) else {
+    let Ok(metadata) = std::fs::metadata(&canonical) else {
         return false;
     };
     if !metadata.is_file() {

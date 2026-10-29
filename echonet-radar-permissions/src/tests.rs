@@ -45,8 +45,31 @@ impl FakeRunner {
         self.reply(program, args, output(code, "", ""))
     }
 
+    fn reply_key(
+        self,
+        rendered: &str,
+        output: CommandOutput,
+    ) -> Self {
+        self.replies
+            .borrow_mut()
+            .push((rendered.to_owned(), output));
+        self
+    }
+
     fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
+    }
+}
+
+struct FailingRunner(i32);
+
+impl CommandRunner for FailingRunner {
+    fn run(
+        &self,
+        _program: &OsStr,
+        _args: &[OsString],
+    ) -> io::Result<CommandOutput> {
+        Err(io::Error::from_raw_os_error(self.0))
     }
 }
 
@@ -812,13 +835,11 @@ fn firewalld_success_is_applied() {
 }
 
 #[test]
-fn firewalld_not_enabled_counts_as_success() {
-    assert_eq!(firewalld_apply(12), Ok(ApplyOutcome::Applied));
-}
-
-#[test]
-fn firewalld_not_authorized_is_cancelled() {
-    assert_eq!(firewalld_apply(253), Ok(ApplyOutcome::Cancelled));
+fn a_stopped_firewalld_is_not_a_successful_add() {
+    assert_eq!(
+        firewalld_apply(12),
+        Err(ApplyError::Failed("firewalld said no".to_owned()))
+    );
 }
 
 #[test]
@@ -835,20 +856,55 @@ fn pkexec_codes_map_to_cancelled_and_not_authorized() {
     assert_eq!(firewalld_apply(127), Err(ApplyError::NotAuthorized));
 }
 
-#[test]
-fn windows_cancelled_uac_is_cancelled() {
-    let plan = platform::plan(
+fn windows_plan(mode: Mode) -> Plan {
+    platform::plan(
         HostOs::Windows,
         &windows_request(),
         &FakeRunner::new(),
         &program_files(),
-        Mode::Add,
+        mode,
+    )
+}
+
+fn elevated_windows_call(plan: &Plan) -> String {
+    let probe = FakeRunner::new();
+    let _ = platform::apply(HostOs::Windows, plan, &probe, |_| true);
+    let mut calls = probe.calls();
+    calls.remove(0)
+}
+
+#[test]
+fn windows_apply_raises_uac_through_powershell() {
+    let plan = windows_plan(Mode::Add);
+    let call = elevated_windows_call(&plan);
+    let parts: Vec<&str> = call.split('\0').collect();
+
+    assert_eq!(parts[0], "powershell");
+    assert_eq!(parts[5], "-Command");
+    let script = parts[6];
+    assert!(script.contains("Start-Process"));
+    assert!(script.contains("-Verb RunAs"));
+    assert!(
+        !script.contains("Program Files"),
+        "the helper path must not be interpolated into the script"
     );
-    let runner = FakeRunner::new().reply(
-        "/Program Files/ECHONET Radar/echonet-radar-firewall-helper.exe",
-        &["--add", "--port", "3610"],
-        output(1223, "", "the operation was cancelled"),
+    assert_eq!(
+        &parts[7..],
+        &[
+            "/Program Files/ECHONET Radar/echonet-radar-firewall-helper.exe",
+            "--add",
+            "--port",
+            "3610",
+        ]
     );
+}
+
+#[test]
+fn windows_cancelled_uac_is_cancelled() {
+    let plan = windows_plan(Mode::Add);
+    let key = elevated_windows_call(&plan);
+    let runner = FakeRunner::new().reply_key(&key, output(1223, "", "cancelled"));
+
     assert_eq!(
         platform::apply(HostOs::Windows, &plan, &runner, |_| true),
         Ok(ApplyOutcome::Cancelled)
@@ -857,21 +913,27 @@ fn windows_cancelled_uac_is_cancelled() {
 
 #[test]
 fn windows_other_exit_is_failed() {
-    let plan = platform::plan(
-        HostOs::Windows,
-        &windows_request(),
-        &FakeRunner::new(),
-        &program_files(),
-        Mode::Add,
-    );
-    let runner = FakeRunner::new().reply(
-        "/Program Files/ECHONET Radar/echonet-radar-firewall-helper.exe",
-        &["--add", "--port", "3610"],
-        output(5, "", "access denied"),
-    );
+    let plan = windows_plan(Mode::Add);
+    let key = elevated_windows_call(&plan);
+    let runner = FakeRunner::new().reply_key(&key, output(5, "", "access denied"));
+
     assert_eq!(
         platform::apply(HostOs::Windows, &plan, &runner, |_| true),
         Err(ApplyError::Failed("access denied".to_owned()))
+    );
+}
+
+#[test]
+fn windows_spawn_errors_map_to_outcomes() {
+    let plan = windows_plan(Mode::Add);
+
+    assert_eq!(
+        platform::apply(HostOs::Windows, &plan, &FailingRunner(1223), |_| true),
+        Ok(ApplyOutcome::Cancelled)
+    );
+    assert_eq!(
+        platform::apply(HostOs::Windows, &plan, &FailingRunner(740), |_| true),
+        Err(ApplyError::NotAuthorized)
     );
 }
 

@@ -145,12 +145,12 @@ fn manual(
 ) -> String {
     match mode {
         Mode::Add => {
-            let program = request.target.display();
+            let program = request.target.display().to_string().replace('\'', "''");
             let port = request.port;
             let rule = |name: &str, profile: &str| {
                 format!(
-                    "New-NetFirewallRule -DisplayName {name} -Direction Inbound -Action Allow \
-                     -Protocol UDP -LocalPort {port} -Program \"{program}\" -Profile {profile}"
+                    "New-NetFirewallRule -Name {name} -Direction Inbound -Action Allow \
+                     -Protocol UDP -LocalPort {port} -Program '{program}' -Profile {profile}"
                 )
             };
             format!(
