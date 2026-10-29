@@ -1,73 +1,33 @@
-//! The discovery, polling and INF-watching service loop and its state.
+//! The discovery, polling and INF-watching state behind the service loop.
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime};
 
 use echonet_lite::ecodec::{Access, lookup};
-use echonet_lite::frame::{Eoj, FrameHeader, Property, parse};
+use echonet_lite::frame::{Eoj, FrameHeader, Property};
 use echonet_lite_udp::EchoNetSocket;
 
 use crate::format::{format_edt, power_epc};
-use crate::model::{
-    ConfigError, Fault, ObjectKey, Observation, RadarEvent, RadarModel, SessionStatus,
-    next_session_id,
-};
+use crate::model::{ObjectKey, Observation, RadarEvent, RadarModel, SessionStatus};
 use crate::protocol::{
-    CONTROLLER_CLASS_CODE, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, DISCOVERY_EPC,
-    EMPTY_EDT, GET_PROPERTY_MAP_EPC, GET_RESPONSE_ESV_CODE, INF_ESV_CODE, NODE_PROFILE_CLASS_CODE,
-    discovery_header, get_header, is_get_response_code, parse_instance_list, parse_property_map,
+    CONTROLLER_CLASS_CODE, DISCOVERY_EPC, EMPTY_EDT, GET_PROPERTY_MAP_EPC, GET_RESPONSE_ESV_CODE,
+    INF_ESV_CODE, NODE_PROFILE_CLASS_CODE, discovery_header, get_header, is_get_response_code,
+    parse_instance_list, parse_property_map,
 };
+use crate::session::SessionConfig;
 
 const VALUE_BATCH_SIZE: usize = 8;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Runtime configuration for the radar service.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RadarConfig {
-    /// IPv4 interface used to join the ECHONET Lite multicast group.
-    pub interface: Ipv4Addr,
-    /// Interval between D6 discovery requests.
-    pub discovery_interval: Duration,
-    /// Interval between value polling rounds.
-    pub update_interval: Duration,
-}
-
-impl Default for RadarConfig {
-    fn default() -> Self {
-        Self {
-            interface: Ipv4Addr::UNSPECIFIED,
-            discovery_interval: DEFAULT_DISCOVERY_INTERVAL,
-            update_interval: DEFAULT_UPDATE_INTERVAL,
-        }
-    }
-}
-
-impl RadarConfig {
-    /// Validate intervals before constructing Tokio timers.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ConfigError::ZeroInterval`] when discovery or value polling
-    /// would otherwise create a zero-duration timer.
-    pub const fn validate(self) -> Result<(), ConfigError> {
-        if self.discovery_interval.is_zero() {
-            return Err(ConfigError::ZeroInterval("discovery_interval"));
-        }
-        if self.update_interval.is_zero() {
-            return Err(ConfigError::ZeroInterval("update_interval"));
-        }
-        Ok(())
-    }
-}
-
-/// A command sent from the terminal to the radar service.
+/// A command sent from a shell to the radar service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// Send value GETs to all known device objects immediately.
     PollNow,
+    /// Send a discovery request without moving the scheduled round.
+    Rediscover,
 }
 
 #[derive(Debug, Clone)]
@@ -97,44 +57,84 @@ impl PendingRequest {
     }
 }
 
-struct ServiceState {
-    model: RadarModel,
-    events: Sender<RadarEvent>,
-    poll_epcs: HashMap<ObjectKey, Vec<u8>>,
+pub struct ServiceState {
+    pub model: RadarModel,
+    pub poll_epcs: HashMap<ObjectKey, Vec<u8>>,
+    pub next_update: Instant,
+    events: Option<Sender<RadarEvent>>,
     pending: HashMap<u16, PendingRequest>,
     next_tid: u16,
     first_refresh_done: bool,
-    next_update: Instant,
+    request_timeout: Duration,
+    dirty: bool,
 }
 
 impl ServiceState {
-    fn new(
-        config: RadarConfig,
-        events: Sender<RadarEvent>,
+    pub fn new(
+        config: SessionConfig,
+        events: Option<Sender<RadarEvent>>,
+        session: u64,
     ) -> Self {
         let now = Instant::now();
-        let mut model = RadarModel::new(next_session_id());
+        let mut model = RadarModel::new(session);
         model.set_status(SessionStatus::Running {
             since: SystemTime::now(),
         });
         Self {
             model,
-            events,
             poll_epcs: HashMap::new(),
+            next_update: now + config.update_interval,
+            events,
             pending: HashMap::new(),
             next_tid: 0,
             first_refresh_done: false,
-            next_update: now + config.update_interval,
+            request_timeout: config.request_timeout,
+            dirty: false,
         }
     }
 
-    fn notice(
+    pub fn notice(
         &mut self,
         message: String,
     ) {
         let projection = self.model.observe(Observation::Status(message));
+        self.dirty = true;
         if let Some(event) = projection.event {
-            let _ = self.events.send(event);
+            self.send(event);
+        }
+    }
+
+    /// Count a datagram the service accepted, before parsing it.
+    pub const fn record_frame(
+        &mut self,
+        at: SystemTime,
+    ) {
+        self.model.record_frame(at);
+        self.dirty = true;
+    }
+
+    /// Whether anything changed since the last call.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// Expire unanswered requests, then send one discovery GET.
+    pub async fn discover(
+        &mut self,
+        socket: &EchoNetSocket,
+    ) {
+        self.expire_pending(Instant::now());
+        if let Err(error) = self.send_discovery(socket).await {
+            self.notice(format!("discovery send failed: {error}"));
+        }
+    }
+
+    fn send(
+        &self,
+        event: RadarEvent,
+    ) {
+        if let Some(events) = &self.events {
+            let _ = events.send(event);
         }
     }
 
@@ -142,8 +142,10 @@ impl ServiceState {
         &mut self,
         observation: Observation,
     ) {
-        if let Some(event) = self.model.observe(observation).event {
-            let _ = self.events.send(event);
+        let projection = self.model.observe(observation);
+        self.dirty |= projection.dirty;
+        if let Some(event) = projection.event {
+            self.send(event);
         }
     }
 
@@ -160,12 +162,12 @@ impl ServiceState {
         ))
     }
 
-    fn expire_pending(
+    pub fn expire_pending(
         &mut self,
         now: Instant,
     ) {
         self.pending.retain(|_, request| {
-            now.saturating_duration_since(request.sent_at()) <= REQUEST_TIMEOUT
+            now.saturating_duration_since(request.sent_at()) <= self.request_timeout
         });
     }
 
@@ -252,7 +254,7 @@ impl ServiceState {
         Ok(())
     }
 
-    async fn refresh_values(
+    pub async fn refresh_values(
         &mut self,
         socket: &EchoNetSocket,
     ) -> io::Result<()> {
@@ -279,7 +281,7 @@ impl ServiceState {
         Ok(())
     }
 
-    async fn process_frame(
+    pub async fn process_frame(
         &mut self,
         socket: &EchoNetSocket,
         header: FrameHeader,
@@ -599,125 +601,12 @@ fn can_inf(
         .is_some_and(|info| matches!(info.inf, Access::Required | Access::Optional))
 }
 
-/// Run the asynchronous discovery, polling, and INF-watching service until
-/// shutdown.
-///
-/// `events` is a standard-library sender drained by the caller. The service
-/// sends on it inline, so a consumer that cannot keep up must move the receiver
-/// to a blocking thread.
-///
-/// `commands` requests an immediate value poll without moving the scheduled
-/// round.
-///
-/// The service stops when `shutdown` changes to `true` or when its sender is
-/// dropped. A value already set before the call is not observed.
-///
-/// # Errors
-///
-/// Returns an I/O error for invalid configuration or receive failures.
-/// Individual request-send failures are reported as status events and the
-/// service continues polling.
-pub async fn run_service(
-    socket: EchoNetSocket,
-    config: RadarConfig,
-    events: Sender<RadarEvent>,
-    mut commands: tokio::sync::mpsc::Receiver<Command>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> io::Result<()> {
-    config
-        .validate()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-
-    let mut service = ServiceState::new(config, events);
-    service.notice(String::from("waiting for discovery"));
-
-    let mut discovery_timer = tokio::time::interval(config.discovery_interval);
-    discovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut update_sleep = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
-        service.next_update,
-    )));
-    let mut receive_buffer = [0u8; 512];
-
-    loop {
-        tokio::select! {
-            result = socket.recv(&mut receive_buffer) => {
-                let (length, source) = match result {
-                    Ok(received) => received,
-                    Err(error) => {
-                        service
-                            .model
-                            .degrade(Fault::Service(format!("receive failed: {error}")));
-                        return Err(error);
-                    },
-                };
-                service.model.record_frame(SystemTime::now());
-                if let Ok(frame) = parse(&receive_buffer[..length]) {
-                    let header = frame.header();
-                    let properties = frame
-                        .properties()
-                        .map(|property| (property.epc, property.edt.to_vec()))
-                        .collect();
-                    service.process_frame(&socket, header, properties, source).await;
-                }
-            }
-            _ = discovery_timer.tick() => {
-                let now = Instant::now();
-                service.expire_pending(now);
-                if let Err(error) = service.send_discovery(&socket).await {
-                    service.notice(format!("discovery send failed: {error}"));
-                }
-            }
-            () = &mut update_sleep => {
-                let now = Instant::now();
-                service.expire_pending(now);
-                let message = match service.refresh_values(&socket).await {
-                    Ok(()) => format!(
-                        "polling {} device object(s)",
-                        service.poll_epcs.len()
-                    ),
-                    Err(error) => format!("value update failed: {error}"),
-                };
-                service.notice(message);
-                service.next_update = now + config.update_interval;
-                update_sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::from_std(service.next_update));
-            }
-            command = commands.recv() => {
-                match command {
-                    Some(Command::PollNow) => {
-                        // A manual poll does not shift the scheduled cadence;
-                        // the next automatic round still fires on its timer.
-                        let now = Instant::now();
-                        service.expire_pending(now);
-                        let message = match service.refresh_values(&socket).await {
-                            Ok(()) => format!(
-                                "manual poll of {} device object(s)",
-                                service.poll_epcs.len()
-                            ),
-                            Err(error) => format!("manual value update failed: {error}"),
-                        };
-                        service.notice(message);
-                    }
-                    None => break,
-                }
-            }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
-                }
-            }
-        }
-    }
-    service.model.set_status(SessionStatus::Stopped);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::{CONTROLLER_EOJ, DISCOVERY_NODE_PROFILE_EOJ};
     use echonet_lite::frame::Esv;
+    use std::net::Ipv4Addr;
     use std::sync::mpsc::{self, TryRecvError};
 
     fn key(
@@ -748,31 +637,12 @@ mod tests {
 
     fn service() -> (ServiceState, mpsc::Receiver<RadarEvent>) {
         let (sender, receiver) = mpsc::channel();
-        let service = ServiceState::new(RadarConfig::default(), sender);
+        let service = ServiceState::new(SessionConfig::desktop(), Some(sender), 1);
         (service, receiver)
     }
 
     const fn is_change(event: &RadarEvent) -> bool {
         matches!(event, RadarEvent::Change(_))
-    }
-
-    #[test]
-    fn default_schedule_matches_radar_defaults() {
-        let config = RadarConfig::default();
-        assert_eq!(config.discovery_interval, Duration::from_secs(60));
-        assert_eq!(config.update_interval, Duration::from_secs(15));
-    }
-
-    #[test]
-    fn zero_poll_interval_is_rejected() {
-        let config = RadarConfig {
-            update_interval: Duration::ZERO,
-            ..RadarConfig::default()
-        };
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::ZeroInterval("update_interval"))
-        );
     }
 
     #[test]
@@ -784,7 +654,7 @@ mod tests {
             PendingRequest::PropertyMap {
                 key,
                 sent_at: Instant::now()
-                    .checked_sub(REQUEST_TIMEOUT + Duration::from_secs(1))
+                    .checked_sub(SessionConfig::desktop().request_timeout + Duration::from_secs(1))
                     .unwrap_or_else(Instant::now),
             },
         );

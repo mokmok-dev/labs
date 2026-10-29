@@ -19,6 +19,7 @@ mod format;
 mod model;
 mod protocol;
 mod service;
+mod session;
 
 pub use format::{format_edt, format_value, instantaneous_watts, power_epc};
 pub use model::{
@@ -33,4 +34,8 @@ pub use protocol::{
     NODE_PROFILE_CLASS_CODE, ProtocolError, discovery_header, get_header, parse_instance_list,
     parse_property_map,
 };
-pub use service::{Command, RadarConfig, run_service};
+pub use service::Command;
+pub use session::{
+    CommandError, NoopPulse, Pulse, RadarHandle, RadarSession, ServiceIo, SessionConfig,
+    run_service,
+};
