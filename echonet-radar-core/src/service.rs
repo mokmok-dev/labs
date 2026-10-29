@@ -293,7 +293,7 @@ impl ServiceState {
             return;
         };
         let key = pending.key();
-        if source.ip() != IpAddr::V4(key.ip) {
+        if source.ip() != IpAddr::V4(key.ip) || header.seoj != key.eoj {
             return;
         }
         let Some(pending) = self.pending.remove(&header.tid) else {
@@ -824,6 +824,41 @@ mod tests {
         }
         assert!(changes.contains(&0x80));
         assert!(changes.contains(&0xB0));
+    }
+
+    #[tokio::test]
+    async fn a_response_from_another_object_is_ignored() {
+        let socket = test_socket().await;
+        let (mut service, receiver) = service();
+        let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
+        let key = air_conditioner(source);
+        service
+            .send_value_batch(&socket, key, vec![0x80])
+            .await
+            .unwrap();
+        let tid = service
+            .pending
+            .keys()
+            .next()
+            .copied()
+            .expect("a pending request");
+
+        service
+            .process_frame(
+                &socket,
+                FrameHeader {
+                    tid,
+                    seoj: Eoj::new(0x02, 0x6B, 0x01),
+                    deoj: CONTROLLER_EOJ,
+                    esv: Esv::from_code(GET_RESPONSE_ESV_CODE),
+                },
+                vec![(0x80, vec![0x30])],
+                source,
+            )
+            .await;
+
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert!(service.pending.contains_key(&tid));
     }
 
     #[tokio::test]
