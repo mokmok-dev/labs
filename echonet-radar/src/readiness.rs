@@ -113,13 +113,7 @@ pub fn freshness(
 
 #[must_use]
 pub fn describe_fault(fault: &Fault) -> String {
-    match fault {
-        Fault::Bind { interface, detail } => {
-            format!("could not bind {interface}: {detail}")
-        },
-        Fault::Config(error) => format!("configuration rejected: {error}"),
-        Fault::Service(detail) => format!("service stopped: {detail}"),
-    }
+    fault.to_string()
 }
 #[cfg(test)]
 mod tests {
