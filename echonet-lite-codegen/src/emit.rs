@@ -128,6 +128,24 @@ fn render_classes(model: &Model) -> Result<String, String> {
     o.push_str("    }\n");
     o.push_str("}\n\n");
 
+    // The loader already sorts classes; sort here so this table's order does not
+    // depend on that loader behavior.
+    let mut class_names: Vec<(u16, &str)> = model
+        .classes
+        .iter()
+        .map(|c| (c.class, c.class_name_en.as_str()))
+        .collect();
+    class_names.sort_unstable_by_key(|&(code, _)| code);
+    o.push_str(
+        "/// English class name of every class in this appendix version, ascending by class code.\n",
+    );
+    // `'static` is elided: clippy::redundant_static_lifetimes denies it on consts.
+    o.push_str("pub const CLASS_NAMES: &[(u16, &str)] = &[\n");
+    for (code, name) in &class_names {
+        o.push_str(&format!("    (0x{code:04X}, {name:?}),\n"));
+    }
+    o.push_str("];\n\n");
+
     // Per-class Epc enums.
     for c in &model.classes {
         let entries = model
