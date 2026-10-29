@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:firewall="http://wixtoolset.org/schemas/v4/wxs/firewall">
+  <!-- Per-machine so the Windows Installer service owns the firewall rules and
+       the first launch does not need UAC. -->
+  <Package Name="ECHONET Radar"
+           Manufacturer="mokmok"
+           Version="0.1.0"
+           Language="1033"
+           UpgradeCode="611294F8-CF36-4A20-934F-FB66A48C3CE7"
+           Scope="perMachine">
+
+    <SummaryInformation Manufacturer="mokmok" />
+    <MajorUpgrade DowngradeErrorMessage="A newer ECHONET Radar is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="ECHONET Radar" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="ECHONET Radar" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="ApplicationComponents" Directory="INSTALLFOLDER">
+      <Component Id="ApplicationFiles" Guid="04395E12-6C5E-4EAF-A07E-CC70F0D5E8FB">
+        <File Id="echonetRadarExe" Source="$(var.SourceDir)\echonet-radar.exe" />
+        <File Id="echonetRadarHelperExe" Source="$(var.SourceDir)\echonet-radar-firewall-helper.exe" />
+
+        <!-- Profile takes one value, so the install authors one rule per
+             profile. Both rows belong to this component, which makes uninstall
+             remove them. -->
+        <firewall:FirewallException Id="EchonetUdp3610Private"
+                                    Name="EchonetRadarUdp3610Private"
+                                    Program="[#echonetRadarExe]"
+                                    Port="3610"
+                                    Protocol="udp"
+                                    Scope="localSubnet"
+                                    Profile="private"
+                                    IgnoreFailure="no" />
+        <firewall:FirewallException Id="EchonetUdp3610Domain"
+                                    Name="EchonetRadarUdp3610Domain"
+                                    Program="[#echonetRadarExe]"
+                                    Port="3610"
+                                    Protocol="udp"
+                                    Scope="localSubnet"
+                                    Profile="domain"
+                                    IgnoreFailure="no" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="ShortcutComponents" Directory="ApplicationProgramsFolder">
+      <Component Id="StartMenuShortcut" Guid="ACB3A389-5436-438A-A8F4-B4F86DADE4C6">
+        <Shortcut Id="ApplicationStartMenuShortcut"
+                  Name="ECHONET Radar"
+                  Description="Observe ECHONET Lite appliances on the local network"
+                  Target="[#echonetRadarExe]"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue Root="HKLM"
+                       Key="Software\mokmok\ECHONET Radar"
+                       Name="installed"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="ProductFeature" Title="ECHONET Radar" Level="1">
+      <ComponentGroupRef Id="ApplicationComponents" />
+      <ComponentGroupRef Id="ShortcutComponents" />
+    </Feature>
+  </Package>
+</Wix>

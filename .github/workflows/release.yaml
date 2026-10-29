@@ -1,0 +1,107 @@
+name: release
+# This job signs and notarizes with an Apple Developer ID, so it needs the
+# APPLE_* secrets and stays out of the default CI. Run it from a tag or by hand.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Build the bundle
+        run: nix build .#packages.aarch64-darwin.echonet-radar --print-build-logs
+      - name: Stage a writable copy
+        run: |
+          ditto "result/Applications/ECHONET Radar.app" "$RUNNER_TEMP/ECHONET Radar.app"
+          chmod -R u+w "$RUNNER_TEMP/ECHONET Radar.app"
+      - name: Import the signing identity
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" /Library/Keychains/System.keychain
+      - name: Sign
+        run: |
+          APP="$RUNNER_TEMP/ECHONET Radar.app"
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Application[^"]*\)".*/\1/p' | head -1)
+          test -n "$IDENTITY"
+          # Nested code is signed first; signing the bundle seals the result.
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" \
+            "$APP/Contents/MacOS/echonet-radar"
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+      - name: Notarize and staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          APP="$RUNNER_TEMP/ECHONET Radar.app"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/ECHONET Radar.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: echonet-radar-macos
+          path: ${{ runner.temp }}/ECHONET Radar.zip
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Build
+        run: cargo build --workspace --release --locked
+      - name: Install WiX
+        run: |
+          dotnet tool install --global wix --version 4.0.6
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.Firewall.wixext/4.0.6
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build the MSI
+        run: |
+          wix build -arch x64 -ext WixToolset.Firewall.wixext `
+            -d SourceDir=target\release -o echonet-radar.msi echonet-radar\wix\main.wxs
+      # The MSI and the helper are unsigned in v1, so SmartScreen warns.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: echonet-radar-windows
+          path: echonet-radar.msi
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Build
+        run: nix build .#packages.x86_64-linux.echonet-radar --print-build-logs
+      - name: Archive
+        run: tar -C result -czf echonet-radar-linux-x86_64.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: echonet-radar-linux
+          path: echonet-radar-linux-x86_64.tar.gz

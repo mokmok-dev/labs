@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ECHONET Radar
+GenericName=ECHONET Lite radar
+Comment=Observe ECHONET Lite appliances on the local network
+Exec=echonet-radar
+Icon=echonet-radar
+Terminal=false
+Categories=Network;Monitor;Utility;
+Keywords=ECHONET;smart home;multicast;
