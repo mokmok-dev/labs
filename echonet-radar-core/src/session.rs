@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
-use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self as std_mpsc, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime};
 use echonet_lite::frame::parse;
 use echonet_lite_udp::EchoNetSocket;
 use tokio::sync::{mpsc, watch};
-use tokio::time::Sleep;
 
 use crate::model::{
     ConfigError, Fault, RadarEvent, RadarModel, RadarSnapshot, SessionStatus, next_session_id,
@@ -17,8 +16,6 @@ use crate::protocol::{DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL};
 use crate::service::{Command, ServiceState};
 
 const COMMAND_CAPACITY: usize = 8;
-
-const IDLE_PUBLISH: Duration = Duration::from_hours(24);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -78,9 +75,9 @@ impl Pulse for NoopPulse {
 
 pub struct ServiceIo {
     pub events: Option<Sender<RadarEvent>>,
-    /// Published snapshots. `send_replace` makes a receiver-less channel
-    /// harmless.
-    pub snapshots: watch::Sender<Arc<RadarSnapshot>>,
+    /// Published snapshots. `None` is for event-only renderers; `send_replace`
+    /// makes a receiver-less channel harmless.
+    pub snapshots: Option<watch::Sender<Arc<RadarSnapshot>>>,
     pub pulse: Arc<dyn Pulse>,
 }
 
@@ -209,7 +206,7 @@ impl RadarSession {
             RadarHandle {
                 snapshots: snapshot_rx,
                 commands,
-                seen: std::cell::Cell::new(0),
+                seen: AtomicU64::new(0),
             },
         ))
     }
@@ -224,7 +221,7 @@ impl Drop for RadarSession {
 pub struct RadarHandle {
     snapshots: watch::Receiver<Arc<RadarSnapshot>>,
     commands: mpsc::Sender<Command>,
-    seen: std::cell::Cell<u64>,
+    seen: AtomicU64,
 }
 
 impl RadarHandle {
@@ -236,13 +233,13 @@ impl RadarHandle {
     /// would otherwise be invisible.
     #[must_use]
     pub fn has_changed(&self) -> bool {
-        self.snapshots.borrow().revision != self.seen.get()
+        self.snapshots.borrow().revision != self.seen.load(Ordering::Relaxed)
     }
 
     #[must_use]
     pub fn snapshot(&mut self) -> Arc<RadarSnapshot> {
         let snapshot = self.snapshots.borrow_and_update().clone();
-        self.seen.set(snapshot.revision);
+        self.seen.store(snapshot.revision, Ordering::Relaxed);
         snapshot
     }
 
@@ -315,9 +312,10 @@ pub async fn run_service(
         snapshots,
         pulse,
     } = io;
-    // The Binding snapshot the session published before the loop fixed the id.
-    let session = snapshots.borrow().session;
-    let mut publisher = Publisher::new(snapshots, pulse, config.snapshot_interval);
+    let session = snapshots
+        .as_ref()
+        .map_or_else(next_session_id, |channel| channel.borrow().session);
+    let publisher = Publisher::new(snapshots, pulse);
     let mut service = ServiceState::new(config, events, session);
     service.notice(String::from("waiting for discovery"));
     publisher.publish(&mut service.model);
@@ -327,7 +325,8 @@ pub async fn run_service(
     let mut update_sleep = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
         service.next_update,
     )));
-    let mut publish_sleep = Box::pin(tokio::time::sleep(IDLE_PUBLISH));
+    let mut publish_tick = tokio::time::interval(config.snapshot_interval);
+    publish_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut receive_buffer = [0u8; 512];
 
     loop {
@@ -397,12 +396,12 @@ pub async fn run_service(
                     break;
                 }
             }
-            () = &mut publish_sleep => {
-                publish_sleep.as_mut().reset(tokio::time::Instant::now() + IDLE_PUBLISH);
+            _ = publish_tick.tick() => {
+                if service.take_dirty() {
+                    publisher.publish(&mut service.model);
+                }
             }
         }
-        let changed = service.take_dirty();
-        publisher.settle(&mut service.model, &mut publish_sleep, changed);
     }
     service.model.set_status(SessionStatus::Stopped);
     publisher.publish(&mut service.model);
@@ -459,77 +458,37 @@ fn run_session(
         }
         let io = ServiceIo {
             events,
-            snapshots,
+            snapshots: Some(snapshots),
             pulse,
         };
         let _ = run_service(socket, config, io, commands, shutdown).await;
     });
 }
 
-/// Publishes the model at most once per interval, and once more when a burst
-/// ends.
+/// Publishes the model behind an interval tick, so a burst reaches the reader
+/// within one interval.
 struct Publisher {
-    snapshots: watch::Sender<Arc<RadarSnapshot>>,
+    snapshots: Option<watch::Sender<Arc<RadarSnapshot>>>,
     pulse: Arc<dyn Pulse>,
-    interval: Duration,
-    last: tokio::time::Instant,
-    dirty: bool,
-    armed: bool,
 }
 
 impl Publisher {
-    fn new(
-        snapshots: watch::Sender<Arc<RadarSnapshot>>,
+    const fn new(
+        snapshots: Option<watch::Sender<Arc<RadarSnapshot>>>,
         pulse: Arc<dyn Pulse>,
-        interval: Duration,
     ) -> Self {
-        Self {
-            snapshots,
-            pulse,
-            interval,
-            last: tokio::time::Instant::now(),
-            dirty: false,
-            armed: false,
-        }
-    }
-
-    const fn mark(&mut self) {
-        self.dirty = true;
+        Self { snapshots, pulse }
     }
 
     fn publish(
-        &mut self,
+        &self,
         model: &mut RadarModel,
     ) {
-        self.snapshots.send_replace(Arc::new(model.snapshot()));
-        self.pulse.pulse();
-        self.last = tokio::time::Instant::now();
-        self.dirty = false;
-        self.armed = false;
-    }
-
-    fn settle(
-        &mut self,
-        model: &mut RadarModel,
-        sleep: &mut Pin<Box<Sleep>>,
-        changed: bool,
-    ) {
-        if changed {
-            self.mark();
-        }
-        if !self.dirty {
+        let Some(snapshots) = &self.snapshots else {
             return;
-        }
-        let deadline = self.last + self.interval;
-        if tokio::time::Instant::now() >= deadline {
-            self.publish(model);
-            sleep
-                .as_mut()
-                .reset(tokio::time::Instant::now() + IDLE_PUBLISH);
-        } else if !self.armed {
-            sleep.as_mut().reset(deadline);
-            self.armed = true;
-        }
+        };
+        snapshots.send_replace(Arc::new(model.snapshot()));
+        self.pulse.pulse();
     }
 }
 
@@ -540,6 +499,16 @@ mod tests {
     use echonet_lite_udp::{MULTICAST_GROUP, MULTICAST_PORT};
     use std::net::SocketAddr;
     use std::time::Instant;
+
+    /// Every session test binds UDP 3610, and `SO_REUSEPORT` splits datagrams
+    /// by 4-tuple hash, so a parallel test could consume another test's frame.
+    static SOCKET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn socket_lock() -> std::sync::MutexGuard<'static, ()> {
+        SOCKET_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn config() -> SessionConfig {
         SessionConfig {
@@ -618,7 +587,7 @@ mod tests {
         let mut handle = RadarHandle {
             snapshots: receiver,
             commands,
-            seen: std::cell::Cell::new(0),
+            seen: AtomicU64::new(0),
         };
 
         snapshots.send_replace(Arc::new(RadarModel::new(1).snapshot()));
@@ -629,8 +598,9 @@ mod tests {
         assert!(!handle.has_changed());
     }
 
-    #[test]
-    fn start_records_running_after_the_socket_binds() {
+    #[tokio::test]
+    async fn start_records_running_after_the_socket_binds() {
+        let _guard = socket_lock();
         let (session, mut handle) = start_session();
 
         assert!(
@@ -640,8 +610,9 @@ mod tests {
         session.stop().unwrap();
     }
 
-    #[test]
-    fn a_snapshot_is_readable_from_the_handle() {
+    #[tokio::test]
+    async fn a_snapshot_is_readable_from_the_handle() {
+        let _guard = socket_lock();
         let (session, mut handle) = start_session();
         assert!(wait_for_running(&mut handle));
 
@@ -654,20 +625,23 @@ mod tests {
         session.stop().unwrap();
     }
 
-    #[test]
-    fn stop_joins_the_service_thread() {
-        let (session, handle) = start_session();
+    #[tokio::test]
+    async fn stop_joins_the_service_thread() {
+        let _guard = socket_lock();
+        let (session, mut handle) = start_session();
         let started = Instant::now();
         assert!(session.alive());
 
         session.stop().unwrap();
 
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(handle.snapshot().status, SessionStatus::Stopped);
         assert_eq!(handle.poll_now(), Err(CommandError::ServiceStopped));
     }
 
-    #[test]
-    fn dropping_a_session_does_not_wait_for_the_thread() {
+    #[tokio::test]
+    async fn dropping_a_session_does_not_wait_for_the_thread() {
+        let _guard = socket_lock();
         let (session, handle) = start_session();
         let started = Instant::now();
 
@@ -677,8 +651,9 @@ mod tests {
         drop(handle);
     }
 
-    #[test]
-    fn an_unbindable_interface_is_a_fault() {
+    #[tokio::test]
+    async fn an_unbindable_interface_is_a_fault() {
+        let _guard = socket_lock();
         let interface = Ipv4Addr::new(192, 0, 2, 1);
         let result = RadarSession::start(
             SessionConfig {
@@ -699,6 +674,7 @@ mod tests {
 
     #[test]
     fn a_received_datagram_is_published() {
+        let _guard = socket_lock();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -731,6 +707,7 @@ mod tests {
 
     #[test]
     fn rediscover_sends_a_discovery_frame() {
+        let _guard = socket_lock();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
