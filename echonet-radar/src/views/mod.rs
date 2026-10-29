@@ -1,6 +1,7 @@
 //! The screens and the formatting shared between them.
 
 pub mod devices;
+pub mod permission;
 pub mod properties;
 pub mod settings;
 pub mod start;

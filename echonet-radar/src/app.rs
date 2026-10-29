@@ -9,12 +9,15 @@ use echonet_radar_core::{
     CommandError, Fault, ObjectKey, Pulse, RadarHandle, RadarSession, RadarSnapshot, SessionConfig,
     SessionStatus,
 };
+use echonet_radar_permissions::{ApplyError, ApplyOutcome, Plan, Report, Verdict};
 
 use crate::chart;
 use crate::net::{self, Interface};
+use crate::permission::{Host, PermissionController};
 use crate::readiness::{self, Readiness};
 use crate::settings::{self, InterfaceChoice, Settings};
 use crate::views;
+use crate::views::permission::{CardAction, CardState, Confirm};
 
 /// How long a settings change waits before it is written and acted on.
 const SETTINGS_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -100,6 +103,14 @@ pub struct RadarApp {
     session_seen: Option<u64>,
     selection_judged: bool,
     running_socket: Option<(InterfaceChoice, Duration, Duration)>,
+    permissions: PermissionController,
+    report: Option<Report>,
+    plan: Option<Plan>,
+    outcome: Option<ApplyOutcome>,
+    permission_error: Option<ApplyError>,
+    trusted_helper: bool,
+    card_state: CardState,
+    permission_open: bool,
     ctx: egui::Context,
 }
 
@@ -109,6 +120,7 @@ impl RadarApp {
     #[must_use]
     pub fn new(
         startup: Startup,
+        permissions: PermissionController,
         interfaces: Vec<Interface>,
         ctx: egui::Context,
     ) -> Self {
@@ -140,6 +152,14 @@ impl RadarApp {
             session_seen: None,
             selection_judged: false,
             running_socket: None,
+            permissions,
+            report: None,
+            plan: None,
+            outcome: None,
+            permission_error: None,
+            trusted_helper: false,
+            card_state: CardState::default(),
+            permission_open: false,
             ctx,
         }
     }
@@ -150,6 +170,7 @@ impl RadarApp {
         ui: &mut egui::Ui,
     ) {
         self.poll_session();
+        self.poll_permissions();
         if self.running.is_none() {
             self.render_start_card(ui);
         } else {
@@ -194,14 +215,43 @@ impl RadarApp {
                 &self.readiness,
                 &self.snapshot,
                 &mut self.actions,
+                &mut self.permission_open,
                 &interface,
             );
         });
+
+        let forced = self.card_forced();
+        let card = views::permission::Card {
+            host: Host::current(),
+            capability: echonet_radar_permissions::capability(),
+            report: self.report.as_ref(),
+            plan: self.plan.as_ref(),
+            outcome: self.outcome,
+            error: self.permission_error.as_ref(),
+            trusted: self.trusted_helper,
+            closable: self.permission_open && !forced && self.card_state.confirming.is_none(),
+        };
+        let mut card_action = CardAction::None;
+        if forced || self.permission_open || self.card_state.confirming.is_some() {
+            let state = &mut self.card_state;
+            egui::Panel::top("permission-card").show(ui, |ui| {
+                card_action = views::permission::permission_card(ui, &card, state);
+            });
+        }
+
+        let mut settings_actions = views::settings::SettingsActions::default();
         egui::Panel::bottom("settings-panel").show(ui, |ui| {
             egui::CollapsingHeader::new("Settings and diagnostics").show(ui, |ui| {
-                views::settings::settings(ui, &mut self.settings, &self.interfaces);
+                views::settings::settings(
+                    ui,
+                    &mut self.settings,
+                    &self.interfaces,
+                    &card,
+                    &mut settings_actions,
+                );
             });
         });
+
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(notice) = &self.notice {
                 ui.label(notice);
@@ -217,6 +267,48 @@ impl RadarApp {
                 views::properties::property_pane(ui, &self.snapshot, key);
             }
         });
+
+        self.act_on_card(card_action);
+        if settings_actions.add_rule {
+            self.permission_open = true;
+            self.card_state.confirming = Some(Confirm::AddRule);
+        }
+        if settings_actions.remove_rule {
+            self.permissions.remove_rule();
+        }
+    }
+
+    fn card_forced(&self) -> bool {
+        matches!(
+            self.readiness,
+            Readiness::Unverified { .. } | Readiness::Degraded { .. }
+        ) || matches!(
+            self.report.as_ref().map(|report| report.verdict),
+            Some(Verdict::Unsupported { .. } | Verdict::ManualSteps { .. })
+        )
+    }
+
+    fn poll_permissions(&mut self) {
+        self.permissions.poll();
+        self.report = self.permissions.report();
+        self.plan = self.permissions.last_plan();
+        self.outcome = self.permissions.last_outcome();
+        self.permission_error = self.permissions.last_error();
+        self.trusted_helper = self.permissions.helper_trusted();
+    }
+
+    fn act_on_card(
+        &mut self,
+        action: CardAction,
+    ) {
+        match action {
+            CardAction::None => {},
+            CardAction::CheckAgain => self.permissions.check_again(),
+            CardAction::AddRule => self.permissions.add_rule(),
+            CardAction::OpenFirewallSettings => self.permissions.open_firewall_settings(),
+            CardAction::OpenLocalNetworkSettings => self.permissions.open_local_network_settings(),
+            CardAction::Close => self.permission_open = false,
+        }
     }
 
     fn settle(&mut self) {
@@ -518,7 +610,7 @@ mod tests {
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable as _;
 
-    use crate::test_support::{key, object, property, snapshot};
+    use crate::test_support::{key, object, property, snapshot, texts};
 
     use super::*;
 
@@ -548,6 +640,13 @@ mod tests {
     }
 
     fn app() -> RadarApp {
+        app_with_report(Report {
+            verdict: Verdict::NotInspected,
+            checked_at: SystemTime::now(),
+        })
+    }
+
+    fn app_with_report(report: Report) -> RadarApp {
         RadarApp::new(
             Startup {
                 settings: Settings::default(),
@@ -556,50 +655,10 @@ mod tests {
                 stored_interface: InterfaceChoice::Auto,
                 interface_override: None,
             },
+            PermissionController::stub(report),
             Vec::new(),
             egui::Context::default(),
         )
-    }
-
-    fn texts(output: &mut egui::FullOutput) -> Vec<(String, egui::Color32)> {
-        // A frame the test does not render leaves glyph deltas behind, and
-        // dropping them panics while a failing assertion unwinds.
-        output.textures_delta.clear();
-        let mut collected = Vec::new();
-        for clipped in &output.shapes {
-            collect(&clipped.shape, &mut collected);
-        }
-        collected
-    }
-
-    fn collect(
-        shape: &egui::Shape,
-        collected: &mut Vec<(String, egui::Color32)>,
-    ) {
-        match shape {
-            egui::Shape::Text(text) => {
-                collected.push((text.galley.text().to_owned(), text_color(text)));
-            },
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    collect(shape, collected);
-                }
-            },
-            _ => {},
-        }
-    }
-
-    fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
-        match text
-            .galley
-            .job
-            .sections
-            .first()
-            .map(|section| section.format.color)
-        {
-            Some(color) if color != egui::Color32::PLACEHOLDER => color,
-            _ => text.override_text_color.unwrap_or(text.fallback_color),
-        }
     }
 
     fn has_text(
@@ -830,6 +889,10 @@ mod tests {
                 stored_interface: InterfaceChoice::Auto,
                 interface_override: Some(String::from("br0")),
             },
+            PermissionController::stub(Report {
+                verdict: Verdict::NotInspected,
+                checked_at: SystemTime::now(),
+            }),
             Vec::new(),
             egui::Context::default(),
         );
@@ -882,6 +945,10 @@ mod tests {
                 stored_interface: InterfaceChoice::Auto,
                 interface_override: None,
             },
+            PermissionController::stub(Report {
+                verdict: Verdict::NotInspected,
+                checked_at: SystemTime::now(),
+            }),
             Vec::new(),
             egui::Context::default(),
         );
@@ -930,6 +997,68 @@ mod tests {
         harness.run();
         harness.get_by_label_contains("224.0.23.0:3610");
         harness.get_by_label_contains("Bound addresses 0.0.0.0:3610");
+    }
+
+    #[test]
+    fn a_rule_in_the_report_leaves_readiness_unverified() {
+        let since = SystemTime::now();
+        let mut app = app_with_report(Report {
+            verdict: Verdict::RulePresent {
+                method: echonet_radar_permissions::Method::WindowsDefender,
+                scope: echonet_radar_permissions::Scope::ApplicationAndPort,
+            },
+            checked_at: since,
+        });
+        app.readiness = Readiness::Unverified { since };
+        app.snapshot = Arc::new(RadarSnapshot {
+            revision: 1,
+            session: 1,
+            status: SessionStatus::Running { since },
+            objects: BTreeMap::new(),
+            recent: Vec::new(),
+            notices: Vec::new(),
+            frames_seen: 0,
+            last_frame: None,
+        });
+        let ctx = egui::Context::default();
+        app.poll_permissions();
+        // A panel clips to the height it stored last frame, so the card's first
+        // frame draws its heading only.
+        let _sized = texts(&mut ctx.run_ui(egui::RawInput::default(), |ui| app.show_started(ui)));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.show_started(ui));
+        let drawn: Vec<String> = texts(&mut output)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            drawn
+                .iter()
+                .any(|text| text.contains("A matching firewall rule")),
+            "{drawn:?}"
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|text| text.contains("Only incoming traffic proves the path"))
+        );
+        assert_eq!(app.readiness, Readiness::Unverified { since });
+    }
+
+    #[test]
+    fn the_network_access_button_opens_the_card() {
+        let mut app = app();
+        app.snapshot = Arc::new(snapshot(SystemTime::now()));
+        app.readiness = Readiness::Listening {
+            since: SystemTime::now(),
+            last: SystemTime::now(),
+            frames: 3,
+        };
+        let mut harness = Harness::new_ui_state(|ui, app: &mut RadarApp| app.show_started(ui), app);
+        harness.get_by_label("Network access").click();
+        harness.step();
+        assert!(harness.state().permission_open);
+        harness.step();
+        harness.get_by_label("Firewall and network access");
     }
 
     #[test]

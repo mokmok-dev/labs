@@ -6,13 +6,15 @@
 //! commands only.
 //!
 //! ```text
-//! echonet-radar                    # open the window and pick an interface
-//! echonet-radar --interface br0    # use br0 for this run only
+//! echonet-radar                      # open the window and pick an interface
+//! echonet-radar --interface br0      # use br0 for this run only
+//! echonet-radar --permission-inspect # print the firewall report as JSON
 //! ```
 
 mod app;
 mod chart;
 mod net;
+mod permission;
 mod readiness;
 mod settings;
 #[cfg(test)]
@@ -28,6 +30,7 @@ use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 use app::{RadarApp, Startup};
+use permission::PermissionController;
 use settings::InterfaceChoice;
 
 /// Command-line arguments.
@@ -37,15 +40,44 @@ struct Args {
     /// Interface to join the multicast group on, for this run only.
     #[arg(long, value_name = "NAME")]
     interface: Option<String>,
+    /// Print the firewall inspection report as JSON and exit.
+    #[arg(long)]
+    permission_inspect: bool,
+}
+
+/// Where a run goes once the arguments are read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Launch {
+    /// Print the report and exit, before tracing, settings or the window.
+    Inspect,
+    /// Open the window with this interface override.
+    Window {
+        /// The `--interface` name, for this run only.
+        interface: Option<String>,
+    },
+}
+
+fn dispatch(args: Args) -> Launch {
+    if args.permission_inspect {
+        Launch::Inspect
+    } else {
+        Launch::Window {
+            interface: args.interface,
+        }
+    }
 }
 
 fn main() -> eframe::Result {
-    let args = Args::parse();
+    let launch = dispatch(Args::parse());
+    let Launch::Window { interface } = launch else {
+        print_inspection();
+        return Ok(());
+    };
     init_tracing();
 
     let (mut settings, notice) = settings::load();
     let stored_interface = settings.interface.clone();
-    let interface_override = args.interface;
+    let interface_override = interface;
     if let Some(name) = &interface_override {
         settings.interface = InterfaceChoice::Named(name.clone());
     }
@@ -64,11 +96,24 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             Ok(Box::new(RadarApp::new(
                 startup,
+                PermissionController::start(),
                 interfaces,
                 cc.egui_ctx.clone(),
             )))
         }),
     )
+}
+
+/// The `--permission-inspect` path: one report, JSON, no window.
+fn print_inspection() {
+    let report = echonet_radar_permissions::inspect(&permission::request());
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => println!("{json}"),
+        Err(error) => {
+            eprintln!("could not render the firewall report: {error}");
+            std::process::exit(1);
+        },
+    }
 }
 
 fn init_tracing() {
@@ -90,4 +135,46 @@ fn log_file() -> Option<File> {
         .append(true)
         .open(directory.join("echonet-radar.log"))
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Args {
+        Args::try_parse_from(args).expect("the arguments parse")
+    }
+
+    #[test]
+    fn permission_inspect_returns_the_inspect_path() {
+        let args = parse(&["echonet-radar", "--permission-inspect"]);
+        assert!(args.permission_inspect);
+        assert_eq!(dispatch(args), Launch::Inspect);
+    }
+
+    #[test]
+    fn an_interface_override_cannot_pull_the_inspect_flag_into_the_window() {
+        let args = parse(&[
+            "echonet-radar",
+            "--interface",
+            "br0",
+            "--permission-inspect",
+        ]);
+        assert_eq!(dispatch(args), Launch::Inspect);
+    }
+
+    #[test]
+    fn a_plain_run_opens_the_window() {
+        let args = parse(&["echonet-radar", "--interface", "br0"]);
+        assert_eq!(
+            dispatch(args),
+            Launch::Window {
+                interface: Some(String::from("br0"))
+            }
+        );
+        assert_eq!(
+            dispatch(parse(&["echonet-radar"])),
+            Launch::Window { interface: None }
+        );
+    }
 }

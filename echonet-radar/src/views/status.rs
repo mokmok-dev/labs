@@ -14,6 +14,7 @@ pub fn status_bar(
     readiness: &Readiness,
     snapshot: &RadarSnapshot,
     actions: &mut AppActions,
+    permission_open: &mut bool,
     interface: &str,
 ) {
     ui.horizontal_wrapped(|ui| {
@@ -27,6 +28,10 @@ pub fn status_bar(
         ));
         ui.separator();
         ui.label(format!("{} devices", snapshot.objects.len()));
+        ui.separator();
+        if ui.button("Network access").clicked() {
+            *permission_open = !*permission_open;
+        }
         ui.separator();
         let bound = matches!(
             readiness,
