@@ -59,11 +59,10 @@ pub enum Freshness {
     Lost,
 }
 
+/// Derive readiness from the snapshot. `Readiness::NotStarted` exists only
+/// before the first session, because every running session publishes a status.
 #[must_use]
-pub fn step(
-    _state: &Readiness,
-    snapshot: &RadarSnapshot,
-) -> Readiness {
+pub fn step(snapshot: &RadarSnapshot) -> Readiness {
     match &snapshot.status {
         SessionStatus::Binding => Readiness::Binding,
         SessionStatus::Running { since } => {
@@ -120,7 +119,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::net::Ipv4Addr;
 
-    use echonet_radar_core::{ConfigError, SessionStatus};
+    use echonet_radar_core::SessionStatus;
 
     use super::*;
 
@@ -146,19 +145,16 @@ mod tests {
         let since = at(10);
         let last = at(20);
         let binding = snapshot(SessionStatus::Binding);
-        assert_eq!(step(&Readiness::NotStarted, &binding), Readiness::Binding);
+        assert_eq!(step(&binding), Readiness::Binding);
 
         let mut unverified = snapshot(SessionStatus::Running { since });
         unverified.frames_seen = 0;
-        assert_eq!(
-            step(&Readiness::Binding, &unverified),
-            Readiness::Unverified { since }
-        );
+        assert_eq!(step(&unverified), Readiness::Unverified { since });
 
         let mut listening = snapshot(SessionStatus::Running { since });
         listening.last_frame = Some(last);
         assert_eq!(
-            step(&Readiness::Unverified { since }, &listening),
+            step(&listening),
             Readiness::Listening {
                 since,
                 last,
@@ -175,14 +171,7 @@ mod tests {
             last_frame: Some(last),
         });
         assert_eq!(
-            step(
-                &Readiness::Listening {
-                    since,
-                    last,
-                    frames: 9
-                },
-                &degraded
-            ),
+            step(&degraded),
             Readiness::Degraded {
                 fault,
                 last_frame: Some(last)
@@ -190,47 +179,7 @@ mod tests {
         );
 
         let stopped = snapshot(SessionStatus::Stopped);
-        assert_eq!(
-            step(
-                &Readiness::Degraded {
-                    fault: Fault::Config(ConfigError::ZeroInterval("update_interval")),
-                    last_frame: None,
-                },
-                &stopped
-            ),
-            Readiness::Stopped
-        );
-    }
-
-    #[test]
-    fn step_is_idempotent_for_every_row() {
-        let since = at(10);
-        let cases = [
-            Readiness::NotStarted,
-            Readiness::Binding,
-            Readiness::Unverified { since },
-            Readiness::Listening {
-                since,
-                last: at(20),
-                frames: 2,
-            },
-            Readiness::Degraded {
-                fault: Fault::Service(String::from("socket closed")),
-                last_frame: Some(at(20)),
-            },
-            Readiness::Stopped,
-        ];
-        let snapshots = [
-            snapshot(SessionStatus::Binding),
-            snapshot(SessionStatus::Running { since }),
-            snapshot(SessionStatus::Stopped),
-        ];
-        for state in &cases {
-            for snap in &snapshots {
-                let once = step(state, snap);
-                assert_eq!(step(&once, snap), once, "not idempotent for {state:?}");
-            }
-        }
+        assert_eq!(step(&stopped), Readiness::Stopped);
     }
 
     #[test]

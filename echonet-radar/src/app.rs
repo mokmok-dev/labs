@@ -389,7 +389,7 @@ impl RadarApp {
             self.snapshot = running.handle.snapshot();
         }
         if self.running.is_some() {
-            self.readiness = readiness::step(&self.readiness, &self.snapshot);
+            self.readiness = readiness::step(&self.snapshot);
         }
         self.adopt_selection();
         if self.running.is_some() {
@@ -494,7 +494,7 @@ impl RadarApp {
         match RadarSession::start(config, Arc::new(EguiPulse(self.ctx.clone()))) {
             Ok((session, mut handle)) => {
                 self.snapshot = handle.snapshot();
-                self.readiness = readiness::step(&Readiness::NotStarted, &self.snapshot);
+                self.readiness = readiness::step(&self.snapshot);
                 self.session_seen = None;
                 self.selection_judged = false;
                 self.running_socket = Some(self.socket_settings());
