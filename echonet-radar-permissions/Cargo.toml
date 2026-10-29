@@ -1,0 +1,14 @@
+[package]
+description = "Inbound firewall capability, inspection and elevation plans"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+name = "echonet-radar-permissions"
+rust-version = "1.98"
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
