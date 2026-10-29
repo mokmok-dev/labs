@@ -236,6 +236,8 @@ pub enum Observation {
         key: ObjectKey,
         /// Two-byte class code of the object.
         class_code: u16,
+        /// Address the announcement came from.
+        source: SocketAddr,
     },
     /// A property answered with a value.
     Value {
@@ -249,6 +251,8 @@ pub enum Observation {
         text: String,
         /// Wall-clock time at which the value was observed.
         at: SystemTime,
+        /// Address the answer came from.
+        source: SocketAddr,
     },
     /// A tracked object answered without a value this fold records.
     Seen {
@@ -256,6 +260,8 @@ pub enum Observation {
         key: ObjectKey,
         /// Wall-clock time at which the object answered.
         at: SystemTime,
+        /// Address the answer came from.
+        source: SocketAddr,
     },
     /// The service raised a status message.
     Status(String),
@@ -337,18 +343,21 @@ impl RadarModel {
         observation: Observation,
     ) -> Projection {
         match observation {
-            Observation::Device { key, class_code } => {
+            Observation::Device {
+                key,
+                class_code,
+                source,
+            } => {
                 let is_new = !self.objects.contains_key(&key);
                 let object = self.object_mut(key, SystemTime::now());
                 object.class_code = class_code;
                 object.class_name = class_name(class_code);
+                object.source = source;
                 Projection {
-                    event: is_new.then(|| {
-                        RadarEvent::Device(DeviceEvent {
-                            source: key.listen_address(),
-                            eoj: key.eoj,
-                        })
-                    }),
+                    event: is_new.then_some(RadarEvent::Device(DeviceEvent {
+                        source,
+                        eoj: key.eoj,
+                    })),
                     dirty: true,
                 }
             },
@@ -358,9 +367,11 @@ impl RadarModel {
                 raw_edt,
                 text,
                 at,
+                source,
             } => {
                 let object = self.object_mut(key, at);
                 object.last_seen = at;
+                object.source = source;
                 let previous = object.properties.insert(
                     epc,
                     PropertySnapshot {
@@ -389,7 +400,7 @@ impl RadarModel {
                 Projection {
                     event: Some(RadarEvent::Change(ChangeEvent {
                         at,
-                        source: key.listen_address(),
+                        source,
                         eoj: key.eoj,
                         epc,
                         text,
@@ -398,12 +409,14 @@ impl RadarModel {
                     dirty: true,
                 }
             },
-            Observation::Seen { key, at } => {
-                self.object_mut(key, at).last_seen = at;
+            Observation::Seen { key, at, source } => {
+                let object = self.object_mut(key, at);
+                object.last_seen = at;
+                object.source = source;
                 Projection {
                     event: Some(RadarEvent::Seen(SeenEvent {
                         at,
-                        source: key.listen_address(),
+                        source,
                         eoj: key.eoj,
                     })),
                     dirty: true,
@@ -484,6 +497,10 @@ mod tests {
         }
     }
 
+    fn source() -> SocketAddr {
+        "192.0.2.7:49152".parse().unwrap()
+    }
+
     fn value(
         key: ObjectKey,
         epc: u8,
@@ -496,6 +513,7 @@ mod tests {
             raw_edt,
             text: String::from(text),
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            source: source(),
         }
     }
 
@@ -507,18 +525,19 @@ mod tests {
         let projection = model.observe(Observation::Device {
             key,
             class_code: 0x0130,
+            source: source(),
         });
 
         let Some(RadarEvent::Device(device)) = projection.event else {
             panic!("expected a device event");
         };
-        assert_eq!(device.source, "192.0.2.7:3610".parse().unwrap());
+        assert_eq!(device.source, source());
         assert_eq!(device.eoj, key.eoj);
         assert!(projection.dirty);
         let snapshot = model.snapshot();
         assert_eq!(
             snapshot.objects.get(&key).map(|object| object.source),
-            Some("192.0.2.7:3610".parse().unwrap())
+            Some(source())
         );
     }
 
@@ -548,10 +567,15 @@ mod tests {
         model.observe(Observation::Device {
             key,
             class_code: 0x0130,
+            source: source(),
         });
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
 
-        let projection = model.observe(Observation::Seen { key, at });
+        let projection = model.observe(Observation::Seen {
+            key,
+            at,
+            source: source(),
+        });
 
         let Some(RadarEvent::Seen(seen)) = projection.event else {
             panic!("expected a seen event");
@@ -583,6 +607,7 @@ mod tests {
         model.observe(Observation::Device {
             key,
             class_code: 0x0130,
+            source: source(),
         });
 
         let object = &model.snapshot().objects[&key];

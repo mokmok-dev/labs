@@ -317,7 +317,7 @@ impl ServiceState {
                 self.process_property_map(key, &properties);
             },
             PendingRequest::Values { key, epcs, .. } => {
-                self.process_values(key, &epcs, &properties);
+                self.process_values(key, &epcs, &properties, source);
             },
         }
     }
@@ -358,6 +358,7 @@ impl ServiceState {
             self.fold(Observation::Device {
                 key,
                 class_code: eoj.class_code(),
+                source,
             });
         }
         is_new
@@ -472,8 +473,9 @@ impl ServiceState {
         key: ObjectKey,
         requested_epcs: &[u8],
         properties: &[(u8, Vec<u8>)],
+        source: SocketAddr,
     ) {
-        self.send_seen(key);
+        self.send_seen(key, source);
         for (epc, edt) in properties {
             if !requested_epcs.contains(epc) || edt.is_empty() {
                 // A requested property can come back without data (PDC 0) when
@@ -482,7 +484,7 @@ impl ServiceState {
                 // discarding the whole response.
                 continue;
             }
-            self.record_value(key, *epc, edt);
+            self.record_value(key, *epc, edt, source);
         }
     }
 
@@ -513,10 +515,10 @@ impl ServiceState {
         for (epc, edt) in properties {
             // Draw a state change only for values the class may announce via INF.
             if can_inf(class_code, epc) && !edt.is_empty() {
-                self.record_value(key, epc, &edt);
+                self.record_value(key, epc, &edt, source);
             }
         }
-        self.send_seen(key);
+        self.send_seen(key, source);
     }
 
     /// Record a property EDT, emitting a [`RadarEvent::Change`] when it differs
@@ -526,6 +528,7 @@ impl ServiceState {
         key: ObjectKey,
         epc: u8,
         edt: &[u8],
+        source: SocketAddr,
     ) {
         self.fold(Observation::Value {
             key,
@@ -533,16 +536,19 @@ impl ServiceState {
             raw_edt: edt.to_vec(),
             text: format_edt(key.eoj.class_code(), epc, edt),
             at: SystemTime::now(),
+            source,
         });
     }
 
     fn send_seen(
         &mut self,
         key: ObjectKey,
+        source: SocketAddr,
     ) {
         self.fold(Observation::Seen {
             key,
             at: SystemTime::now(),
+            source,
         });
     }
 }
@@ -668,7 +674,7 @@ mod tests {
         let key = air_conditioner("127.0.0.1:3610".parse().unwrap());
 
         // First observation is a change.
-        service.record_value(key, 0x80, &[0x30]);
+        service.record_value(key, 0x80, &[0x30], key.listen_address());
         let RadarEvent::Change(first) = receiver.recv().unwrap() else {
             panic!("expected a change event");
         };
@@ -676,11 +682,11 @@ mod tests {
         assert_eq!(first.text, "Operation status ON");
 
         // An identical value is not reported again.
-        service.record_value(key, 0x80, &[0x30]);
+        service.record_value(key, 0x80, &[0x30], key.listen_address());
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
 
         // A different value is reported.
-        service.record_value(key, 0x80, &[0x31]);
+        service.record_value(key, 0x80, &[0x31], key.listen_address());
         let RadarEvent::Change(second) = receiver.recv().unwrap() else {
             panic!("expected a change event");
         };
@@ -692,13 +698,13 @@ mod tests {
         let (mut service, receiver) = service();
         let key = air_conditioner("127.0.0.1:3610".parse().unwrap());
 
-        service.record_value(key, 0x80, &[0x30]);
-        service.record_value(key, 0xBB, &[0x01, 0x1E]);
+        service.record_value(key, 0x80, &[0x30], key.listen_address());
+        service.record_value(key, 0xBB, &[0x01, 0x1E], key.listen_address());
         assert!(is_change(&receiver.recv().unwrap()));
         assert!(is_change(&receiver.recv().unwrap()));
 
         // Changing one EPC does not re-report the other.
-        service.record_value(key, 0x80, &[0x31]);
+        service.record_value(key, 0x80, &[0x31], key.listen_address());
         let RadarEvent::Change(changed) = receiver.recv().unwrap() else {
             panic!("expected a change event");
         };
@@ -710,7 +716,7 @@ mod tests {
         let (mut service, receiver) = service();
         let key = air_conditioner("127.0.0.1:3610".parse().unwrap());
 
-        service.record_value(key, 0x80, &[0x30]);
+        service.record_value(key, 0x80, &[0x30], key.listen_address());
         let RadarEvent::Change(change) = receiver.recv().unwrap() else {
             panic!("expected a change event");
         };
@@ -723,11 +729,11 @@ mod tests {
         let (mut service, receiver) = service();
         let key = air_conditioner("127.0.0.1:3610".parse().unwrap());
 
-        service.process_values(key, &[0x80], &[(0x80, vec![0x30])]);
+        service.process_values(key, &[0x80], &[(0x80, vec![0x30])], key.listen_address());
         assert!(matches!(receiver.recv().unwrap(), RadarEvent::Seen(_)));
         assert!(is_change(&receiver.recv().unwrap()));
 
-        service.process_values(key, &[0x80], &[(0x80, vec![0x30])]);
+        service.process_values(key, &[0x80], &[(0x80, vec![0x30])], key.listen_address());
         assert!(matches!(receiver.recv().unwrap(), RadarEvent::Seen(_)));
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
     }
