@@ -1,8 +1,8 @@
 //! End-to-end tests of the generated ECHONET Lite codec against the MRA data.
 
-use echonet_lite::ecodec::Eoj;
 use echonet_lite::ecodec::class_0000::Epc as Epc00;
 use echonet_lite::ecodec::class_0130::Epc as Epc0130;
+use echonet_lite::ecodec::{CLASS_NAMES, Eoj, class_name};
 use echonet_lite::{Access, DataKind, DecodeError, EdtValue, decode, decode_eoj, lookup};
 
 #[test]
@@ -141,4 +141,33 @@ fn node_profile_instance_list_passes_through() {
     let edt = [0x02, 0x05, 0xFF, 0x01, 0x01, 0x02, 0x01];
     let d = decode(0x0EF0, 0xD5, &edt).unwrap();
     assert_eq!(d.value, EdtValue::Raw(&edt[..]));
+}
+
+#[test]
+fn class_names_sorted_without_duplicate_codes() {
+    assert!(!CLASS_NAMES.is_empty(), "class table must not be empty");
+    for pair in CLASS_NAMES.windows(2) {
+        assert!(
+            pair[0].0 < pair[1].0,
+            "codes {} and {} unsorted or duplicate",
+            pair[0].0,
+            pair[1].0
+        );
+    }
+}
+
+#[test]
+fn class_name_resolves_every_table_entry_and_agrees_with_eoj() {
+    for &(code, name) in CLASS_NAMES {
+        assert_eq!(class_name(code), name);
+        let eoj = Eoj::from_code(code);
+        assert!(!matches!(eoj, Eoj::Unknown(_)));
+        assert_eq!(eoj.class_code(), code);
+    }
+}
+
+#[test]
+fn class_name_falls_back_for_absent_code() {
+    assert_eq!(class_name(0xFFFF), "Unknown class");
+    assert!(matches!(Eoj::from_code(0xFFFF), Eoj::Unknown(0xFFFF)));
 }

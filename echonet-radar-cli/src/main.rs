@@ -34,7 +34,7 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local, SecondsFormat, Utc};
@@ -45,7 +45,8 @@ use echonet_lite::frame::{Eoj, Esv, Frame, FrameHeader, Property, parse};
 use echonet_lite_udp::EchoNetSocket;
 use echonet_radar_core::{
     CONTROLLER_EOJ, ChangeEvent, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, DeviceEvent,
-    RadarConfig, RadarEvent, format_edt, get_header, parse_property_map, run_service,
+    NoopPulse, RadarEvent, ServiceIo, SessionConfig, format_edt, get_header, parse_property_map,
+    run_service,
 };
 
 /// Receive buffer size. ECHONET Lite frames are at most 256 bytes; the extra
@@ -140,11 +141,12 @@ struct WriteProperty {
 }
 
 impl Arguments {
-    const fn radar_config(&self) -> RadarConfig {
-        RadarConfig {
+    const fn session_config(&self) -> SessionConfig {
+        SessionConfig {
             interface: self.interface,
             discovery_interval: Duration::from_secs(self.discovery_interval_seconds),
             update_interval: Duration::from_secs(self.update_interval_seconds),
+            ..SessionConfig::desktop()
         }
     }
 }
@@ -198,7 +200,7 @@ async fn run(arguments: Arguments) -> io::Result<()> {
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     let output = output(&arguments, interactive);
     if output == Output::Dashboard {
-        return run_dashboard(arguments.radar_config());
+        return run_dashboard(arguments.session_config());
     }
 
     let socket = EchoNetSocket::bind_default_multicast(arguments.interface)
@@ -228,7 +230,7 @@ async fn run(arguments: Arguments) -> io::Result<()> {
             "echonet-radar-cli: active mode (discovery {}s, polling {}s)",
             arguments.discovery_interval_seconds, arguments.update_interval_seconds
         );
-        run_active(socket, arguments.radar_config()).await
+        run_active(socket, arguments.session_config()).await
     } else {
         run_passive(socket).await
     }
@@ -260,13 +262,18 @@ async fn run_passive(socket: EchoNetSocket) -> io::Result<()> {
 /// Discover devices and poll their values, printing every state change.
 async fn run_active(
     socket: EchoNetSocket,
-    config: RadarConfig,
+    config: SessionConfig,
 ) -> io::Result<()> {
     let (events, event_receiver) = mpsc::channel();
     // Hold the command and shutdown senders open: if either channel closes, the
     // service treats it as a stop request and exits immediately.
     let (_commands, command_receiver) = tokio::sync::mpsc::channel(8);
     let (_shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
+    let io = ServiceIo {
+        events: Some(events),
+        snapshots: None,
+        pulse: Arc::new(NoopPulse),
+    };
 
     // The service publishes through a std channel; drain it on a blocking thread
     // so the current-thread runtime never stalls on terminal output.
@@ -276,7 +283,7 @@ async fn run_active(
         }
     });
 
-    let result = run_service(socket, config, events, command_receiver, shutdown_receiver).await;
+    let result = run_service(socket, config, io, command_receiver, shutdown_receiver).await;
     let _ = printer.await;
     result
 }
@@ -758,9 +765,14 @@ mod tests {
             arguments.update_interval_seconds,
             DEFAULT_UPDATE_INTERVAL.as_secs()
         );
-        let config = arguments.radar_config();
+        let config = arguments.session_config();
+        assert_eq!(config.interface, arguments.interface);
         assert_eq!(config.discovery_interval, DEFAULT_DISCOVERY_INTERVAL);
         assert_eq!(config.update_interval, DEFAULT_UPDATE_INTERVAL);
+        assert_eq!(
+            config.snapshot_interval,
+            SessionConfig::desktop().snapshot_interval
+        );
     }
 
     #[test]

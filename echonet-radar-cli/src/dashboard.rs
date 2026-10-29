@@ -1,16 +1,15 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::format_eoj;
 use chrono::{DateTime, Local, Utc};
-use echonet_lite::frame::Eoj;
-use echonet_lite_udp::{EchoNetSocket, MULTICAST_GROUP, MULTICAST_PORT};
+use echonet_lite_udp::{MULTICAST_GROUP, MULTICAST_PORT};
 use echonet_radar_core::{
-    Command, RadarConfig, RadarEvent, format_value, instantaneous_watts, power_epc, run_service,
+    CommandError, Fault, NoopPulse, ObjectKey, ObjectSnapshot, PropertySnapshot, RadarHandle,
+    RadarSession, RadarSnapshot, SessionConfig, SessionStatus, format_value, instantaneous_watts,
+    power_epc,
 };
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -100,46 +99,17 @@ enum SeriesState {
     },
 }
 
-struct ObjectRow {
-    address: SocketAddr,
-    eoj: Eoj,
-    values: BTreeMap<u8, StoredValue>,
-    last_seen: SystemTime,
-}
-
-impl ObjectRow {
-    const fn new(
-        address: SocketAddr,
-        eoj: Eoj,
-        at: SystemTime,
-    ) -> Self {
-        Self {
-            address,
-            eoj,
-            values: BTreeMap::new(),
-            last_seen: at,
-        }
-    }
-}
-
-struct StoredValue {
-    raw: Vec<u8>,
-    text: String,
-}
-
 #[derive(Clone, Copy)]
 struct PowerSource<'a> {
-    row: &'a ObjectRow,
+    object: &'a ObjectSnapshot,
     watts: i64,
 }
 
-type ObjectKey = (IpAddr, u16, u8);
-
 struct Dashboard {
-    config: RadarConfig,
+    config: SessionConfig,
+    snapshot: Arc<RadarSnapshot>,
     started: Instant,
     status: Option<(SystemTime, String)>,
-    objects: BTreeMap<ObjectKey, ObjectRow>,
     samples: VecDeque<Sample>,
     selected: Option<ObjectKey>,
     first: usize,
@@ -147,12 +117,15 @@ struct Dashboard {
 }
 
 impl Dashboard {
-    fn new(config: RadarConfig) -> Self {
+    fn new(
+        config: SessionConfig,
+        snapshot: Arc<RadarSnapshot>,
+    ) -> Self {
         Self {
             config,
+            status: status_line(&snapshot),
+            snapshot,
             started: Instant::now(),
-            status: None,
-            objects: BTreeMap::new(),
             samples: VecDeque::new(),
             selected: None,
             first: 0,
@@ -162,42 +135,17 @@ impl Dashboard {
 
     fn apply(
         &mut self,
-        event: RadarEvent,
+        snapshot: Arc<RadarSnapshot>,
     ) {
-        match event {
-            RadarEvent::Device(device) => {
-                self.row_mut(device.source, device.eoj).last_seen = SystemTime::now();
-            },
-            RadarEvent::Change(change) => {
-                let class_code = change.eoj.class_code();
-                let text = cell_text(class_code, change.epc, &change.raw_edt);
-                let row = self.row_mut(change.source, change.eoj);
-                row.last_seen = change.at;
-                row.values.insert(
-                    change.epc,
-                    StoredValue {
-                        raw: change.raw_edt,
-                        text,
-                    },
-                );
-            },
-            RadarEvent::Seen(seen) => {
-                self.row_mut(seen.source, seen.eoj).last_seen = seen.at;
-            },
-            RadarEvent::Status(status) => {
-                self.status = Some((SystemTime::now(), status));
-            },
+        let restarted = snapshot.session != self.snapshot.session;
+        let vanished = self
+            .selected
+            .is_some_and(|key| !snapshot.objects.contains_key(&key));
+        if restarted || vanished {
+            self.selected = None;
         }
-    }
-
-    fn row_mut(
-        &mut self,
-        address: SocketAddr,
-        eoj: Eoj,
-    ) -> &mut ObjectRow {
-        self.objects
-            .entry((address.ip(), eoj.class_code(), eoj.instance))
-            .or_insert_with(|| ObjectRow::new(address, eoj, SystemTime::now()))
+        self.status = status_line(&snapshot);
+        self.snapshot = snapshot;
     }
 
     fn sample(
@@ -221,13 +169,16 @@ impl Dashboard {
 
     fn selected_key(&self) -> Option<ObjectKey> {
         self.selected
-            .filter(|key| self.objects.contains_key(key))
-            .or_else(|| self.objects.keys().next().copied())
+            .filter(|key| self.snapshot.objects.contains_key(key))
+            .or_else(|| self.snapshot.objects.keys().next().copied())
     }
 
     fn selected_index(&self) -> Option<usize> {
         let key = self.selected_key()?;
-        self.objects.keys().position(|candidate| *candidate == key)
+        self.snapshot
+            .objects
+            .keys()
+            .position(|candidate| *candidate == key)
     }
 
     fn select_by(
@@ -237,9 +188,9 @@ impl Dashboard {
         let Some(index) = self.selected_index() else {
             return;
         };
-        let last = self.objects.len().saturating_sub(1);
+        let last = self.snapshot.objects.len().saturating_sub(1);
         let next = index.saturating_add_signed(delta).min(last);
-        self.selected = self.objects.keys().nth(next).copied();
+        self.selected = self.snapshot.objects.keys().nth(next).copied();
     }
 
     const fn stale_after(&self) -> Duration {
@@ -248,10 +199,12 @@ impl Dashboard {
 
     fn is_fresh(
         &self,
-        row: &ObjectRow,
+        object: &ObjectSnapshot,
         now: SystemTime,
     ) -> bool {
-        now.duration_since(row.last_seen).unwrap_or(Duration::ZERO) <= self.stale_after()
+        now.duration_since(object.last_seen)
+            .unwrap_or(Duration::ZERO)
+            <= self.stale_after()
     }
 
     /// The freshest metering object in [`POWER_PRIORITY`], with its reading.
@@ -260,35 +213,39 @@ impl Dashboard {
         now: SystemTime,
     ) -> Option<PowerSource<'_>> {
         POWER_PRIORITY.iter().find_map(|class_code| {
-            self.objects
+            self.snapshot
+                .objects
                 .values()
-                .filter(|row| row.eoj.class_code() == *class_code && self.is_fresh(row, now))
-                .find_map(|row| power_reading(row, *class_code))
+                .filter(|object| object.class_code == *class_code && self.is_fresh(object, now))
+                .find_map(|object| power_reading(object, *class_code))
         })
     }
 
     /// The most recent reading from any metering object, fresh or not.
     fn last_power_source(&self) -> Option<PowerSource<'_>> {
         POWER_PRIORITY.iter().find_map(|class_code| {
-            self.objects
+            self.snapshot
+                .objects
                 .values()
-                .filter(|row| row.eoj.class_code() == *class_code)
-                .find_map(|row| power_reading(row, *class_code))
+                .filter(|object| object.class_code == *class_code)
+                .find_map(|object| power_reading(object, *class_code))
         })
     }
 
-    fn metering_object(&self) -> Option<&ObjectRow> {
+    fn metering_object(&self) -> Option<&ObjectSnapshot> {
         POWER_PRIORITY.iter().find_map(|class_code| {
-            self.objects
+            self.snapshot
+                .objects
                 .values()
-                .find(|row| row.eoj.class_code() == *class_code)
+                .find(|object| object.class_code == *class_code)
         })
     }
 
-    fn pv_objects(&self) -> impl Iterator<Item = &ObjectRow> {
-        self.objects
+    fn pv_objects(&self) -> impl Iterator<Item = &ObjectSnapshot> {
+        self.snapshot
+            .objects
             .values()
-            .filter(|row| row.eoj.class_code() == SOLAR_CLASS_CODE)
+            .filter(|object| object.class_code == SOLAR_CLASS_CODE)
     }
 
     fn has_pv(&self) -> bool {
@@ -297,13 +254,13 @@ impl Dashboard {
 
     fn solar_units(&self) -> Vec<PowerSource<'_>> {
         self.pv_objects()
-            .filter_map(|row| power_reading(row, SOLAR_CLASS_CODE))
+            .filter_map(|object| power_reading(object, SOLAR_CLASS_CODE))
             .collect()
     }
 
-    fn metering_objects(&self) -> impl Iterator<Item = &ObjectRow> {
-        self.objects.values().filter(|row| {
-            let class_code = row.eoj.class_code();
+    fn metering_objects(&self) -> impl Iterator<Item = &ObjectSnapshot> {
+        self.snapshot.objects.values().filter(|object| {
+            let class_code = object.class_code;
             class_code == SOLAR_CLASS_CODE || POWER_PRIORITY.contains(&class_code)
         })
     }
@@ -322,7 +279,7 @@ impl Dashboard {
         now: SystemTime,
     ) -> Option<i64> {
         let units = self.solar_units();
-        if units.is_empty() || units.iter().any(|unit| !self.is_fresh(unit.row, now)) {
+        if units.is_empty() || units.iter().any(|unit| !self.is_fresh(unit.object, now)) {
             return None;
         }
         Some(total_watts(&units))
@@ -335,20 +292,25 @@ impl Dashboard {
         if let Some(source) = self.power_source(now) {
             return SeriesState::Current {
                 watts: source.watts,
-                age: reading_age(now, source.row.last_seen),
-                detail: Some(format_eoj(source.row.eoj)),
+                age: reading_age(now, source.object.last_seen),
+                detail: Some(format_eoj(source.object.key.eoj)),
             };
         }
         if let Some(source) = self.last_power_source() {
             return SeriesState::Stale {
                 last: source.watts,
-                age: reading_age(now, source.row.last_seen),
+                age: reading_age(now, source.object.last_seen),
                 detail: None,
             };
         }
         let detail = self.metering_object().map_or_else(
             || String::from("no consumption meter"),
-            |row| format!("{} · waiting for the first poll", format_eoj(row.eoj)),
+            |object| {
+                format!(
+                    "{} · waiting for the first poll",
+                    format_eoj(object.key.eoj)
+                )
+            },
         );
         SeriesState::Waiting { detail }
     }
@@ -365,8 +327,8 @@ impl Dashboard {
         }
         let units = self.solar_units();
         if units.is_empty() {
-            let answered = self.pv_objects().any(|row| {
-                power_epc(SOLAR_CLASS_CODE).is_some_and(|epc| row.values.contains_key(&epc))
+            let answered = self.pv_objects().any(|object| {
+                power_epc(SOLAR_CLASS_CODE).is_some_and(|epc| object.properties.contains_key(&epc))
             });
             return SeriesState::Waiting {
                 detail: String::from(if answered {
@@ -378,13 +340,13 @@ impl Dashboard {
         }
         let age = units
             .iter()
-            .map(|unit| reading_age(now, unit.row.last_seen))
+            .map(|unit| reading_age(now, unit.object.last_seen))
             .max()
             .unwrap_or(Duration::ZERO);
         let partial = (units.len() < pv_count).then(|| format!("{} of {pv_count} PV", units.len()));
         let stale = units
             .iter()
-            .filter(|unit| !self.is_fresh(unit.row, now))
+            .filter(|unit| !self.is_fresh(unit.object, now))
             .count();
         let stale_detail = partial.clone().or_else(|| {
             (stale > 0 && stale < units.len())
@@ -527,7 +489,7 @@ impl Dashboard {
         frame: &mut Frame,
         area: Rect,
     ) {
-        let devices = match self.objects.len() {
+        let devices = match self.snapshot.objects.len() {
             1 => String::from("1 device"),
             count => format!("{count} devices"),
         };
@@ -565,9 +527,9 @@ impl Dashboard {
                         "waiting for a metering object",
                     )
                 },
-                |row| {
+                |object| {
                     (
-                        format!(" Power · {} · no reading yet", format_eoj(row.eoj)),
+                        format!(" Power · {} · no reading yet", format_eoj(object.key.eoj)),
                         "waiting for the first poll",
                     )
                 },
@@ -607,12 +569,12 @@ impl Dashboard {
         area: Rect,
     ) {
         self.visible_rows = usize::from(area.height.saturating_sub(3));
-        let title = format!(" Devices ({}) ", self.objects.len());
+        let title = format!(" Devices ({}) ", self.snapshot.objects.len());
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(BORDER))
             .title(title);
-        if self.objects.is_empty() {
+        if self.snapshot.objects.is_empty() {
             let waiting = format!(
                 " waiting for discovery on {MULTICAST_GROUP}:{MULTICAST_PORT} via {}",
                 self.config.interface
@@ -634,7 +596,12 @@ impl Dashboard {
             .first
             .min(selected_index)
             .max((selected_index + 1).saturating_sub(self.visible_rows))
-            .min(self.objects.len().saturating_sub(self.visible_rows));
+            .min(
+                self.snapshot
+                    .objects
+                    .len()
+                    .saturating_sub(self.visible_rows),
+            );
         let header = Row::new(vec![
             Cell::from("EOJ"),
             Cell::from(Line::from("POWER").alignment(Alignment::Right)),
@@ -642,13 +609,14 @@ impl Dashboard {
         ])
         .style(Style::new().fg(LABEL));
         let rows: Vec<Row<'_>> = self
+            .snapshot
             .objects
             .iter()
             .enumerate()
             .skip(self.first)
             .take(self.visible_rows)
-            .map(|(index, (_, row))| {
-                let row = device_row(self.config.update_interval, row);
+            .map(|(index, (_, object))| {
+                let row = device_row(self.config.update_interval, object);
                 if index == selected_index {
                     row.style(Style::new().add_modifier(Modifier::REVERSED))
                 } else {
@@ -676,22 +644,28 @@ impl Dashboard {
         frame: &mut Frame,
         area: Rect,
     ) {
-        let selected = self.selected_key().and_then(|key| self.objects.get(&key));
+        let selected = self
+            .selected_key()
+            .and_then(|key| self.snapshot.objects.get(&key));
         let title = Line::from(Span::styled(" Properties ", accent()));
         let mut block = panel(title);
-        if let Some(row) = selected {
+        if let Some(object) = selected {
             block = block.title_top(
-                Line::from(format!(" {} {} ", format_eoj(row.eoj), row.address.ip()))
-                    .alignment(Alignment::Right)
-                    .style(dim()),
+                Line::from(format!(
+                    " {} {} ",
+                    format_eoj(object.key.eoj),
+                    object.key.ip
+                ))
+                .alignment(Alignment::Right)
+                .style(dim()),
             );
         }
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let Some(row) = selected else {
+        let Some(object) = selected else {
             return;
         };
-        if row.values.is_empty() {
+        if object.properties.is_empty() {
             frame.render_widget(
                 Paragraph::new(Line::from(" waiting for the first poll").style(dim())),
                 inner,
@@ -705,19 +679,19 @@ impl Dashboard {
         ])
         .style(Style::new().fg(LABEL));
         let data_rows = usize::from(inner.height.saturating_sub(1));
-        let (shown, hidden) = if row.values.len() > data_rows {
+        let (shown, hidden) = if object.properties.len() > data_rows {
             (
                 data_rows.saturating_sub(1),
-                row.values.len() + 1 - data_rows,
+                object.properties.len() + 1 - data_rows,
             )
         } else {
-            (row.values.len(), 0)
+            (object.properties.len(), 0)
         };
-        let rows: Vec<Row<'_>> = row
-            .values
+        let rows: Vec<Row<'_>> = object
+            .properties
             .iter()
             .take(shown)
-            .map(|(epc, stored)| property_row(row.eoj.class_code(), *epc, stored))
+            .map(|(epc, property)| property_row(object.class_code, *epc, property))
             .collect();
         let [table_area, more_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
@@ -887,15 +861,15 @@ fn reading_text(
 
 fn device_row(
     update_interval: Duration,
-    row: &ObjectRow,
+    object: &ObjectSnapshot,
 ) -> Row<'_> {
-    let age = row.last_seen.elapsed().unwrap_or(Duration::ZERO);
+    let age = object.last_seen.elapsed().unwrap_or(Duration::ZERO);
     let seen = Line::from(format_age(age))
         .alignment(Alignment::Right)
         .style(Style::new().fg(age_color(update_interval, age)));
     Row::new(vec![
-        Cell::from(format_eoj(row.eoj)),
-        power_cell(row),
+        Cell::from(format_eoj(object.key.eoj)),
+        power_cell(object),
         Cell::from(seen),
     ])
 }
@@ -903,38 +877,38 @@ fn device_row(
 fn property_row(
     class_code: u16,
     epc: u8,
-    stored: &StoredValue,
+    property: &PropertySnapshot,
 ) -> Row<'_> {
     let name = echonet_lite::ecodec::lookup(class_code, epc).map_or("(unknown)", |info| info.name);
     Row::new(vec![
         Cell::from(format!("0x{epc:02X}")),
         Cell::from(name).style(dim()),
-        Cell::from(stored.text.as_str()).style(Style::new().fg(VALUE)),
+        Cell::from(cell_text(class_code, epc, &property.raw_edt)).style(Style::new().fg(VALUE)),
     ])
 }
 
-// Do not render stored.text here: it prints the sentinel name, while this
-// column is a watt figure or `--`. Do not gate on liveness: SEEN already dates
-// the reading, so blanking the last value only loses it.
-fn power_text(row: &ObjectRow) -> Option<String> {
-    let class_code = row.eoj.class_code();
-    power_reading(row, class_code)
+// Do not render `PropertySnapshot::text` here: it prints the property name, while
+// this column is a watt figure or `--`. Do not gate on liveness: SEEN already
+// dates the reading, so blanking the last value only loses it.
+fn power_text(object: &ObjectSnapshot) -> Option<String> {
+    let class_code = object.class_code;
+    power_reading(object, class_code)
         .map(|source| format!("{} {} W", power_label(class_code), source.watts))
 }
 
-fn power_cell(row: &ObjectRow) -> Cell<'static> {
-    let line = power_text(row).map_or_else(|| Line::from("--").style(dim()), Line::from);
+fn power_cell(object: &ObjectSnapshot) -> Cell<'static> {
+    let line = power_text(object).map_or_else(|| Line::from("--").style(dim()), Line::from);
     Cell::from(line.alignment(Alignment::Right))
 }
 
 fn power_reading(
-    row: &ObjectRow,
+    object: &ObjectSnapshot,
     class_code: u16,
 ) -> Option<PowerSource<'_>> {
     let epc = power_epc(class_code)?;
-    let stored = row.values.get(&epc)?;
-    let watts = instantaneous_watts(class_code, &stored.raw)?;
-    Some(PowerSource { row, watts })
+    let property = object.properties.get(&epc)?;
+    let watts = instantaneous_watts(class_code, &property.raw_edt)?;
+    Some(PowerSource { object, watts })
 }
 
 fn total_watts(units: &[PowerSource<'_>]) -> i64 {
@@ -1037,79 +1011,39 @@ fn format_limit(watts: i64) -> String {
 ///
 /// Returns the bind or terminal I/O error, or the error the radar service
 /// stopped with.
-pub fn run(config: RadarConfig) -> io::Result<()> {
-    let (event_sender, events) = mpsc::channel();
-    let (commands, command_receiver) = tokio::sync::mpsc::channel(8);
-    let (shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
-
+pub fn run(config: SessionConfig) -> io::Result<()> {
     let mut terminal = ratatui::try_init()?;
-    let guard = TerminalGuard::new(shutdown);
+    let guard = TerminalGuard;
 
-    // The socket must be created inside the runtime that drives it: Tokio
-    // registers a socket's readiness with the reactor of the runtime that
-    // created it, and a socket handed over from another runtime never becomes
-    // writable here.
-    let service = thread::Builder::new()
-        .name(String::from("echonet-radar-dashboard"))
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            runtime.block_on(async move {
-                let socket = EchoNetSocket::bind_default_multicast(config.interface).await?;
-                run_service(
-                    socket,
-                    config,
-                    event_sender,
-                    command_receiver,
-                    shutdown_receiver,
-                )
-                .await
-            })
-        })?;
-
-    let mut dashboard = Dashboard::new(config);
-    let drawn = event_loop(&mut terminal, &mut dashboard, &events, &commands);
+    let (session, mut handle) =
+        RadarSession::start(config, Arc::new(NoopPulse)).map_err(|fault| fault_error(&fault))?;
+    let mut dashboard = Dashboard::new(config, handle.snapshot());
+    let drawn = event_loop(&mut terminal, &mut dashboard, &mut handle);
     drop(guard);
 
-    let joined = service
-        .join()
-        .map_err(|_| io::Error::other("dashboard service thread panicked"))?;
+    let stopped = session.stop().map_err(|fault| fault_error(&fault));
     drawn?;
-    joined
+    stopped
 }
 
-struct TerminalGuard {
-    shutdown: tokio::sync::watch::Sender<bool>,
-}
-
-impl TerminalGuard {
-    const fn new(shutdown: tokio::sync::watch::Sender<bool>) -> Self {
-        Self { shutdown }
-    }
-}
+struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = ratatui::try_restore();
-        let _ = self.shutdown.send(true);
     }
 }
 
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     dashboard: &mut Dashboard,
-    events: &Receiver<RadarEvent>,
-    commands: &tokio::sync::mpsc::Sender<Command>,
+    handle: &mut RadarHandle,
 ) -> io::Result<()> {
     let mut last_sample = Instant::now();
     loop {
-        loop {
-            match events.try_recv() {
-                Ok(event) => dashboard.apply(event),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Ok(()),
-            }
+        if handle.has_changed() {
+            let published = handle.snapshot();
+            dashboard.apply(published);
         }
         if last_sample.elapsed() >= SAMPLE_PERIOD {
             dashboard.sample(SystemTime::now());
@@ -1129,11 +1063,8 @@ fn event_loop(
             KeyCode::Char('q') | KeyCode::Esc => break,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
             KeyCode::Char('p') => {
-                if commands.try_send(Command::PollNow).is_err() {
-                    dashboard.status = Some((
-                        SystemTime::now(),
-                        String::from("poll request dropped: the service queue is full"),
-                    ));
+                if let Err(error) = handle.poll_now() {
+                    dashboard.status = Some((SystemTime::now(), poll_error(error)));
                 }
             },
             KeyCode::Char('j') | KeyCode::Down => dashboard.select_by(1),
@@ -1144,69 +1075,163 @@ fn event_loop(
     Ok(())
 }
 
+fn poll_error(error: CommandError) -> String {
+    match error {
+        CommandError::Busy => String::from("poll request dropped: the service queue is full"),
+        CommandError::ServiceStopped => error.to_string(),
+    }
+}
+
+/// A stopped service outranks its last notice: the display is frozen, while the
+/// LAN may still be fine.
+fn status_line(snapshot: &RadarSnapshot) -> Option<(SystemTime, String)> {
+    match &snapshot.status {
+        SessionStatus::Degraded { fault, .. } => Some((
+            SystemTime::now(),
+            format!("the radar service stopped: {}", fault_text(fault)),
+        )),
+        SessionStatus::Stopped => {
+            Some((SystemTime::now(), String::from("the radar service stopped")))
+        },
+        SessionStatus::Binding | SessionStatus::Running { .. } => snapshot
+            .notices
+            .last()
+            .map(|notice| (notice.at, notice.text.clone())),
+    }
+}
+
+fn fault_text(fault: &Fault) -> String {
+    match fault {
+        Fault::Bind { interface, detail } => {
+            format!("could not bind {interface}: {detail}")
+        },
+        Fault::Config(error) => error.to_string(),
+        Fault::Service(detail) => detail.clone(),
+    }
+}
+
+fn fault_error(fault: &Fault) -> io::Error {
+    io::Error::other(fault_text(fault))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr};
 
-    use echonet_radar_core::{ChangeEvent, DeviceEvent, SeenEvent};
+    use echonet_lite::frame::Eoj;
+    use echonet_radar_core::{Observation, RadarModel, format_edt};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::{Buffer, Cell as BufferCell};
 
     const INTERFACE: Ipv4Addr = Ipv4Addr::new(192, 168, 100, 30);
+    const IP: &str = "192.168.100.26";
+    const OTHER: &str = "192.168.100.30";
+    const BOARD: Eoj = Eoj::new(0x02, 0x87, 0x01);
+    const METER: Eoj = Eoj::new(0x02, 0x88, 0x01);
+    const PV: Eoj = Eoj::new(0x02, 0x79, 0x01);
+    const PV_SECOND: Eoj = Eoj::new(0x02, 0x79, 0x02);
+    const HEATER: Eoj = Eoj::new(0x02, 0x6B, 0x01);
 
-    fn dashboard(update_seconds: u64) -> Dashboard {
-        Dashboard::new(RadarConfig {
+    fn config(update_seconds: u64) -> SessionConfig {
+        SessionConfig {
             interface: INTERFACE,
-            discovery_interval: Duration::from_secs(60),
             update_interval: Duration::from_secs(update_seconds),
-        })
+            ..SessionConfig::desktop()
+        }
+    }
+
+    fn key(
+        ip: &str,
+        eoj: Eoj,
+    ) -> ObjectKey {
+        ObjectKey {
+            ip: ip.parse().unwrap(),
+            eoj,
+        }
     }
 
     fn source(ip: &str) -> SocketAddr {
         format!("{ip}:3610").parse().unwrap()
     }
 
-    fn device(
-        ip: &str,
-        class_group: u8,
-        class: u8,
-        instance: u8,
-    ) -> RadarEvent {
-        RadarEvent::Device(DeviceEvent {
-            source: source(ip),
-            eoj: Eoj::new(class_group, class, instance),
-        })
+    fn session_snapshot(
+        session: u64,
+        observations: Vec<Observation>,
+    ) -> Arc<RadarSnapshot> {
+        let mut model = RadarModel::new(session);
+        for observation in observations {
+            model.observe(observation);
+        }
+        Arc::new(model.snapshot())
     }
 
-    fn change(
+    fn snapshot(observations: Vec<Observation>) -> Arc<RadarSnapshot> {
+        session_snapshot(1, observations)
+    }
+
+    fn dashboard(
+        update_seconds: u64,
+        observations: Vec<Observation>,
+    ) -> Dashboard {
+        Dashboard::new(config(update_seconds), snapshot(observations))
+    }
+
+    fn device(
+        ip: &str,
+        eoj: Eoj,
+    ) -> Observation {
+        Observation::Device {
+            key: key(ip, eoj),
+            class_code: eoj.class_code(),
+            source: source(ip),
+        }
+    }
+
+    fn value(
         at: SystemTime,
         ip: &str,
         eoj: Eoj,
         epc: u8,
         raw: &[u8],
-    ) -> RadarEvent {
-        RadarEvent::Change(ChangeEvent {
+    ) -> Observation {
+        Observation::Value {
+            key: key(ip, eoj),
+            epc,
+            raw_edt: raw.to_vec(),
+            text: format_edt(eoj.class_code(), epc, raw),
             at,
             source: source(ip),
-            eoj,
-            epc,
-            text: format_value(eoj.class_code(), epc, raw),
-            raw_edt: raw.to_vec(),
-        })
+        }
     }
 
     fn seen(
         at: SystemTime,
         ip: &str,
         eoj: Eoj,
-    ) -> RadarEvent {
-        RadarEvent::Seen(SeenEvent {
+    ) -> Observation {
+        Observation::Seen {
+            key: key(ip, eoj),
             at,
             source: source(ip),
-            eoj,
-        })
+        }
+    }
+
+    fn notice(text: &str) -> Observation {
+        Observation::Status(String::from(text))
+    }
+
+    fn object(
+        observations: Vec<Observation>,
+        eoj: Eoj,
+    ) -> ObjectSnapshot {
+        snapshot(observations)
+            .objects
+            .values()
+            .find(|object| object.key.eoj == eoj)
+            .cloned()
+            .unwrap()
     }
 
     fn screen(
@@ -1255,24 +1280,6 @@ mod tests {
             .expect("the properties pane is rendered")
     }
 
-    fn stored(raw: &[u8]) -> StoredValue {
-        StoredValue {
-            raw: raw.to_vec(),
-            text: String::new(),
-        }
-    }
-
-    fn object_row(
-        class_group: u8,
-        class: u8,
-    ) -> ObjectRow {
-        ObjectRow::new(
-            source("192.168.100.26"),
-            Eoj::new(class_group, class, 0x01),
-            SystemTime::UNIX_EPOCH,
-        )
-    }
-
     fn text(line: &Line<'_>) -> String {
         line.spans
             .iter()
@@ -1294,140 +1301,136 @@ mod tests {
 
     #[test]
     fn power_text_labels_the_reading() {
-        let mut board = object_row(0x02, 0x87);
-        board.values.insert(0xC6, stored(&[0, 0, 2, 0x44]));
+        let board = object(
+            vec![value(
+                SystemTime::UNIX_EPOCH,
+                IP,
+                BOARD,
+                0xC6,
+                &[0, 0, 2, 0x44],
+            )],
+            BOARD,
+        );
         assert_eq!(power_text(&board).as_deref(), Some("Power 580 W"));
 
-        let mut solar = object_row(0x02, 0x79);
-        solar.values.insert(0xE0, stored(&[0x04, 0xD8]));
+        let solar = object(
+            vec![value(SystemTime::UNIX_EPOCH, IP, PV, 0xE0, &[0x04, 0xD8])],
+            PV,
+        );
         assert_eq!(power_text(&solar).as_deref(), Some("Gen 1240 W"));
 
-        let mut battery = object_row(0x02, 0x7D);
-        battery
-            .values
-            .insert(0xD3, stored(&[0xFF, 0xFF, 0xFF, 0x38]));
+        let battery_eoj = Eoj::new(0x02, 0x7D, 0x01);
+        let battery = object(
+            vec![value(
+                SystemTime::UNIX_EPOCH,
+                IP,
+                battery_eoj,
+                0xD3,
+                &[0xFF, 0xFF, 0xFF, 0x38],
+            )],
+            battery_eoj,
+        );
         assert_eq!(power_text(&battery).as_deref(), Some("Battery -200 W"));
 
-        let mut no_data = object_row(0x02, 0x87);
-        no_data
-            .values
-            .insert(0xC6, stored(&[0x7F, 0xFF, 0xFF, 0xFE]));
+        let no_data = object(
+            vec![value(
+                SystemTime::UNIX_EPOCH,
+                IP,
+                BOARD,
+                0xC6,
+                &[0x7F, 0xFF, 0xFF, 0xFE],
+            )],
+            BOARD,
+        );
         assert_eq!(power_text(&no_data), None);
 
-        assert_eq!(power_text(&object_row(0x02, 0x87)), None);
+        assert_eq!(power_text(&object(vec![device(IP, BOARD)], BOARD)), None);
 
-        let heater = object_row(0x02, 0x6B);
+        let heater = object(vec![device(IP, HEATER)], HEATER);
         assert_eq!(power_text(&heater), None);
     }
 
     #[test]
     fn a_stale_device_keeps_its_power_reading() {
-        let mut dashboard = dashboard(10);
         let old = SystemTime::now() - Duration::from_secs(3600);
-        dashboard.apply(change(
-            old,
-            "192.168.100.26",
-            Eoj::new(0x02, 0x87, 0x01),
-            0xC6,
-            &[0, 0, 2, 0x44],
-        ));
+        let mut dashboard = dashboard(10, vec![value(old, IP, BOARD, 0xC6, &[0, 0, 2, 0x44])]);
 
         let screen = screen(&mut dashboard, 100, 30);
         assert!(screen.contains("Power 580 W"), "{screen}");
     }
 
     #[test]
-    fn apply_stores_values_and_seen_updates_liveness() {
-        let mut dashboard = dashboard(10);
-        let eoj = Eoj::new(0x02, 0x87, 0x01);
+    fn a_seen_observation_keeps_the_value_and_stamps_liveness() {
         let start = SystemTime::UNIX_EPOCH;
-
-        dashboard.apply(device("192.168.100.26", 0x02, 0x87, 0x01));
-        dashboard.apply(change(start, "192.168.100.26", eoj, 0xC6, &[0, 0, 2, 0x44]));
-
-        let row = dashboard
-            .power_source(start + Duration::from_secs(5))
-            .map(|source| source.row)
-            .unwrap();
-        let stored = row.values.get(&0xC6).unwrap();
-        assert_eq!(stored.raw, vec![0, 0, 2, 0x44]);
-        assert_eq!(stored.text, "580 W");
-        let inserted = row.last_seen;
-
-        let later = inserted + Duration::from_secs(60);
-        dashboard.apply(seen(later, "192.168.100.26", eoj));
-        let row = dashboard
-            .power_source(later)
-            .map(|source| source.row)
-            .unwrap();
-        assert!(row.last_seen > inserted);
-        assert_eq!(row.values.len(), 1);
-        assert_eq!(
-            row.values.get(&0xC6).map(|value| value.text.as_str()),
-            Some("580 W")
+        let later = start + Duration::from_secs(60);
+        let dashboard = dashboard(
+            10,
+            vec![
+                device(IP, BOARD),
+                value(start, IP, BOARD, 0xC6, &[0, 0, 2, 0x44]),
+                seen(later, IP, BOARD),
+            ],
         );
+
+        let object = dashboard
+            .power_source(later)
+            .map(|source| source.object)
+            .unwrap();
+        let property = object.properties.get(&0xC6).unwrap();
+        assert_eq!(property.raw_edt, vec![0, 0, 2, 0x44]);
+        assert_eq!(
+            cell_text(BOARD.class_code(), 0xC6, &property.raw_edt),
+            "580 W"
+        );
+        assert_eq!(object.properties.len(), 1);
+        assert_eq!(object.last_seen, later);
+        assert_eq!(property.at, start);
     }
 
     #[test]
     fn the_meter_is_the_power_source_before_the_board() {
-        let mut dashboard = dashboard(10);
         let start = SystemTime::UNIX_EPOCH;
-        let solar = Eoj::new(0x02, 0x79, 0x01);
-        let board = Eoj::new(0x02, 0x87, 0x01);
-        let meter = Eoj::new(0x02, 0x88, 0x01);
-
-        dashboard.apply(change(start, "192.168.100.26", solar, 0xE0, &[0x04, 0xD8]));
+        let pv_only = dashboard(10, vec![value(start, IP, PV, 0xE0, &[0x04, 0xD8])]);
         assert!(
-            dashboard.power_source(start).is_none(),
+            pv_only.power_source(start).is_none(),
             "PV is not a consumption source"
         );
 
-        dashboard.apply(change(
-            start,
-            "192.168.100.26",
-            board,
-            0xC6,
-            &[0, 0, 2, 0x44],
-        ));
+        let board_only = dashboard(10, vec![value(start, IP, BOARD, 0xC6, &[0, 0, 2, 0x44])]);
         assert_eq!(
-            dashboard.power_source(start).map(|source| source.watts),
+            board_only.power_source(start).map(|source| source.watts),
             Some(580)
         );
 
-        dashboard.apply(change(
-            start,
-            "192.168.100.26",
-            meter,
-            0xE7,
-            &[0, 0, 0x02, 0xBC],
-        ));
+        let with_meter = dashboard(
+            10,
+            vec![
+                value(start, IP, BOARD, 0xC6, &[0, 0, 2, 0x44]),
+                value(start, IP, METER, 0xE7, &[0, 0, 0x02, 0xBC]),
+            ],
+        );
         assert_eq!(
-            dashboard.power_source(start).map(|source| source.watts),
+            with_meter.power_source(start).map(|source| source.watts),
             Some(700)
         );
     }
 
     #[test]
     fn a_fresh_board_is_used_when_the_meter_goes_quiet() {
-        let mut dashboard = dashboard(10);
         let start = SystemTime::UNIX_EPOCH;
-        let meter = Eoj::new(0x02, 0x88, 0x01);
-        let board = Eoj::new(0x02, 0x87, 0x01);
-
-        dashboard.apply(change(
-            start,
-            "192.168.100.26",
-            meter,
-            0xE7,
-            &[0, 0, 0x02, 0xBC],
-        ));
-        dashboard.apply(change(
-            start + Duration::from_secs(40),
-            "192.168.100.26",
-            board,
-            0xC6,
-            &[0, 0, 2, 0x44],
-        ));
+        let dashboard = dashboard(
+            10,
+            vec![
+                value(start, IP, METER, 0xE7, &[0, 0, 0x02, 0xBC]),
+                value(
+                    start + Duration::from_secs(40),
+                    IP,
+                    BOARD,
+                    0xC6,
+                    &[0, 0, 2, 0x44],
+                ),
+            ],
+        );
 
         assert_eq!(
             dashboard
@@ -1439,12 +1442,14 @@ mod tests {
 
     #[test]
     fn a_stale_source_samples_nothing() {
-        let mut dashboard = dashboard(10);
         let start = SystemTime::UNIX_EPOCH;
-        let eoj = Eoj::new(0x02, 0x87, 0x01);
-
-        dashboard.apply(change(start, "192.168.100.26", eoj, 0xC6, &[0, 0, 2, 0x44]));
-        dashboard.apply(seen(start, "192.168.100.26", eoj));
+        let mut dashboard = dashboard(
+            10,
+            vec![
+                value(start, IP, BOARD, 0xC6, &[0, 0, 2, 0x44]),
+                seen(start, IP, BOARD),
+            ],
+        );
 
         dashboard.sample(start + Duration::from_secs(29));
         assert_eq!(
@@ -1467,12 +1472,14 @@ mod tests {
 
     #[test]
     fn a_silent_meter_keeps_its_last_reading_out_of_the_headline() {
-        let mut dashboard = dashboard(10);
         let start = SystemTime::UNIX_EPOCH;
-        let eoj = Eoj::new(0x02, 0x87, 0x01);
-
-        dashboard.apply(change(start, "192.168.100.26", eoj, 0xC6, &[0, 0, 2, 0x44]));
-        dashboard.apply(seen(start, "192.168.100.26", eoj));
+        let dashboard = dashboard(
+            10,
+            vec![
+                value(start, IP, BOARD, 0xC6, &[0, 0, 2, 0x44]),
+                seen(start, IP, BOARD),
+            ],
+        );
 
         let now = start + Duration::from_secs(31);
         assert_eq!(dashboard.grid_watts(now), None);
@@ -1484,30 +1491,15 @@ mod tests {
 
     #[test]
     fn one_tick_samples_both_series() {
-        let mut dashboard = dashboard(10);
         let start = SystemTime::UNIX_EPOCH;
-        let ip = "192.168.100.26";
-        dashboard.apply(change(
-            start,
-            ip,
-            Eoj::new(0x02, 0x87, 0x01),
-            0xC6,
-            &[0, 0, 2, 0x44],
-        ));
-        dashboard.apply(change(
-            start,
-            ip,
-            Eoj::new(0x02, 0x79, 0x01),
-            0xE0,
-            &[0x04, 0xD8],
-        ));
-        dashboard.apply(change(
-            start,
-            ip,
-            Eoj::new(0x02, 0x79, 0x02),
-            0xE0,
-            &[0x01, 0x2C],
-        ));
+        let mut dashboard = dashboard(
+            10,
+            vec![
+                value(start, IP, BOARD, 0xC6, &[0, 0, 2, 0x44]),
+                value(start, IP, PV, 0xE0, &[0x04, 0xD8]),
+                value(start, IP, PV_SECOND, 0xE0, &[0x01, 0x2C]),
+            ],
+        );
 
         dashboard.sample(start);
         let sample = dashboard.samples.back().unwrap();
@@ -1525,18 +1517,15 @@ mod tests {
 
     #[test]
     fn a_pv_unit_that_never_reported_leaves_a_partial_note() {
-        let mut dashboard = dashboard(10);
         let start = SystemTime::UNIX_EPOCH;
-        let ip = "192.168.100.26";
-        dashboard.apply(device(ip, 0x02, 0x79, 0x01));
-        dashboard.apply(device(ip, 0x02, 0x79, 0x02));
-        dashboard.apply(change(
-            start,
-            ip,
-            Eoj::new(0x02, 0x79, 0x01),
-            0xE0,
-            &[0x04, 0xD8],
-        ));
+        let mut dashboard = dashboard(
+            10,
+            vec![
+                device(IP, PV),
+                device(IP, PV_SECOND),
+                value(start, IP, PV, 0xE0, &[0x04, 0xD8]),
+            ],
+        );
 
         dashboard.sample(start);
         assert_eq!(
@@ -1553,23 +1542,14 @@ mod tests {
 
     #[test]
     fn a_zero_pv_reading_is_a_value_not_a_gap() {
-        let mut dashboard = dashboard(10);
         let start = SystemTime::UNIX_EPOCH;
-        let ip = "192.168.100.26";
-        dashboard.apply(change(
-            start,
-            ip,
-            Eoj::new(0x02, 0x79, 0x01),
-            0xE0,
-            &[0x00, 0x00],
-        ));
-        dashboard.apply(change(
-            start,
-            ip,
-            Eoj::new(0x02, 0x79, 0x02),
-            0xE0,
-            &[0x00, 0x00],
-        ));
+        let mut dashboard = dashboard(
+            10,
+            vec![
+                value(start, IP, PV, 0xE0, &[0x00, 0x00]),
+                value(start, IP, PV_SECOND, 0xE0, &[0x00, 0x00]),
+            ],
+        );
 
         dashboard.sample(start);
         assert_eq!(
@@ -1586,19 +1566,15 @@ mod tests {
 
     #[test]
     fn a_stale_pv_unit_withholds_the_solar_total() {
-        let mut dashboard = dashboard(10);
         let start = SystemTime::UNIX_EPOCH;
-        let ip = "192.168.100.26";
-        let first = Eoj::new(0x02, 0x79, 0x01);
-        dashboard.apply(change(start, ip, first, 0xE0, &[0x04, 0xD8]));
-        dashboard.apply(change(
-            start,
-            ip,
-            Eoj::new(0x02, 0x79, 0x02),
-            0xE0,
-            &[0x01, 0x2C],
-        ));
-        dashboard.apply(seen(start + Duration::from_secs(20), ip, first));
+        let dashboard = dashboard(
+            10,
+            vec![
+                value(start, IP, PV, 0xE0, &[0x04, 0xD8]),
+                value(start, IP, PV_SECOND, 0xE0, &[0x01, 0x2C]),
+                seen(start + Duration::from_secs(20), IP, PV),
+            ],
+        );
 
         assert_eq!(
             dashboard.solar_watts(start + Duration::from_secs(29)),
@@ -1615,18 +1591,15 @@ mod tests {
 
     #[test]
     fn a_stale_partial_solar_series_keeps_its_note() {
-        let mut dashboard = dashboard(10);
         let start = SystemTime::UNIX_EPOCH;
-        let ip = "192.168.100.26";
-        dashboard.apply(device(ip, 0x02, 0x79, 0x01));
-        dashboard.apply(device(ip, 0x02, 0x79, 0x02));
-        dashboard.apply(change(
-            start,
-            ip,
-            Eoj::new(0x02, 0x79, 0x01),
-            0xE0,
-            &[0x04, 0xD8],
-        ));
+        let dashboard = dashboard(
+            10,
+            vec![
+                device(IP, PV),
+                device(IP, PV_SECOND),
+                value(start, IP, PV, 0xE0, &[0x04, 0xD8]),
+            ],
+        );
 
         let stale_at = start + Duration::from_secs(31);
         assert_eq!(dashboard.solar_watts(stale_at), None);
@@ -1639,32 +1612,17 @@ mod tests {
 
     #[test]
     fn a_current_consumption_and_stale_solar_draw_both_lines() {
-        let mut dashboard = dashboard(10);
         let now = SystemTime::now();
         let stale_at = now.checked_sub(Duration::from_secs(40)).unwrap();
-        let ip = "192.168.100.26";
-        dashboard.apply(change(
-            now,
-            ip,
-            Eoj::new(0x02, 0x87, 0x01),
-            0xC6,
-            &[0, 0, 2, 0x44],
-        ));
-        dashboard.apply(change(
-            stale_at,
-            ip,
-            Eoj::new(0x02, 0x79, 0x01),
-            0xE0,
-            &[0x04, 0xD8],
-        ));
-        dashboard.apply(change(
-            stale_at,
-            ip,
-            Eoj::new(0x02, 0x79, 0x02),
-            0xE0,
-            &[0x01, 0x2C],
-        ));
-        dashboard.apply(seen(now, ip, Eoj::new(0x02, 0x79, 0x01)));
+        let mut dashboard = dashboard(
+            10,
+            vec![
+                value(now, IP, BOARD, 0xC6, &[0, 0, 2, 0x44]),
+                value(stale_at, IP, PV, 0xE0, &[0x04, 0xD8]),
+                value(stale_at, IP, PV_SECOND, 0xE0, &[0x01, 0x2C]),
+                seen(now, IP, PV),
+            ],
+        );
 
         for (width, height) in [(100, 30), (80, 24)] {
             let screen = screen(&mut dashboard, width, height);
@@ -1676,15 +1634,8 @@ mod tests {
 
     #[test]
     fn a_pv_unit_reporting_no_value_is_not_waiting_for_its_first_poll() {
-        let mut dashboard = dashboard(10);
         let start = SystemTime::UNIX_EPOCH;
-        dashboard.apply(change(
-            start,
-            "192.168.100.26",
-            Eoj::new(0x02, 0x79, 0x01),
-            0xE0,
-            &[0xFF, 0xFF],
-        ));
+        let dashboard = dashboard(10, vec![value(start, IP, PV, 0xE0, &[0xFF, 0xFF])]);
 
         assert_eq!(dashboard.solar_watts(start), None);
         let state = dashboard.series_state(Series::Solar, start);
@@ -1694,15 +1645,8 @@ mod tests {
 
     #[test]
     fn a_site_without_pv_keeps_the_consumption_only_layout() {
-        let mut dashboard = dashboard(10);
         let now = SystemTime::now();
-        dashboard.apply(change(
-            now,
-            "192.168.100.26",
-            Eoj::new(0x02, 0x87, 0x01),
-            0xC6,
-            &[0, 0, 2, 0x44],
-        ));
+        let mut dashboard = dashboard(10, vec![value(now, IP, BOARD, 0xC6, &[0, 0, 2, 0x44])]);
 
         let screen = screen(&mut dashboard, 100, 30);
         assert!(screen.contains("grid buying 580 W"), "{screen}");
@@ -1711,15 +1655,8 @@ mod tests {
 
     #[test]
     fn a_solar_only_site_lists_solar_without_a_grid_chart() {
-        let mut dashboard = dashboard(10);
         let now = SystemTime::now();
-        dashboard.apply(change(
-            now,
-            "192.168.100.26",
-            Eoj::new(0x02, 0x79, 0x01),
-            0xE0,
-            &[0x04, 0xD8],
-        ));
+        let mut dashboard = dashboard(10, vec![value(now, IP, PV, 0xE0, &[0x04, 0xD8])]);
         dashboard.sample(now);
 
         let screen = screen(&mut dashboard, 100, 30);
@@ -1730,7 +1667,7 @@ mod tests {
 
     #[test]
     fn the_grid_chart_keeps_its_gaps() {
-        let mut dashboard = dashboard(10);
+        let mut dashboard = dashboard(10, vec![]);
         for tick in [
             sample(Some(100), None),
             sample(Some(100), Some(1000)),
@@ -1753,7 +1690,7 @@ mod tests {
 
     #[test]
     fn peak_and_average_are_per_series() {
-        let mut dashboard = dashboard(10);
+        let mut dashboard = dashboard(10, vec![]);
         dashboard.samples.push_back(sample(Some(100), Some(1000)));
         dashboard.samples.push_back(sample(Some(300), Some(0)));
 
@@ -1769,7 +1706,7 @@ mod tests {
 
     #[test]
     fn a_selling_window_peaks_at_its_largest_export() {
-        let mut dashboard = dashboard(10);
+        let mut dashboard = dashboard(10, vec![]);
         dashboard.samples.push_back(sample(Some(-300), None));
         dashboard.samples.push_back(sample(Some(-400), None));
 
@@ -1781,7 +1718,7 @@ mod tests {
 
     #[test]
     fn the_scale_is_symmetric_about_zero() {
-        let mut dashboard = dashboard(10);
+        let mut dashboard = dashboard(10, vec![]);
         dashboard.samples.push_back(sample(Some(-373), Some(1240)));
 
         let bounds = PowerPlot::build(&dashboard.samples).scale.bounds();
@@ -1828,7 +1765,7 @@ mod tests {
     #[test]
     fn the_scale_holds_every_plotted_point() {
         for peak in [-5000, -373, -1, 0, 1, 373, 2168, 2541, 12_000] {
-            let mut dashboard = dashboard(10);
+            let mut dashboard = dashboard(10, vec![]);
             dashboard
                 .samples
                 .push_back(sample(Some(peak), Some(peak.saturating_abs())));
@@ -1846,7 +1783,7 @@ mod tests {
 
     #[test]
     fn the_scale_ignores_solar() {
-        let mut dashboard = dashboard(10);
+        let mut dashboard = dashboard(10, vec![]);
         dashboard.samples.push_back(sample(Some(100), Some(5000)));
 
         let plot = PowerPlot::build(&dashboard.samples);
@@ -1862,7 +1799,7 @@ mod tests {
 
     #[test]
     fn a_missing_grid_reading_keeps_the_scale_at_its_floor() {
-        let mut dashboard = dashboard(10);
+        let mut dashboard = dashboard(10, vec![]);
         for _ in 0..3 {
             dashboard.samples.push_back(sample(None, Some(1240)));
         }
@@ -1874,15 +1811,11 @@ mod tests {
 
     #[test]
     fn a_selling_reading_reads_as_selling() {
-        let mut dashboard = dashboard(10);
         let now = SystemTime::now();
-        dashboard.apply(change(
-            now,
-            "192.168.100.26",
-            Eoj::new(0x02, 0x87, 0x01),
-            0xC6,
-            &[0xFF, 0xFF, 0xFE, 0x8B],
-        ));
+        let mut dashboard = dashboard(
+            10,
+            vec![value(now, IP, BOARD, 0xC6, &[0xFF, 0xFF, 0xFE, 0x8B])],
+        );
         dashboard.sample(now);
 
         let screen = screen(&mut dashboard, 100, 30);
@@ -1903,7 +1836,7 @@ mod tests {
 
     #[test]
     fn samples_are_capped() {
-        let mut dashboard = dashboard(10);
+        let mut dashboard = dashboard(10, vec![]);
         for _ in 0..(SAMPLE_CAPACITY + 5) {
             dashboard.sample(SystemTime::now());
         }
@@ -1912,18 +1845,18 @@ mod tests {
 
     #[test]
     fn the_property_pane_lists_every_stored_value() {
-        let mut dashboard = dashboard(10);
         let now = SystemTime::now();
-        let heater = Eoj::new(0x02, 0x6B, 0x01);
         let heater_changes: [(u8, &[u8]); 4] = [
             (0xC3, &[0x42]),
             (0xD1, &[0x28]),
             (0xD3, &[0x28]),
             (0xB1, &[0x41]),
         ];
-        for (epc, raw) in heater_changes {
-            dashboard.apply(change(now, "192.168.100.26", heater, epc, raw));
-        }
+        let observations = heater_changes
+            .iter()
+            .map(|(epc, raw)| value(now, IP, HEATER, *epc, raw))
+            .collect();
+        let mut dashboard = dashboard(10, observations);
 
         let screen = screen(&mut dashboard, 100, 30);
         let title = pane_title(&screen);
@@ -1961,22 +1894,14 @@ mod tests {
 
     #[test]
     fn selecting_the_next_device_swaps_the_pane() {
-        let mut dashboard = dashboard(10);
         let now = SystemTime::now();
-        dashboard.apply(change(
-            now,
-            "192.168.100.26",
-            Eoj::new(0x02, 0x6B, 0x01),
-            0xB1,
-            &[0x41],
-        ));
-        dashboard.apply(change(
-            now,
-            "192.168.100.26",
-            Eoj::new(0x02, 0x88, 0x01),
-            0xE7,
-            &[0, 0, 0x02, 0xBC],
-        ));
+        let mut dashboard = dashboard(
+            10,
+            vec![
+                value(now, IP, HEATER, 0xB1, &[0x41]),
+                value(now, IP, METER, 0xE7, &[0, 0, 0x02, 0xBC]),
+            ],
+        );
 
         let before = screen(&mut dashboard, 100, 30);
         assert!(
@@ -2000,10 +1925,10 @@ mod tests {
 
     #[test]
     fn the_selection_clamps_and_scrolls_to_stay_visible() {
-        let mut dashboard = dashboard(10);
-        for instance in 1..=6 {
-            dashboard.apply(device("192.168.100.26", 0x02, 0x87, instance));
-        }
+        let devices = (1..=6)
+            .map(|instance| device(IP, Eoj::new(0x02, 0x87, instance)))
+            .collect();
+        let mut dashboard = dashboard(10, devices);
 
         dashboard.select_by(-1);
         let top = screen(&mut dashboard, 100, 20);
@@ -2034,22 +1959,17 @@ mod tests {
 
     #[test]
     fn a_pane_too_short_for_every_value_says_how_many_more() {
-        let mut dashboard = dashboard(10);
         let now = SystemTime::now();
-        for (epc, raw) in [
+        let observations = [
             (0xB1, &[0x41][..]),
             (0xC3, &[0x42]),
             (0xD1, &[0x28]),
             (0xD3, &[0x28]),
-        ] {
-            dashboard.apply(change(
-                now,
-                "192.168.100.26",
-                Eoj::new(0x02, 0x6B, 0x01),
-                epc,
-                raw,
-            ));
-        }
+        ]
+        .into_iter()
+        .map(|(epc, raw)| value(now, IP, HEATER, epc, raw))
+        .collect();
+        let mut dashboard = dashboard(10, observations);
 
         let screen = screen(&mut dashboard, 100, 18);
         assert!(screen.contains("… 2 more"), "{screen}");
@@ -2059,10 +1979,9 @@ mod tests {
 
     #[test]
     fn a_device_discovered_later_does_not_move_the_selection() {
-        let mut dashboard = dashboard(10);
-        dashboard.apply(device("192.168.100.30", 0x02, 0x87, 0x01));
+        let mut dashboard = dashboard(10, vec![device(OTHER, BOARD)]);
         dashboard.select_by(1);
-        dashboard.apply(device("192.168.100.26", 0x02, 0x87, 0x01));
+        dashboard.apply(snapshot(vec![device(OTHER, BOARD), device(IP, BOARD)]));
 
         let screen = screen(&mut dashboard, 100, 30);
         let title = pane_title(&screen);
@@ -2074,14 +1993,10 @@ mod tests {
 
     #[test]
     fn an_epc_outside_the_mra_table_reads_as_unknown() {
-        let mut dashboard = dashboard(10);
-        dashboard.apply(change(
-            SystemTime::now(),
-            "192.168.100.26",
-            Eoj::new(0x02, 0x6B, 0x01),
-            0xC5,
-            &[0xFF],
-        ));
+        let mut dashboard = dashboard(
+            10,
+            vec![value(SystemTime::now(), IP, HEATER, 0xC5, &[0xFF])],
+        );
 
         let screen = screen(&mut dashboard, 100, 30);
         assert!(screen.contains("0xC5"), "{screen}");
@@ -2091,9 +2006,13 @@ mod tests {
     #[test]
     fn the_selected_row_is_reversed() {
         for (width, height) in [(100, 30), (80, 24)] {
-            let mut dashboard = dashboard(10);
-            dashboard.apply(device("192.168.100.26", 0x02, 0x87, 0x01));
-            dashboard.apply(device("192.168.100.26", 0x02, 0x87, 0x02));
+            let mut dashboard = dashboard(
+                10,
+                vec![
+                    device(IP, Eoj::new(0x02, 0x87, 0x01)),
+                    device(IP, Eoj::new(0x02, 0x87, 0x02)),
+                ],
+            );
 
             let buffer = buffer(&mut dashboard, width, height);
             let row = |eoj: &str| {
@@ -2136,8 +2055,7 @@ mod tests {
 
     #[test]
     fn a_discovered_pv_unit_without_a_reading_waits_in_the_placeholder() {
-        let mut dashboard = dashboard(10);
-        dashboard.apply(device("192.168.100.26", 0x02, 0x79, 0x01));
+        let mut dashboard = dashboard(10, vec![device(IP, PV)]);
 
         let screen = screen(&mut dashboard, 100, 30);
         assert!(screen.contains("0x027901 · no reading yet"), "{screen}");
@@ -2146,7 +2064,7 @@ mod tests {
 
     #[test]
     fn the_empty_dashboard_names_where_it_listens() {
-        let mut dashboard = dashboard(10);
+        let mut dashboard = dashboard(10, vec![]);
 
         let screen = screen(&mut dashboard, 100, 30);
         assert!(
@@ -2160,39 +2078,21 @@ mod tests {
     #[test]
     fn the_dashboard_renders_the_power_and_devices() {
         for (width, height) in [(100, 30), (80, 24)] {
-            let mut dashboard = dashboard(10);
             let now = SystemTime::now();
-            let heater = Eoj::new(0x02, 0x6B, 0x01);
             let heater_changes: [(u8, &[u8]); 4] = [
                 (0xC3, &[0x42]),
                 (0xD1, &[0x28]),
                 (0xD3, &[0x28]),
                 (0xB1, &[0x41]),
             ];
-            for (epc, raw) in heater_changes {
-                dashboard.apply(change(now, "192.168.100.26", heater, epc, raw));
-            }
-            dashboard.apply(change(
-                now,
-                "192.168.100.26",
-                Eoj::new(0x02, 0x87, 0x01),
-                0xC6,
-                &[0, 0, 2, 0x44],
-            ));
-            dashboard.apply(change(
-                now,
-                "192.168.100.26",
-                Eoj::new(0x02, 0x79, 0x01),
-                0xE0,
-                &[0x04, 0xD8],
-            ));
-            dashboard.apply(change(
-                now,
-                "192.168.100.26",
-                Eoj::new(0x02, 0x79, 0x02),
-                0xE0,
-                &[0x01, 0x2C],
-            ));
+            let mut observations: Vec<Observation> = heater_changes
+                .iter()
+                .map(|(epc, raw)| value(now, IP, HEATER, *epc, raw))
+                .collect();
+            observations.push(value(now, IP, BOARD, 0xC6, &[0, 0, 2, 0x44]));
+            observations.push(value(now, IP, PV, 0xE0, &[0x04, 0xD8]));
+            observations.push(value(now, IP, PV_SECOND, 0xE0, &[0x01, 0x2C]));
+            let mut dashboard = dashboard(10, observations);
             dashboard.sample(now);
 
             let screen = screen(&mut dashboard, width, height);
@@ -2231,5 +2131,79 @@ mod tests {
                 "{width}x{height}: the B1 value is missing: {screen}"
             );
         }
+    }
+
+    #[test]
+    fn a_new_session_clears_the_selection() {
+        let mut dashboard = dashboard(10, vec![device(IP, BOARD), device(OTHER, BOARD)]);
+        dashboard.select_by(1);
+        assert_eq!(dashboard.selected, Some(key(OTHER, BOARD)));
+
+        dashboard.apply(session_snapshot(
+            2,
+            vec![device(IP, BOARD), device(OTHER, BOARD)],
+        ));
+
+        assert_eq!(dashboard.selected, None);
+        let screen = screen(&mut dashboard, 100, 30);
+        assert!(
+            pane_title(&screen).contains("0x028701 192.168.100.26"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_selected_key_that_disappears_is_cleared() {
+        let mut dashboard = dashboard(10, vec![device(IP, BOARD), device(OTHER, BOARD)]);
+        dashboard.select_by(0);
+        assert_eq!(dashboard.selected, Some(key(IP, BOARD)));
+
+        dashboard.apply(snapshot(vec![device(OTHER, BOARD)]));
+
+        assert_eq!(dashboard.selected, None);
+    }
+
+    #[test]
+    fn the_status_line_shows_the_latest_notice() {
+        let mut dashboard = dashboard(
+            10,
+            vec![
+                notice("discovery round sent"),
+                notice("polling 2 device object(s)"),
+            ],
+        );
+        let at = dashboard.snapshot.notices.last().unwrap().at;
+        let clock = DateTime::<Utc>::from(at)
+            .with_timezone(&Local)
+            .format("%H:%M:%S")
+            .to_string();
+
+        let screen = screen(&mut dashboard, 100, 30);
+        assert!(
+            screen.contains(&format!(" {clock} polling 2 device object(s)")),
+            "{screen}"
+        );
+        assert!(!screen.contains("discovery round sent"), "{screen}");
+    }
+
+    #[test]
+    fn a_stopped_service_outranks_its_last_notice() {
+        let mut model = RadarModel::new(1);
+        model.observe(notice("polling 2 device object(s)"));
+        model.set_status(SessionStatus::Stopped);
+        let mut dashboard = Dashboard::new(config(10), Arc::new(model.snapshot()));
+
+        let screen = screen(&mut dashboard, 100, 30);
+        assert!(screen.contains("the radar service stopped"), "{screen}");
+        assert!(!screen.contains("polling 2 device object(s)"), "{screen}");
+    }
+
+    #[test]
+    fn a_dropped_poll_request_keeps_its_text() {
+        assert_eq!(
+            poll_error(CommandError::Busy),
+            "poll request dropped: the service queue is full"
+        );
+        assert!(poll_error(CommandError::ServiceStopped).contains("not running"));
     }
 }

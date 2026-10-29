@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<policyconfig>
+  <vendor>mokmok</vendor>
+  <action id="dev.mokmok.echonet-radar.firewall">
+    <description>Add or remove the ECHONET Lite inbound rule</description>
+    <message>Authentication is required to change the firewall rule for UDP port 3610</message>
+    <defaults>
+      <!-- auth_admin everywhere, so a cached active-session grant cannot skip the prompt. -->
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <!-- The installer rewrites this path to the helper it installs. -->
+    <annotate key="org.freedesktop.policykit.exec.path">/run/current-system/sw/bin/echonet-radar-firewall-helper</annotate>
+  </action>
+</policyconfig>

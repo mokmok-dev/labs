@@ -1,0 +1,17 @@
+[package]
+description = "Elevated helper that adds and removes the inbound rule for UDP 3610"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+name = "echonet-radar-firewall-helper"
+rust-version = "1.98"
+version.workspace = true
+
+[[bin]]
+name = "echonet-radar-firewall-helper"
+path = "src/main.rs"
+
+[build-dependencies]
+embed-resource = "3"
+
+[lints]
+workspace = true

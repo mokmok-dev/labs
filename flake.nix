@@ -34,9 +34,31 @@
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
           src = pkgs.lib.cleanSourceWith { src = ./.; };
 
+          # eframe, winit and wgpu dlopen these, so they reach the runtime
+          # closure rather than the link line. The checks share the list so the
+          # package and the tests see one definition.
+          guiLibraries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
+            with pkgs;
+            [
+              wayland
+              libxkbcommon
+              xorg.libX11
+              xorg.libxcb
+              xorg.libXcursor
+              xorg.libXi
+              xorg.libXrandr
+              xorg.libXinerama
+              libGL
+              vulkan-loader
+              fontconfig
+            ]
+          );
+
           commonArgs = {
             inherit src;
             strictDeps = true;
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = guiLibraries;
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
         in
@@ -72,16 +94,33 @@
             inputsFrom = [ config.pre-commit.devShell ];
 
             packages = with pkgs; [
+              pkg-config
               rustToolchain
               sccache
             ];
 
+            # A local `cargo run` then links and loads the same closure as the
+            # package.
+            buildInputs = guiLibraries;
+
             shellHook = ''
               export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
+            ''
+            + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath guiLibraries}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             '';
           };
 
           packages = {
+            echonet-radar = import ./echonet-radar/package.nix {
+              inherit
+                cargoArtifacts
+                commonArgs
+                craneLib
+                guiLibraries
+                pkgs
+                ;
+            };
             echonet-radar-cli = import ./echonet-radar-cli/package.nix {
               inherit
                 cargoArtifacts

@@ -1,0 +1,99 @@
+name: windows
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --release --locked
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- --deny warnings
+      - name: Install WiX
+        run: |
+          dotnet tool install --global wix --version 4.0.6
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.Firewall.wixext/4.0.6
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build the MSI
+        run: |
+          wix build -arch x64 -ext WixToolset.Firewall.wixext `
+            -d SourceDir=target\release -o echonet-radar.msi echonet-radar\wix\main.wxs
+      - name: Install silently
+        run: |
+          $msi = Join-Path $PWD "echonet-radar.msi"
+          $log = Join-Path $PWD "install.log"
+          $install = Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/qn", "/l*v", "`"$log`"" -Wait -PassThru
+          if ($install.ExitCode -notin 0, 3010) {
+            Get-Content $log -Tail 120
+            throw "msiexec /i exited $($install.ExitCode)"
+          }
+      - name: Query both rules
+        run: |
+          $expected = @(
+            @{ Name = "EchonetRadarUdp3610Private"; Profile = "Private" },
+            @{ Name = "EchonetRadarUdp3610Domain"; Profile = "Domain" }
+          )
+          $program = Join-Path $env:ProgramFiles "ECHONET Radar\echonet-radar.exe"
+          foreach ($want in $expected) {
+            $name = $want.Name
+            $rule = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
+            if (-not $rule) { throw "no rule named $name" }
+            if ("$($rule.Enabled)" -ne "True") { throw "$name is not enabled" }
+            if ("$($rule.Direction)" -ne "Inbound") { throw "$name is not inbound" }
+            if ("$($rule.Action)" -ne "Allow") { throw "$name does not allow" }
+            if ("$($rule.Profile)" -ne $want.Profile) { throw "$name is on profile $($rule.Profile)" }
+            $port = $rule | Get-NetFirewallPortFilter
+            if ("$($port.Protocol)" -ne "UDP" -or "$($port.LocalPort)" -ne "3610") {
+              throw "$name covers $($port.Protocol)/$($port.LocalPort)"
+            }
+            $application = $rule | Get-NetFirewallApplicationFilter
+            if ("$($application.Program)" -ne $program) {
+              throw "$name applies to $($application.Program)"
+            }
+          }
+      - name: Inspect permissions without a window
+        run: |
+          # Parsing stdout as JSON proves the flag returns before eframe; a
+          # window would leave the step waiting instead of printing.
+          $exe = Join-Path $env:ProgramFiles "ECHONET Radar\echonet-radar.exe"
+          $json = & $exe --permission-inspect
+          if ($LASTEXITCODE -ne 0) { throw "echonet-radar --permission-inspect exited $LASTEXITCODE" }
+          $report = $json | ConvertFrom-Json
+          if (-not $report.verdict) { throw "no verdict in $json" }
+          Write-Host "verdict: $($report.verdict)"
+      - name: Uninstall silently
+        run: |
+          $msi = Join-Path $PWD "echonet-radar.msi"
+          $log = Join-Path $PWD "uninstall.log"
+          $uninstall = Start-Process msiexec.exe -ArgumentList "/x", "`"$msi`"", "/qn", "/l*v", "`"$log`"" -Wait -PassThru
+          if ($uninstall.ExitCode -notin 0, 3010) {
+            Get-Content $log -Tail 120
+            throw "msiexec /x exited $($uninstall.ExitCode)"
+          }
+      - name: Query both rules again
+        run: |
+          foreach ($name in "EchonetRadarUdp3610Private", "EchonetRadarUdp3610Domain") {
+            $deadline = (Get-Date).AddSeconds(30)
+            while (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue) {
+              if ((Get-Date) -gt $deadline) { throw "$name survived uninstall" }
+              Start-Sleep -Seconds 1
+            }
+          }

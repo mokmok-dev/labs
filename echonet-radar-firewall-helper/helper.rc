@@ -1,0 +1,3 @@
+// rc.exe only reads RC source; 24 is RT_MANIFEST and id 1 is the resource the
+// loader treats as the process manifest.
+1 24 "helper.manifest"

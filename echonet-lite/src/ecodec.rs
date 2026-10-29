@@ -164,6 +164,18 @@ pub fn lookup(
         .find(|p| p.epc == epc)
 }
 
+/// English class name for a two-byte class code.
+///
+/// Returns `"Unknown class"` for a class code this appendix version does not
+/// define.
+#[must_use]
+pub fn class_name(class_code: u16) -> &'static str {
+    match classes::CLASS_NAMES.binary_search_by(|(code, _)| code.cmp(&class_code)) {
+        Ok(idx) => classes::CLASS_NAMES[idx].1,
+        Err(_) => "Unknown class",
+    }
+}
+
 /// Decode and validate an EDT against a property's shape.
 ///
 /// Performs a length check against the size range, and for numeric/state shapes a
