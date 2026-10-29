@@ -10,4 +10,3 @@ version.workspace = true
 echonet-lite.workspace = true
 socket2.workspace = true
 tokio.workspace = true
-workspace-hack.workspace = true

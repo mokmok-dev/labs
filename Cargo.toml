@@ -5,7 +5,6 @@ members = [
   "echonet-lite-udp",
   "echonet-radar-cli",
   "echonet-radar-core",
-  "workspace-hack",
 ]
 resolver = "3"
 
@@ -31,7 +30,6 @@ tokio = { version = "1", features = [
   "sync",
   "time",
 ] }
-workspace-hack = { version = "0.0.0", path = "./workspace-hack" }
 
 [workspace.lints.clippy]
 all = "deny"

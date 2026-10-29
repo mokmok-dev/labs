@@ -6,8 +6,5 @@ name = "echonet-lite"
 rust-version = "1.98"
 version.workspace = true
 
-[dependencies]
-workspace-hack.workspace = true
-
 [features]
 default = []
