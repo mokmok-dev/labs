@@ -56,12 +56,8 @@ pub fn device_list(
         })
         .body(|body| {
             body.rows(18.0, keys.len(), |mut row| {
-                let Some(key) = keys.get(row.index()).copied() else {
-                    return;
-                };
-                let Some(object) = snapshot.objects.get(&key) else {
-                    return;
-                };
+                let key = keys[row.index()];
+                let object = &snapshot.objects[&key];
                 let state = freshness(object.last_seen, now, update_interval);
                 row.col(|ui| {
                     let text = aged_text(ui, object.class_name, state);

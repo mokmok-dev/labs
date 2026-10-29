@@ -107,7 +107,6 @@ fn flush(
     } else if let Some(point) = run.pop() {
         painter.circle_filled(point, 1.5, stroke.color);
     }
-    run.clear();
 }
 
 /// Sample indices are small and watt values are far inside the range `f32`

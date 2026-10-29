@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::SystemTime;
 
 use echonet_radar_core::{
-    ObjectKey, ObjectSnapshot, PropertySnapshot, RadarSnapshot, SessionStatus,
+    Eoj, ObjectKey, ObjectSnapshot, PropertySnapshot, RadarSnapshot, SessionStatus,
 };
 
 pub fn texts(output: &mut egui::FullOutput) -> Vec<(String, egui::Color32)> {
@@ -54,22 +54,13 @@ fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
     }
 }
 
-/// Build an `ObjectKey` without naming the `echonet-lite` EOJ type, which the
-/// app is not allowed to depend on. The instance list starts with its count.
 pub fn key(
     ip: Ipv4Addr,
     class_code: u16,
 ) -> ObjectKey {
-    let mut eojs = echonet_radar_core::parse_instance_list(&[
-        1,
-        u8::try_from(class_code >> 8).expect("class group"),
-        u8::try_from(class_code & 0x00FF).expect("class code"),
-        1,
-    ])
-    .expect("a one-item instance list parses");
     ObjectKey {
         ip,
-        eoj: eojs.remove(0),
+        eoj: Eoj::from_class_code(class_code, 0x01),
     }
 }
 
