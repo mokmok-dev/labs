@@ -45,8 +45,8 @@ use echonet_lite::frame::{Eoj, Esv, Frame, FrameHeader, Property, parse};
 use echonet_lite_udp::EchoNetSocket;
 use echonet_radar_core::{
     CONTROLLER_EOJ, ChangeEvent, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL, DeviceEvent,
-    NoopPulse, RadarEvent, RadarModel, ServiceIo, SessionConfig, format_edt, get_header,
-    parse_property_map, run_service,
+    NoopPulse, RadarEvent, ServiceIo, SessionConfig, format_edt, get_header, parse_property_map,
+    run_service,
 };
 
 /// Receive buffer size. ECHONET Lite frames are at most 256 bytes; the extra
@@ -269,11 +269,9 @@ async fn run_active(
     // service treats it as a stop request and exits immediately.
     let (_commands, command_receiver) = tokio::sync::mpsc::channel(8);
     let (_shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
-    let (snapshots, _snapshots) =
-        tokio::sync::watch::channel(Arc::new(RadarModel::new(0).snapshot()));
     let io = ServiceIo {
         events: Some(events),
-        snapshots,
+        snapshots: None,
         pulse: Arc::new(NoopPulse),
     };
 
