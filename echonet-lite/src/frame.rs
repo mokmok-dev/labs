@@ -84,7 +84,7 @@ impl Esv {
 
 /// A three-byte ECHONET Lite object (EOJ): class group code, class code, and
 /// instance code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Eoj {
     /// Class group code (high byte of the two-byte class code).
     pub class_group: u8,
