@@ -257,11 +257,14 @@ fn poll_datagram(
 
 /// Bind a UDP socket that shares its port with other ECHONET Lite processes.
 ///
-/// Both socket options are needed: `SO_REUSEADDR` lets a listener share the
-/// port, and `SO_REUSEPORT` lets several listeners bind the same address.
+/// `SO_REUSEADDR` lets a listener share the port; on Unix `SO_REUSEPORT` lets
+/// several listeners bind the same address.
 fn bind_shared(address: SocketAddr) -> io::Result<Socket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
+    // Windows has no `SO_REUSEPORT`; its `SO_REUSEADDR` alone permits the
+    // shared bind.
+    #[cfg(unix)]
     socket.set_reuse_port(true)?;
     socket.bind(&address.into())?;
     socket.set_nonblocking(true)?;
