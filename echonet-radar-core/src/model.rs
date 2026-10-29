@@ -104,6 +104,23 @@ pub enum Fault {
     Service(String),
 }
 
+impl std::fmt::Display for Fault {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        match self {
+            Self::Bind { interface, detail } => {
+                write!(f, "could not bind {interface}: {detail}")
+            },
+            Self::Config(error) => write!(f, "configuration rejected: {error}"),
+            Self::Service(detail) => write!(f, "service stopped: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for Fault {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
     ZeroInterval(&'static str),

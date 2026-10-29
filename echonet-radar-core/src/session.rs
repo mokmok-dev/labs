@@ -22,7 +22,9 @@ pub struct SessionConfig {
     pub interface: Ipv4Addr,
     pub discovery_interval: Duration,
     pub update_interval: Duration,
+    /// Time an unanswered Get keeps its transaction id. Zero expires it at once.
     pub request_timeout: Duration,
+    /// Fastest publish cadence; a change waits for the next tick.
     pub snapshot_interval: Duration,
 }
 
