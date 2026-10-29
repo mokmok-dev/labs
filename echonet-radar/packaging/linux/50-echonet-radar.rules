@@ -1,0 +1,8 @@
+/* pkexec authorizes org.freedesktop.policykit.exec, not the app's own action
+   id, so the admin prompt is enforced by matching the helper program here. */
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        action.lookup("program") == "@helper@") {
+        return polkit.Result.AUTH_ADMIN;
+    }
+});

@@ -43,6 +43,11 @@ craneLib.buildPackage (
         substituteInPlace "$policy" \
           --replace-fail /run/current-system/sw/bin/echonet-radar-firewall-helper \
           "$out/bin/echonet-radar-firewall-helper"
+
+        rules=$out/share/polkit-1/rules.d/50-echonet-radar.rules
+        install -Dm644 ${./packaging/linux/50-echonet-radar.rules} "$rules"
+        substituteInPlace "$rules" \
+          --replace-fail @helper@ "$out/bin/echonet-radar-firewall-helper"
       ''
       + lib.optionalString isDarwin ''
         mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources"
