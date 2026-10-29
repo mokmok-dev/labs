@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::args::{self, Action, Host};
+use crate::args::{self, Action};
 use crate::exit::{Exit, Failure};
 use crate::paths;
 use crate::runner::{CommandRunner, Invocation, Output, SystemRunner};
@@ -14,7 +14,7 @@ const TARGET_ENV: &str = "ECHONET_RADAR_FIREWALL_TARGET";
 const UAC_CANCELLED: i32 = 1223;
 
 pub fn run(args: &[OsString]) -> u8 {
-    let request = match args::parse(Host::Windows, args) {
+    let request = match args::parse(args) {
         Ok(request) => request,
         Err(error) => {
             eprintln!("{}", error.detail);

@@ -9,6 +9,16 @@ pub enum Host {
 }
 
 impl Host {
+    /// The host this binary was built for. Both variants stay constructed here
+    /// so the other host's shape keeps compiling and stays testable.
+    pub const fn native() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Linux
+        }
+    }
+
     const fn usage(self) -> &'static str {
         match self {
             Self::Linux => "--backend <firewalld|ufw> --add|--remove --port 3610",
@@ -63,7 +73,11 @@ impl UsageError {
 
 pub const PORT: &str = "3610";
 
-pub fn parse(
+pub fn parse(args: &[OsString]) -> Result<Request, UsageError> {
+    parse_for(Host::native(), args)
+}
+
+pub fn parse_for(
     host: Host,
     args: &[OsString],
 ) -> Result<Request, UsageError> {
@@ -173,11 +187,11 @@ mod tests {
     }
 
     fn linux(values: &[&str]) -> Result<Request, UsageError> {
-        parse(Host::Linux, &args(values))
+        parse_for(Host::Linux, &args(values))
     }
 
     fn windows(values: &[&str]) -> Result<Request, UsageError> {
-        parse(Host::Windows, &args(values))
+        parse_for(Host::Windows, &args(values))
     }
 
     fn rejected(result: Result<Request, UsageError>) -> String {

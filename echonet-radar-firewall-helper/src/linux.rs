@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use crate::args::{self, Action, Backend, Host, Request};
+use crate::args::{self, Action, Backend, Request};
 use crate::exit::{Exit, Failure};
 use crate::paths;
 use crate::runner::{CommandRunner, Invocation, Output, SystemRunner};
@@ -26,7 +26,7 @@ const UFW_ABSENT_RULE: &str = "Could not delete non-existent rule";
 const TRUSTED_PREFIXES: [&str; 4] = ["/nix/store", "/usr", "/opt", "/run/current-system/sw"];
 
 pub fn run(args: &[OsString]) -> u8 {
-    let request = match args::parse(Host::Linux, args) {
+    let request = match args::parse(args) {
         Ok(request) => request,
         Err(error) => {
             eprintln!("{}", error.detail);
