@@ -54,7 +54,7 @@ jobs:
           $program = Join-Path $env:ProgramFiles "ECHONET Radar\echonet-radar.exe"
           foreach ($want in $expected) {
             $name = $want.Name
-            $rule = Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
+            $rule = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
             if (-not $rule) { throw "no rule named $name" }
             if ("$($rule.Enabled)" -ne "True") { throw "$name is not enabled" }
             if ("$($rule.Direction)" -ne "Inbound") { throw "$name is not inbound" }
@@ -92,7 +92,7 @@ jobs:
         run: |
           foreach ($name in "EchonetRadarUdp3610Private", "EchonetRadarUdp3610Domain") {
             $deadline = (Get-Date).AddSeconds(30)
-            while (Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue) {
+            while (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue) {
               if ((Get-Date) -gt $deadline) { throw "$name survived uninstall" }
               Start-Sleep -Seconds 1
             }

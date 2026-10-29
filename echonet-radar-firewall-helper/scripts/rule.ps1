@@ -18,7 +18,7 @@ $rules = @(
 )
 
 foreach ($rule in $rules) {
-    Get-NetFirewallRule -Name $rule.Name -ErrorAction SilentlyContinue |
+    Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue |
         Remove-NetFirewallRule -ErrorAction SilentlyContinue
 }
 
@@ -28,7 +28,7 @@ if ($action -eq 'remove') {
 
 foreach ($rule in $rules) {
     New-NetFirewallRule -Name $rule.Name `
-        -DisplayName "ECHONET Radar UDP 3610 ($($rule.Profile))" `
+        -DisplayName $rule.Name `
         -Program $target `
         -Direction Inbound `
         -Action Allow `

@@ -533,6 +533,11 @@ fn windows_plan_outside_program_files_is_manual() {
     assert_eq!(plan.action, PlanAction::Manual);
     assert!(plan.manual.contains("New-NetFirewallRule"));
     assert!(plan.manual.contains("echonet-radar.exe"));
+    assert!(
+        plan.manual
+            .contains("-DisplayName EchonetRadarUdp3610Private"),
+        "a pasted rule must be findable by the read-back"
+    );
 
     let remove = platform::plan(
         HostOs::Windows,
@@ -543,6 +548,12 @@ fn windows_plan_outside_program_files_is_manual() {
     );
     assert_eq!(remove.action, PlanAction::Manual);
     assert!(remove.manual.contains("Remove-NetFirewallRule"));
+    assert!(
+        remove
+            .manual
+            .contains("-DisplayName EchonetRadarUdp3610Private"),
+        "removal must reach a rule the MSI created"
+    );
 }
 
 #[test]

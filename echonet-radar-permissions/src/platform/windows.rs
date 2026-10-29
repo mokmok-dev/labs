@@ -20,18 +20,23 @@ pub const DOMAIN_RULE: &str = "EchonetRadarUdp3610Domain";
 /// Emits the two rules and the firewall state of every profile as JSON. Exit 0
 /// means both names were found, 1 means at least one was not, and 2 means the
 /// read itself failed.
+///
+/// The rules are selected by display name. Windows Firewall gives a rule that
+/// the MSI creates through its COM API a generated instance id, and the `WiX`
+/// `Name` becomes that rule's display name, so the display name is the one
+/// identity the MSI rules and the helper's rules share.
 pub const SCRIPT: &str = r"
 $ErrorActionPreference = 'Stop'
 try {
   $names = @('EchonetRadarUdp3610Private', 'EchonetRadarUdp3610Domain')
   $rules = @()
   foreach ($name in $names) {
-    $rule = Get-NetFirewallRule -Name $name -PolicyStore PersistentStore -ErrorAction SilentlyContinue
+    $rule = Get-NetFirewallRule -DisplayName $name -PolicyStore PersistentStore -ErrorAction SilentlyContinue
     if ($null -eq $rule) { continue }
     $port = $rule | Get-NetFirewallPortFilter
     $app = $rule | Get-NetFirewallApplicationFilter
     $rules += [pscustomobject]@{
-      name       = [string]$rule.Name
+      name       = [string]$rule.DisplayName
       enabled    = ([string]$rule.Enabled -eq 'True')
       direction  = [string]$rule.Direction
       action     = [string]$rule.Action
@@ -149,8 +154,9 @@ fn manual(
             let port = request.port;
             let rule = |name: &str, profile: &str| {
                 format!(
-                    "New-NetFirewallRule -Name {name} -Direction Inbound -Action Allow \
-                     -Protocol UDP -LocalPort {port} -Program '{program}' -Profile {profile}"
+                    "New-NetFirewallRule -Name {name} -DisplayName {name} -Direction Inbound \
+                     -Action Allow -Protocol UDP -LocalPort {port} -Program '{program}' \
+                     -Profile {profile}"
                 )
             };
             format!(
@@ -159,7 +165,9 @@ fn manual(
                 rule(DOMAIN_RULE, "Domain")
             )
         },
-        Mode::Remove => format!("Remove-NetFirewallRule -Name {PRIVATE_RULE},{DOMAIN_RULE}"),
+        Mode::Remove => {
+            format!("Remove-NetFirewallRule -DisplayName {PRIVATE_RULE},{DOMAIN_RULE}")
+        },
     }
 }
 
