@@ -359,8 +359,7 @@ pub async fn run_service(
             }
             () = &mut update_sleep => {
                 let now = std::time::Instant::now();
-                service.expire_pending(now);
-                let message = match service.refresh_values(&socket).await {
+                let message = match service.poll_round(&socket).await {
                     Ok(()) => format!(
                         "polling {} device object(s)",
                         service.poll_epcs.len()
@@ -378,9 +377,7 @@ pub async fn run_service(
                     Some(Command::PollNow) => {
                         // A manual poll does not shift the scheduled cadence;
                         // the next automatic round still fires on its timer.
-                        let now = std::time::Instant::now();
-                        service.expire_pending(now);
-                        let message = match service.refresh_values(&socket).await {
+                        let message = match service.poll_round(&socket).await {
                             Ok(()) => format!(
                                 "manual poll of {} device object(s)",
                                 service.poll_epcs.len()

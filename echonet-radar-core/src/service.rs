@@ -246,6 +246,15 @@ impl ServiceState {
         Ok(())
     }
 
+    /// Expire unanswered requests, then ask every tracked object for its values.
+    pub async fn poll_round(
+        &mut self,
+        socket: &EchoNetSocket,
+    ) -> io::Result<()> {
+        self.expire_pending(std::time::Instant::now());
+        self.refresh_values(socket).await
+    }
+
     pub async fn refresh_values(
         &mut self,
         socket: &EchoNetSocket,
