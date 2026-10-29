@@ -21,6 +21,7 @@ mod protocol;
 mod service;
 mod session;
 
+pub use echonet_lite_udp::{MULTICAST_GROUP, MULTICAST_PORT};
 pub use format::{format_edt, format_value, instantaneous_watts, power_epc};
 pub use model::{
     ChangeEvent, ChangeRecord, ConfigError, DeviceEvent, Fault, Notice, ObjectKey, ObjectSnapshot,
