@@ -742,7 +742,7 @@ mod tests {
     async fn inf_telegram_emits_change_immediately() {
         let socket = test_socket().await;
         let (mut service, receiver) = service();
-        let source: SocketAddr = "192.0.2.7:3610".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
 
         service
             .process_frame(
@@ -938,7 +938,7 @@ mod tests {
     async fn inf_for_non_infable_value_is_not_drawn() {
         let socket = test_socket().await;
         let (mut service, receiver) = service();
-        let source: SocketAddr = "192.0.2.11:3610".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:3610".parse().unwrap();
         // 0xD0 (Buzzer) is not announced via INF on an air conditioner.
         service
             .process_frame(
