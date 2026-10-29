@@ -75,10 +75,24 @@ fn under(
     path: &Path,
     root: &Path,
 ) -> bool {
-    let root = root.to_string_lossy().to_lowercase();
-    let path = path.to_string_lossy().to_lowercase();
+    let root = normalized(root);
+    let path = normalized(path);
     path.strip_prefix(&root)
         .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+fn normalized(path: &Path) -> String {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            },
+            std::path::Component::CurDir => {},
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out.to_string_lossy().to_lowercase()
 }
 
 fn invocation(

@@ -84,8 +84,11 @@ fn untrusted(
 }
 
 fn trusted(path: &Path) -> bool {
-    trusted_prefix(path)
-        && std::fs::metadata(path).is_ok_and(|meta| trusted_owner(meta.uid(), meta.mode()))
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    trusted_prefix(&canonical)
+        && std::fs::metadata(&canonical).is_ok_and(|meta| trusted_owner(meta.uid(), meta.mode()))
 }
 
 fn trusted_prefix(path: &Path) -> bool {
@@ -123,7 +126,7 @@ pub fn apply(
                 format!("could not run {}: {error}", invocation.program),
             )
         })?;
-        let exit = step.classify(&output);
+        let exit = step.classify(request.action, &output);
         if exit != Exit::Ok {
             return Err(step.failure(exit, request, &output));
         }
@@ -184,12 +187,13 @@ impl Step {
 
     fn classify(
         self,
+        action: Action,
         output: &Output,
     ) -> Exit {
         match self {
             Self::RequireUfwActive | Self::UfwAllow => status_exit(output.status),
             Self::FirewalldAdd | Self::FirewalldRemove | Self::FirewalldReload => {
-                firewalld_exit(output.status)
+                firewalld_exit(action, output.status)
             },
             Self::UfwDelete => {
                 if status_exit(output.status) == Exit::Ok || mentions_absent_rule(output) {
@@ -232,9 +236,15 @@ const fn status_exit(status: i32) -> Exit {
     if status == 0 { Exit::Ok } else { Exit::Failed }
 }
 
-const fn firewalld_exit(status: i32) -> Exit {
+const fn firewalld_exit(
+    action: Action,
+    status: i32,
+) -> Exit {
     match status {
-        0 | FIREWALLD_NOT_ENABLED => Exit::Ok,
+        0 => Exit::Ok,
+        // A stopped daemon has no rule to remove. An add against it changes
+        // nothing, so reporting success would claim a rule that does not exist.
+        FIREWALLD_NOT_ENABLED if matches!(action, Action::Remove) => Exit::Ok,
         FIREWALLD_NOT_AUTHORIZED => Exit::Cancelled,
         _ => Exit::Failed,
     }
@@ -409,11 +419,18 @@ mod tests {
 
     #[test]
     fn maps_firewalld_statuses_to_exit_codes() {
-        assert_eq!(firewalld_exit(0).code(), 0);
-        assert_eq!(firewalld_exit(FIREWALLD_NOT_ENABLED).code(), 0);
-        assert_eq!(firewalld_exit(FIREWALLD_NOT_AUTHORIZED).code(), 126);
-        assert_eq!(firewalld_exit(1).code(), 1);
-        assert_eq!(firewalld_exit(2).code(), 1);
+        assert_eq!(firewalld_exit(Action::Add, 0).code(), 0);
+        assert_eq!(
+            firewalld_exit(Action::Remove, FIREWALLD_NOT_ENABLED).code(),
+            0
+        );
+        assert_eq!(firewalld_exit(Action::Add, FIREWALLD_NOT_ENABLED).code(), 1);
+        assert_eq!(
+            firewalld_exit(Action::Add, FIREWALLD_NOT_AUTHORIZED).code(),
+            126
+        );
+        assert_eq!(firewalld_exit(Action::Add, 1).code(), 1);
+        assert_eq!(firewalld_exit(Action::Add, 2).code(), 1);
     }
 
     #[test]
@@ -455,12 +472,10 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_firewalld_is_a_successful_add() {
+    fn a_disabled_firewalld_fails_an_add() {
         let runner = FakeRunner::replying(vec![Ok(output(FIREWALLD_NOT_ENABLED)), Ok(output(0))]);
-        assert_eq!(
-            apply(&runner, request(Backend::Firewalld, Action::Add)),
-            Ok(())
-        );
+        let failure = apply(&runner, request(Backend::Firewalld, Action::Add)).unwrap_err();
+        assert_eq!(failure.exit.code(), 1);
     }
 
     #[test]

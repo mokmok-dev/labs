@@ -2,13 +2,13 @@ $ErrorActionPreference = 'Stop'
 
 $action = $env:ECHONET_RADAR_FIREWALL_ACTION
 if ($action -ne 'add' -and $action -ne 'remove') {
-    Write-Error 'ECHONET_RADAR_FIREWALL_ACTION must be add or remove'
+    [Console]::Error.WriteLine('ECHONET_RADAR_FIREWALL_ACTION must be add or remove')
     exit 2
 }
 
 $target = $env:ECHONET_RADAR_FIREWALL_TARGET
 if ($action -eq 'add' -and [string]::IsNullOrEmpty($target)) {
-    Write-Error 'ECHONET_RADAR_FIREWALL_TARGET is not set'
+    [Console]::Error.WriteLine('ECHONET_RADAR_FIREWALL_TARGET is not set')
     exit 1
 }
 
