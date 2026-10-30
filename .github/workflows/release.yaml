@@ -16,7 +16,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: DeterminateSystems/determinate-nix-action@v3
       - name: Build the bundle
         run: nix build .#packages.aarch64-darwin.echonet-radar --print-build-logs
@@ -74,7 +74,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
       - name: Build
         run: cargo build --workspace --release --locked
@@ -95,7 +95,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: DeterminateSystems/determinate-nix-action@v3
       - name: Build
         run: nix build .#packages.x86_64-linux.echonet-radar --print-build-logs
