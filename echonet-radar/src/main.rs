@@ -1,5 +1,7 @@
 mod app;
 mod chart;
+#[cfg(test)]
+mod lifecycle_model;
 mod net;
 mod permission;
 mod readiness;
