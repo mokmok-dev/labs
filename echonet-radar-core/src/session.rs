@@ -9,9 +9,7 @@ use echonet_lite::frame::parse;
 use echonet_lite_udp::EchoNetSocket;
 use tokio::sync::{mpsc, watch};
 
-use crate::model::{
-    ConfigError, Fault, RadarEvent, RadarModel, RadarSnapshot, SessionStatus, next_session_id,
-};
+use crate::model::{ConfigError, Fault, RadarEvent, RadarModel, RadarSnapshot, next_session_id};
 use crate::protocol::{DEFAULT_DISCOVERY_INTERVAL, DEFAULT_UPDATE_INTERVAL};
 use crate::service::{Command, ServiceState};
 
@@ -402,7 +400,7 @@ pub async fn run_service(
             }
         }
     }
-    service.model.set_status(SessionStatus::Stopped);
+    service.model.stop();
     publisher.publish(&mut service.model);
     Ok(())
 }
@@ -494,6 +492,7 @@ impl Publisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SessionStatus;
     use crate::protocol::DISCOVERY_EPC;
     use echonet_lite_udp::{MULTICAST_GROUP, MULTICAST_PORT};
     use std::net::SocketAddr;

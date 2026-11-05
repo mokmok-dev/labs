@@ -9,7 +9,7 @@ use echonet_lite::frame::{Eoj, FrameHeader, Property};
 use echonet_lite_udp::EchoNetSocket;
 
 use crate::format::{format_edt, power_epc};
-use crate::model::{ObjectKey, Observation, RadarEvent, RadarModel, SessionStatus};
+use crate::model::{ObjectKey, Observation, RadarEvent, RadarModel};
 use crate::protocol::{
     CONTROLLER_CLASS_CODE, DISCOVERY_EPC, EMPTY_EDT, GET_PROPERTY_MAP_EPC, GET_RESPONSE_ESV_CODE,
     INF_ESV_CODE, NODE_PROFILE_CLASS_CODE, discovery_header, get_header, is_get_response_code,
@@ -72,9 +72,7 @@ impl ServiceState {
     ) -> Self {
         let now = Instant::now();
         let mut model = RadarModel::new(session);
-        model.set_status(SessionStatus::Running {
-            since: SystemTime::now(),
-        });
+        model.start(SystemTime::now());
         Self {
             model,
             poll_epcs: HashMap::new(),
