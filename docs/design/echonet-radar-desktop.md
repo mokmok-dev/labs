@@ -122,7 +122,7 @@ impl eframe::App for RadarApp {
             self.snapshot = running.handle.snapshot();
         }
         self.permission.poll();
-        self.readiness = readiness::step(&self.readiness, &self.snapshot);
+        self.readiness = readiness::step(&self.snapshot);
         egui::CentralPanel::default().show(ctx, |ui| {
             views::status_bar(ui, &self.readiness);
             views::permission_card(ui, self.permission.report(), &mut self.actions);
@@ -271,7 +271,7 @@ pub struct PropertySnapshot {
 pub enum SessionStatus {
     Binding,
     Running { since: SystemTime },
-    Degraded { fault: Fault, last_frame: Option<SystemTime> },
+    Degraded { fault: Fault },
     Stopped,
 }
 
@@ -618,7 +618,10 @@ pub const LOST_AFTER_POLLS: u32 = 5;
 
 /// Total and idempotent. The permission report is not an input: a rule never
 /// proves the LAN path.
-pub fn step(state: &Readiness, snapshot: &RadarSnapshot) -> Readiness;
+pub fn step(snapshot: &RadarSnapshot) -> Readiness;
+
+/// The projection `step` uses; the Stateright model calls it directly.
+pub fn from_parts(status: &SessionStatus, frames_seen: u64, last_frame: Option<SystemTime>) -> Readiness;
 
 pub fn freshness(last_seen: SystemTime, now: SystemTime, update_interval: Duration) -> Freshness;
 ```
@@ -628,10 +631,12 @@ pub fn freshness(last_seen: SystemTime, now: SystemTime, update_interval: Durati
 | `SessionStatus::Binding` | `Binding` |
 | `SessionStatus::Running` with `last_frame == None` | `Unverified { since }` |
 | `SessionStatus::Running` with `last_frame == Some(last)` | `Listening { since, last, frames: frames_seen }` |
-| `SessionStatus::Degraded { fault, last_frame }` | `Degraded { fault, last_frame }` |
+| `SessionStatus::Degraded { fault }` | `Degraded { fault, last_frame }` from the snapshot |
 | `SessionStatus::Stopped` | `Stopped` |
 
 The app calls `step` once per frame with the latest snapshot. A restart resets the readiness to `Binding` through the new snapshot's status. `Readiness::NotStarted` is the state before the user clicks **Start listening**.
+
+`RadarModel` owns the transitions that produce the status. `start`, `record_frame` and `degrade` accept an event only in the status where it can occur, and `stop` is total. `echonet-radar`'s `lifecycle_model` test drives those same methods in a bounded Stateright model. The model checks that a frame and its timestamp advance together, that `Binding` holds no history, that a degraded or stopped session records no further frames, and that `Listening`, both degraded shapes and `Stopped` stay reachable.
 
 `freshness` is separate from `step`, because a device can be stale while the session is listening. It reads `last_seen`, the current time and the configured update interval. The status bar and the device rows use its three values. The thresholds live here, not in view prose, so unit 6 can test them.
 
@@ -686,7 +691,7 @@ The app changes firewall state only after an explicit click and a confirmation t
 - Values render from `PropertySnapshot.text`, which core produces with `format_edt` and the generated metadata.
 - The power chart samples once per second, cap 120 samples, and centers on zero for buy and sell. The series is computed in the app from `PropertySnapshot`, not in core.
 - The window remembers size and position through eframe persistence. Settings use a separate JSON file so the interface is known before the window opens.
-- A vanished interface name falls back to `Automatic` with a notice. A bind failure shows `Degraded` with **Restart**; there is no silent retry loop.
+- A vanished interface name falls back to `Automatic` with a notice. A bind failure stays on the start card with the fault and **Start listening** as the retry; there is no silent retry loop.
 - Keyboard: arrow keys move the device selection, Enter opens the property pane, `p` polls, `r` retries the session. These mirror the TUI where the action exists.
 
 ### Language

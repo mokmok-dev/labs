@@ -84,20 +84,15 @@ pub struct Notice {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SessionStatus {
     Binding,
-    Running {
-        since: SystemTime,
-    },
-    Degraded {
-        fault: Fault,
-        last_frame: Option<SystemTime>,
-    },
+    Running { since: SystemTime },
+    Degraded { fault: Fault },
     Stopped,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Fault {
     Bind { interface: Ipv4Addr, detail: String },
     Config(ConfigError),
@@ -121,7 +116,7 @@ impl std::fmt::Display for Fault {
 
 impl std::error::Error for Fault {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigError {
     ZeroInterval(&'static str),
 }
@@ -206,6 +201,11 @@ pub struct Projection {
     pub dirty: bool,
 }
 
+/// The authoritative session state.
+///
+/// Status moves `Binding -> Running -> (Degraded | Stopped)`, and `stop` is
+/// allowed from every state. Recovery from `Degraded` or `Stopped` is a new
+/// session, not a status mutation.
 #[derive(Debug, Clone)]
 pub struct RadarModel {
     session: u64,
@@ -233,29 +233,44 @@ impl RadarModel {
         }
     }
 
-    pub fn set_status(
+    /// Only a binding model moves to running. A second call keeps the first
+    /// timestamp, so a snapshot's `Running { since }` does not drift.
+    pub fn start(
         &mut self,
-        status: SessionStatus,
+        since: SystemTime,
     ) {
-        self.status = status;
+        if matches!(self.status, SessionStatus::Binding) {
+            self.status = SessionStatus::Running { since };
+        }
     }
 
+    /// Stopped is terminal; every later event is ignored.
+    pub fn stop(&mut self) {
+        self.status = SessionStatus::Stopped;
+    }
+
+    /// Only a running model degrades. A fault before the socket binds is a
+    /// start failure, reported by `RadarSession::start`, not a transition. The
+    /// first fault is preserved, so a later receive error cannot mask the cause.
     pub fn degrade(
         &mut self,
         fault: Fault,
     ) {
-        self.status = SessionStatus::Degraded {
-            fault,
-            last_frame: self.last_frame,
-        };
+        if matches!(self.status, SessionStatus::Running { .. }) {
+            self.status = SessionStatus::Degraded { fault };
+        }
     }
 
+    /// Only a running model records a frame. A frame that races with shutdown
+    /// or degrade must not make readiness claim a datagram arrived.
     pub const fn record_frame(
         &mut self,
         at: SystemTime,
     ) {
-        self.frames_seen += 1;
-        self.last_frame = Some(at);
+        if matches!(self.status, SessionStatus::Running { .. }) {
+            self.frames_seen += 1;
+            self.last_frame = Some(at);
+        }
     }
 
     /// The event is `None` when a renderer would draw nothing new, as with a
@@ -634,6 +649,7 @@ mod tests {
     #[test]
     fn frame_counters_track_every_datagram() {
         let mut model = RadarModel::new(1);
+        model.start(SystemTime::UNIX_EPOCH);
         let first = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
         let second = SystemTime::UNIX_EPOCH + Duration::from_secs(2);
 
@@ -643,5 +659,49 @@ mod tests {
         let snapshot = model.snapshot();
         assert_eq!(snapshot.frames_seen, 2);
         assert_eq!(snapshot.last_frame, Some(second));
+    }
+
+    #[test]
+    fn lifecycle_transitions_reject_events_from_the_wrong_status() {
+        let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        let fault = Fault::Service(String::from("receive failed"));
+        let mut model = RadarModel::new(1);
+
+        model.record_frame(at(1));
+        assert_eq!(model.initial_snapshot().status, SessionStatus::Binding);
+        assert_eq!(model.initial_snapshot().frames_seen, 0);
+
+        model.start(at(2));
+        model.start(at(3));
+        assert_eq!(
+            model.initial_snapshot().status,
+            SessionStatus::Running { since: at(2) }
+        );
+
+        model.record_frame(at(4));
+        model.degrade(fault.clone());
+        assert_eq!(
+            model.initial_snapshot().status,
+            SessionStatus::Degraded {
+                fault: fault.clone()
+            }
+        );
+        assert_eq!(model.initial_snapshot().frames_seen, 1);
+        assert_eq!(model.initial_snapshot().last_frame, Some(at(4)));
+
+        model.record_frame(at(5));
+        model.start(at(6));
+        assert_eq!(model.initial_snapshot().frames_seen, 1);
+        assert_eq!(model.initial_snapshot().last_frame, Some(at(4)));
+
+        model.stop();
+        assert_eq!(model.initial_snapshot().status, SessionStatus::Stopped);
+        model.record_frame(at(7));
+        model.start(at(8));
+        model.degrade(fault);
+        model.stop();
+        assert_eq!(model.initial_snapshot().status, SessionStatus::Stopped);
+        assert_eq!(model.initial_snapshot().frames_seen, 1);
+        assert_eq!(model.initial_snapshot().last_frame, Some(at(4)));
     }
 }

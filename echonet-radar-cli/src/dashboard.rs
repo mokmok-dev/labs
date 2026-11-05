@@ -1086,7 +1086,7 @@ fn poll_error(error: CommandError) -> String {
 /// LAN may still be fine.
 fn status_line(snapshot: &RadarSnapshot) -> Option<(SystemTime, String)> {
     match &snapshot.status {
-        SessionStatus::Degraded { fault, .. } => Some((
+        SessionStatus::Degraded { fault } => Some((
             SystemTime::now(),
             format!("the radar service stopped: {}", fault_text(fault)),
         )),
@@ -2190,7 +2190,7 @@ mod tests {
     fn a_stopped_service_outranks_its_last_notice() {
         let mut model = RadarModel::new(1);
         model.observe(notice("polling 2 device object(s)"));
-        model.set_status(SessionStatus::Stopped);
+        model.stop();
         let mut dashboard = Dashboard::new(config(10), Arc::new(model.snapshot()));
 
         let screen = screen(&mut dashboard, 100, 30);

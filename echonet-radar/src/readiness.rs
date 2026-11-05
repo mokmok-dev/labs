@@ -63,22 +63,32 @@ pub enum Freshness {
 /// before the first session, because every running session publishes a status.
 #[must_use]
 pub fn step(snapshot: &RadarSnapshot) -> Readiness {
-    match &snapshot.status {
+    from_parts(&snapshot.status, snapshot.frames_seen, snapshot.last_frame)
+}
+
+/// The projection `step` uses. Split out so the Stateright model checks the
+/// same mapping without fabricating a snapshot. All three parts must come from
+/// one snapshot; mixing revisions can report a shape the service never held.
+#[must_use]
+pub fn from_parts(
+    status: &SessionStatus,
+    frames_seen: u64,
+    last_frame: Option<SystemTime>,
+) -> Readiness {
+    match status {
         SessionStatus::Binding => Readiness::Binding,
         SessionStatus::Running { since } => {
-            snapshot
-                .last_frame
-                .map_or(Readiness::Unverified { since: *since }, |last| {
-                    Readiness::Listening {
-                        since: *since,
-                        last,
-                        frames: snapshot.frames_seen,
-                    }
-                })
+            last_frame.map_or(Readiness::Unverified { since: *since }, |last| {
+                Readiness::Listening {
+                    since: *since,
+                    last,
+                    frames: frames_seen,
+                }
+            })
         },
-        SessionStatus::Degraded { fault, last_frame } => Readiness::Degraded {
+        SessionStatus::Degraded { fault } => Readiness::Degraded {
             fault: fault.clone(),
-            last_frame: *last_frame,
+            last_frame,
         },
         SessionStatus::Stopped => Readiness::Stopped,
     }
@@ -166,15 +176,25 @@ mod tests {
             interface: Ipv4Addr::new(192, 168, 1, 2),
             detail: String::from("address in use"),
         };
-        let degraded = snapshot(SessionStatus::Degraded {
+        let mut degraded = snapshot(SessionStatus::Degraded {
             fault: fault.clone(),
-            last_frame: Some(last),
         });
+        degraded.last_frame = Some(last);
         assert_eq!(
             step(&degraded),
             Readiness::Degraded {
-                fault,
+                fault: fault.clone(),
                 last_frame: Some(last)
+            }
+        );
+        let degraded_without_a_frame = snapshot(SessionStatus::Degraded {
+            fault: fault.clone(),
+        });
+        assert_eq!(
+            step(&degraded_without_a_frame),
+            Readiness::Degraded {
+                fault,
+                last_frame: None
             }
         );
 
