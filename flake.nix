@@ -139,6 +139,7 @@
                 ".direnv"
               ];
             };
+            package = pkgs.prek;
           };
 
           treefmt = {
